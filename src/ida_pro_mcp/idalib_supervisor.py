@@ -1040,6 +1040,20 @@ def idalib_open(
     been seen in multiple folders.
     """
     sup = _require_supervisor()
+    # Compute context fields up front so every return path (including errors)
+    # satisfies the published IdalibOpenResult schema, which requires
+    # context_id / transport_context_id / isolated_contexts.
+    try:
+        context_id = sup.resolve_context_id()
+        ctx = dict(sup.context_fields(context_id))
+    except Exception as e:
+        return {
+            "success": False,
+            "context_id": "",
+            "transport_context_id": None,
+            "isolated_contexts": sup.isolated_contexts,
+            "error": f"Failed to resolve context: {e}",
+        }
     try:
         # Resolve bare filenames / non-existent paths via the alias registry
         # before handing to open_session (which expects a real filesystem path).
@@ -1048,11 +1062,10 @@ def idalib_open(
             try:
                 resolved = sup.resolve_alias(input_path, directory_hint=directory)
             except RuntimeError as e:
-                return {"error": str(e)}
+                return {"success": False, **ctx, "error": str(e)}
             if resolved is not None:
                 input_path = resolved
 
-        context_id = sup.resolve_context_id()
         session = sup.open_session(
             input_path,
             run_auto_analysis=run_auto_analysis,
@@ -1061,12 +1074,12 @@ def idalib_open(
         )
         return {
             "success": True,
-            **sup.context_fields(context_id),
+            **ctx,
             "session": session.to_dict(),
             "message": f"Binary opened and bound to context: {session.filename} ({session.session_id})",
         }
     except Exception as e:
-        return {"error": str(e)}
+        return {"success": False, **ctx, "error": str(e)}
 
 
 @mcp.tool
