@@ -1193,6 +1193,213 @@ def test_idalib_open_accepts_wire_path_from_list_pe_images(tmp_path):
         supmod.supervisor = old_supervisor
 
 
+# ---------------------------------------------------------------------------
+# list_pe_images search-root fallback
+# ---------------------------------------------------------------------------
+
+
+def test_list_pe_images_falls_back_to_search_roots(tmp_path):
+    # Agent supplies a directory the server can't see; supervisor falls back
+    # to its configured --search-root directory and returns those PE images
+    # tagged with source_root so the agent knows what happened.
+    old_supervisor = supmod.supervisor
+    sup = _FakeSupervisor()
+    supmod.supervisor = sup
+    try:
+        real_root = tmp_path / "real"
+        real_root.mkdir()
+        (real_root / "alpha.exe").write_bytes(_make_pe_blob(body=b"a"))
+        (real_root / "beta.exe").write_bytes(_make_pe_blob(body=b"b"))
+        sup.prepopulate_aliases([str(real_root)])
+
+        # Caller asks for a directory that doesn't exist on the server.
+        bogus = str(tmp_path / "this_is_only_on_my_machine")
+        result = supmod.list_pe_images(bogus)
+
+        assert result["count"] == 2
+        assert result.get("fallback_to_search_roots") is True
+        assert result.get("searched_roots") == [str(real_root)]
+        assert "notes" in result
+        assert any("not found on server" in n for n in result["notes"])
+
+        for img in result["images"]:
+            assert img["source_root"] == str(real_root)
+            # path stays relative to the source_root (no absolute leak)
+            assert img["path"] in ("alpha.exe", "beta.exe")
+    finally:
+        supmod.supervisor = old_supervisor
+
+
+def test_list_pe_images_no_fallback_when_no_search_roots(tmp_path):
+    # Caller's directory missing AND no --search-root configured -> error
+    # as before, with a hint pointing at idalib_search_roots so the operator
+    # can confirm nothing was configured.
+    old_supervisor = supmod.supervisor
+    supmod.supervisor = _FakeSupervisor()
+    try:
+        result = supmod.list_pe_images(str(tmp_path / "missing"))
+        assert "error" in result
+        assert "directory not found" in result["error"]
+        assert "search-root" in result["error"].lower() or "search_root" in result["error"]
+        assert "fallback_to_search_roots" not in result
+    finally:
+        supmod.supervisor = old_supervisor
+
+
+def test_list_pe_images_no_fallback_when_directory_exists(tmp_path):
+    # Happy path stays untouched -- when the requested directory IS reachable,
+    # we never fall back even with search_roots configured. source_root is the
+    # empty string in this mode.
+    old_supervisor = supmod.supervisor
+    sup = _FakeSupervisor()
+    supmod.supervisor = sup
+    try:
+        other_root = tmp_path / "other"
+        other_root.mkdir()
+        (other_root / "other.exe").write_bytes(_make_pe_blob(body=b"o"))
+        sup.prepopulate_aliases([str(other_root)])
+
+        target = tmp_path / "target"
+        target.mkdir()
+        (target / "hit.exe").write_bytes(_make_pe_blob(body=b"h"))
+
+        result = supmod.list_pe_images(str(target))
+        assert result["count"] == 1
+        assert result["images"][0]["filename"] == "hit.exe"
+        assert result["images"][0]["source_root"] == ""
+        assert "fallback_to_search_roots" not in result
+        assert "notes" not in result
+    finally:
+        supmod.supervisor = old_supervisor
+
+
+def test_list_pe_images_fallback_aggregates_multiple_roots(tmp_path):
+    old_supervisor = supmod.supervisor
+    sup = _FakeSupervisor()
+    supmod.supervisor = sup
+    try:
+        root_a = tmp_path / "a"
+        root_b = tmp_path / "b"
+        root_a.mkdir()
+        root_b.mkdir()
+        (root_a / "from_a.exe").write_bytes(_make_pe_blob(body=b"a"))
+        (root_b / "from_b.exe").write_bytes(_make_pe_blob(body=b"b"))
+        sup.prepopulate_aliases([str(root_a), str(root_b)])
+
+        result = supmod.list_pe_images(str(tmp_path / "nope"))
+        assert result.get("fallback_to_search_roots") is True
+        assert set(result["searched_roots"]) == {str(root_a), str(root_b)}
+
+        by_name = {img["filename"]: img for img in result["images"]}
+        assert by_name["from_a.exe"]["source_root"] == str(root_a)
+        assert by_name["from_b.exe"]["source_root"] == str(root_b)
+    finally:
+        supmod.supervisor = old_supervisor
+
+
+def test_list_pe_images_fallback_skips_unreachable_roots(tmp_path):
+    # If a search_root was recorded but is no longer reachable (e.g. unmounted
+    # volume), the fallback skips it gracefully and uses the others.
+    old_supervisor = supmod.supervisor
+    sup = _FakeSupervisor()
+    supmod.supervisor = sup
+    try:
+        real = tmp_path / "real"
+        real.mkdir()
+        (real / "x.exe").write_bytes(_make_pe_blob())
+        # Manually populate search_roots with one good + one nonexistent.
+        ghost = str(tmp_path / "this_was_unmounted")
+        sup.search_roots = [ghost, str(real)]
+
+        result = supmod.list_pe_images(str(tmp_path / "missing"))
+        assert result.get("fallback_to_search_roots") is True
+        assert result["searched_roots"] == [str(real)]
+        assert result["count"] == 1
+    finally:
+        supmod.supervisor = old_supervisor
+
+
+def test_list_pe_images_fallback_errors_when_all_roots_unreachable(tmp_path):
+    old_supervisor = supmod.supervisor
+    sup = _FakeSupervisor()
+    supmod.supervisor = sup
+    try:
+        sup.search_roots = [str(tmp_path / "gone"), str(tmp_path / "also_gone")]
+        result = supmod.list_pe_images(str(tmp_path / "missing"))
+        assert "error" in result
+        assert "all unreachable" in result["error"]
+    finally:
+        supmod.supervisor = old_supervisor
+
+
+def test_list_pe_images_fallback_honors_recursive(tmp_path):
+    old_supervisor = supmod.supervisor
+    sup = _FakeSupervisor()
+    supmod.supervisor = sup
+    try:
+        root = tmp_path / "root"
+        root.mkdir()
+        sub = root / "sub"
+        sub.mkdir()
+        (root / "top.exe").write_bytes(_make_pe_blob(body=b"t"))
+        (sub / "deep.exe").write_bytes(_make_pe_blob(body=b"d"))
+        sup.search_roots = [str(root)]
+
+        result = supmod.list_pe_images(str(tmp_path / "nope"), recursive=True)
+        assert result.get("fallback_to_search_roots") is True
+        by_name = {img["filename"]: img for img in result["images"]}
+        assert "top.exe" in by_name
+        assert "deep.exe" in by_name
+        # Relative path in recursive mode preserves the subdirectory under the source_root
+        assert by_name["deep.exe"]["path"] == "sub/deep.exe"
+        assert by_name["top.exe"]["path"] == "top.exe"
+    finally:
+        supmod.supervisor = old_supervisor
+
+
+def test_list_pe_images_fallback_registers_aliases_too(tmp_path):
+    # End-to-end: agent's bogus directory triggers fallback, supervisor returns
+    # PE images from the search_root, and the alias registry is populated so
+    # the agent can immediately turn around and call idalib_open(filename).
+    old_supervisor = supmod.supervisor
+    sup = _FakeSupervisor()
+    supmod.supervisor = sup
+    sup.mcp = _TransportMcp(session_id="ctx-A")
+    try:
+        real = tmp_path / "real"
+        real.mkdir()
+        sample = real / "thing.exe"
+        sample.write_bytes(_make_pe_blob(body=b"x"))
+        sup.search_roots = [str(real)]
+
+        # First call: bogus path, fallback fires, registry populated.
+        listing = supmod.list_pe_images(str(tmp_path / "elsewhere"))
+        assert listing.get("fallback_to_search_roots") is True
+        assert "thing.exe" in sup.alias_registry
+
+        # Now an agent can open by bare filename.
+        opened = supmod.idalib_open(input_path="thing.exe")
+        assert opened.get("success") is True
+        assert sup.opened[0][1]["input_path"] == str(sample)
+    finally:
+        supmod.supervisor = old_supervisor
+
+
+def test_list_pe_images_normal_path_has_empty_source_root(tmp_path):
+    # Verify the new source_root field is always present (schema stability)
+    # and is the empty string when no fallback happened.
+    old_supervisor = supmod.supervisor
+    supmod.supervisor = _FakeSupervisor()
+    try:
+        (tmp_path / "x.exe").write_bytes(_make_pe_blob())
+        result = supmod.list_pe_images(str(tmp_path))
+        for img in result["images"]:
+            assert "source_root" in img
+            assert img["source_root"] == ""
+    finally:
+        supmod.supervisor = old_supervisor
+
+
 def test_list_pe_images_skips_ida_artifacts(tmp_path):
     old_supervisor = supmod.supervisor
     supmod.supervisor = _FakeSupervisor()

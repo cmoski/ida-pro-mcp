@@ -196,6 +196,10 @@ class PeImageInfo(TypedDict):
     is_system: bool
     loaded: bool
     session_id: str | None
+    # Empty string for normal scans; set to the configured --search-root path
+    # this entry came from when list_pe_images fell back because the caller's
+    # requested directory wasn't reachable from the server.
+    source_root: str
 
 
 class PeImageError(TypedDict):
@@ -212,6 +216,11 @@ class ListPeImagesResult(TypedDict, total=False):
     truncated: bool
     limit_hit: str
     error: str
+    # Populated when the requested directory was not reachable but the
+    # supervisor served the call from --search-root pre-configured directories.
+    fallback_to_search_roots: bool
+    searched_roots: list[str]
+    notes: list[str]
 
 
 @dataclass
@@ -1673,6 +1682,12 @@ def list_pe_images(
     scans of very large trees: use ``hash=False`` for discovery, then call again with
     ``hash=True`` on a narrowed directory. Scans truncate when any of ``max_files``,
     ``max_errors``, or ``time_budget_sec`` is hit; the result reports ``limit_hit``.
+
+    Fallback: if ``directory`` does not exist on the server but ``--search-root``
+    was configured at startup, the supervisor scans the configured roots instead
+    and tags each entry with its ``source_root``. This lets agents that don't
+    know which paths the server has reachable -- e.g. a Linux-mounted view that
+    differs from the Windows-side mount -- still get a useful response.
     """
     from datetime import timezone
 
@@ -1688,18 +1703,55 @@ def list_pe_images(
     if not dir_path.is_absolute():
         result["error"] = "directory must be an absolute path"
         return result
-    if not dir_path.exists():
-        result["error"] = f"directory not found: {directory}"
-        return result
-    if not dir_path.is_dir():
-        result["error"] = f"not a directory: {directory}"
+
+    # Decide which directories to scan. Normal path: just the requested one.
+    # Fallback path: the requested directory doesn't exist on the server, but
+    # --search-root directories were configured -- scan those and tag entries
+    # with source_root so the caller knows.
+    notes: list[str] = []
+    scan_targets: list[tuple[Path, str]] = []  # (scan_root, source_root_str or "")
+    fallback = False
+    searched_roots: list[str] = []
+
+    if dir_path.exists():
+        if not dir_path.is_dir():
+            result["error"] = f"not a directory: {directory}"
+            return result
+        scan_targets.append((dir_path, ""))
+    elif sup.search_roots:
+        fallback = True
+        with sup._lock:
+            configured_roots = list(sup.search_roots)
+        for raw_root in configured_roots:
+            root_path = Path(raw_root)
+            if root_path.exists() and root_path.is_dir():
+                scan_targets.append((root_path, raw_root))
+                searched_roots.append(raw_root)
+        if not scan_targets:
+            result["error"] = (
+                f"directory not found: {directory}; configured search roots are "
+                f"all unreachable: {configured_roots}"
+            )
+            return result
+        notes.append(
+            f"Directory '{directory}' not found on server; falling back to "
+            f"{len(searched_roots)} configured --search-root director"
+            f"{'y' if len(searched_roots) == 1 else 'ies'}."
+        )
+    else:
+        result["error"] = (
+            f"directory not found: {directory}. No --search-root configured "
+            f"so no fallback is available; call idalib_search_roots() to see "
+            f"what was configured."
+        )
         return result
 
     loaded = _loaded_index(sup)
 
     # Each pending entry pairs the wire-format PeImageInfo (relative `path`) with the
     # absolute filesystem path used for internal cross-referencing and registry
-    # population. Absolute paths never escape this function.
+    # population. Absolute paths never escape this function except inside `notes`
+    # (intentional debug aid) and aggregated via record_aliases (server-internal).
     pending: list[tuple[PeImageInfo, str]] = []
     errors: list[PeImageError] = []
     truncated = False
@@ -1715,71 +1767,75 @@ def list_pe_images(
             return
         errors.append({"path": path, "error": f"{type(exc).__name__}: {exc}"})
 
-    for full_path, st in _iter_candidate_files(dir_path, bool(recursive), _record_error):
-        if len(pending) >= max_files:
-            truncated = True
-            limit_hit = "max_files"
+    for scan_root, source_root in scan_targets:
+        if truncated:
             break
-        if deadline is not None and time.monotonic() >= deadline:
-            truncated = True
-            limit_hit = "time_budget"
-            break
+        for full_path, st in _iter_candidate_files(scan_root, bool(recursive), _record_error):
+            if len(pending) >= max_files:
+                truncated = True
+                limit_hit = "max_files"
+                break
+            if deadline is not None and time.monotonic() >= deadline:
+                truncated = True
+                limit_hit = "time_budget"
+                break
 
-        try:
-            with open(full_path, "rb") as fh:
-                header = _parse_pe_header(fh, st.st_size)
-        except OSError as e:
-            _record_error(str(full_path), e)
-            continue
-        if header is None:
-            continue
-
-        sha1 = ""
-        crc32 = ""
-        if hash:
             try:
-                sha1, crc32 = _hash_file(full_path)
+                with open(full_path, "rb") as fh:
+                    header = _parse_pe_header(fh, st.st_size)
             except OSError as e:
                 _record_error(str(full_path), e)
                 continue
+            if header is None:
+                continue
 
-        abs_path = str(full_path)
-        try:
-            key = sup._path_key(abs_path)
-        except Exception:
-            key = os.path.normcase(abs_path)
-        session_id = loaded.get(key)
+            sha1 = ""
+            crc32 = ""
+            if hash:
+                try:
+                    sha1, crc32 = _hash_file(full_path)
+                except OSError as e:
+                    _record_error(str(full_path), e)
+                    continue
 
-        try:
-            rel_path = full_path.relative_to(dir_path).as_posix()
-        except ValueError:
-            # Walker promised a file under dir_path; if relative_to ever
-            # fails, fall back to the basename so we still emit something
-            # non-absolute on the wire.
-            rel_path = full_path.name
+            abs_path = str(full_path)
+            try:
+                key = sup._path_key(abs_path)
+            except Exception:
+                key = os.path.normcase(abs_path)
+            session_id = loaded.get(key)
 
-        mtime = datetime.fromtimestamp(st.st_mtime, tz=timezone.utc).isoformat()
+            try:
+                rel_path = full_path.relative_to(scan_root).as_posix()
+            except ValueError:
+                # Walker promised a file under scan_root; if relative_to ever
+                # fails, fall back to the basename so we still emit something
+                # non-absolute on the wire.
+                rel_path = full_path.name
 
-        entry: PeImageInfo = {
-            "path": rel_path,
-            "filename": full_path.name,
-            "size": int(st.st_size),
-            "mtime": mtime,
-            "sha1": sha1,
-            "crc32": crc32,
-            "machine": header["machine"],
-            "arch": header["arch"],
-            "bitness": header["bitness"],
-            "characteristics": header["characteristics"],
-            "is_executable_image": header["is_executable_image"],
-            "is_dll": header["is_dll"],
-            "is_system": header["is_system"],
-            "loaded": session_id is not None,
-            "session_id": session_id,
-        }
-        pending.append((entry, abs_path))
+            mtime = datetime.fromtimestamp(st.st_mtime, tz=timezone.utc).isoformat()
 
-    pending.sort(key=lambda pair: pair[0]["path"].lower())
+            entry: PeImageInfo = {
+                "path": rel_path,
+                "filename": full_path.name,
+                "size": int(st.st_size),
+                "mtime": mtime,
+                "sha1": sha1,
+                "crc32": crc32,
+                "machine": header["machine"],
+                "arch": header["arch"],
+                "bitness": header["bitness"],
+                "characteristics": header["characteristics"],
+                "is_executable_image": header["is_executable_image"],
+                "is_dll": header["is_dll"],
+                "is_system": header["is_system"],
+                "loaded": session_id is not None,
+                "session_id": session_id,
+                "source_root": source_root,
+            }
+            pending.append((entry, abs_path))
+
+    pending.sort(key=lambda pair: (pair[0].get("source_root", ""), pair[0]["path"].lower()))
     # Record (filename -> absolute path) so callers can later open these binaries
     # by bare filename (or by the relative `path` we just returned, which the
     # idalib_open basename fallback handles). The registry keeps absolute paths
@@ -1794,6 +1850,11 @@ def list_pe_images(
         result["truncated"] = True
         if limit_hit is not None:
             result["limit_hit"] = limit_hit
+    if fallback:
+        result["fallback_to_search_roots"] = True
+        result["searched_roots"] = searched_roots
+    if notes:
+        result["notes"] = notes
     return result
 
 
