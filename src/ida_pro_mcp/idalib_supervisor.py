@@ -119,6 +119,7 @@ class IdalibOpenResult(IdalibContextFields, total=False):
     session: IdalibSessionInfo
     message: str
     error: str
+    notes: list[str]
 
 
 class IdalibCloseResult(TypedDict, total=False):
@@ -1054,17 +1055,48 @@ def idalib_open(
             "isolated_contexts": sup.isolated_contexts,
             "error": f"Failed to resolve context: {e}",
         }
+    notes: list[str] = []
     try:
         # Resolve bare filenames / non-existent paths via the alias registry
         # before handing to open_session (which expects a real filesystem path).
+        # When the caller passes an absolute path that does not exist, also try
+        # the basename so list_pe_images-populated aliases match -- agents will
+        # frequently guess a path that resembles a real layout and miss.
         candidate = Path(input_path)
-        if not candidate.is_absolute() or not candidate.exists():
-            try:
-                resolved = sup.resolve_alias(input_path, directory_hint=directory)
-            except RuntimeError as e:
-                return {"success": False, **ctx, "error": str(e)}
+        original_input = input_path
+        needs_lookup = (not candidate.is_absolute()) or (not candidate.exists())
+        if needs_lookup:
+            lookup_keys: list[str] = [input_path]
+            if candidate.name and candidate.name != input_path:
+                lookup_keys.append(candidate.name)
+            resolved: str | None = None
+            matched_key: str | None = None
+            for key in lookup_keys:
+                try:
+                    r = sup.resolve_alias(key, directory_hint=directory)
+                except RuntimeError as e:
+                    return {"success": False, **ctx, "error": str(e)}
+                if r is not None:
+                    resolved = r
+                    matched_key = key
+                    break
             if resolved is not None:
                 input_path = resolved
+                if matched_key == original_input:
+                    notes.append(
+                        f"Resolved '{original_input}' via alias registry to '{resolved}'."
+                    )
+                else:
+                    notes.append(
+                        f"Path '{original_input}' did not exist; resolved via alias "
+                        f"registry by basename '{matched_key}' to '{resolved}'."
+                    )
+            elif candidate.is_absolute() and not candidate.exists():
+                notes.append(
+                    f"Path '{original_input}' did not exist and the alias registry "
+                    f"has no entry for basename '{candidate.name}'. Run list_pe_images "
+                    f"on the parent folder first if you want bare-filename resolution."
+                )
 
         session = sup.open_session(
             input_path,
@@ -1072,14 +1104,20 @@ def idalib_open(
             session_id=session_id,
             context_id=context_id,
         )
-        return {
+        result: IdalibOpenResult = {
             "success": True,
             **ctx,
             "session": session.to_dict(),
             "message": f"Binary opened and bound to context: {session.filename} ({session.session_id})",
         }
+        if notes:
+            result["notes"] = notes
+        return result
     except Exception as e:
-        return {"success": False, **ctx, "error": str(e)}
+        err: IdalibOpenResult = {"success": False, **ctx, "error": str(e)}
+        if notes:
+            err["notes"] = notes
+        return err
 
 
 @mcp.tool

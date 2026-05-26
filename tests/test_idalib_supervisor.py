@@ -1465,6 +1465,92 @@ def test_idalib_aliases_in_management_set():
     assert "idalib_aliases" in supmod.IDALIB_MANAGEMENT_TOOLS
 
 
+def test_idalib_open_falls_back_to_basename_when_absolute_path_missing(tmp_path):
+    # An agent often guesses a plausible absolute layout for a file that actually
+    # lives somewhere else. When that absolute path doesn't exist, the alias
+    # registry should still match on basename so the open succeeds.
+    old_supervisor = supmod.supervisor
+    sup = _FakeSupervisor()
+    supmod.supervisor = sup
+    sup.mcp = _TransportMcp(session_id="ctx-A")
+    try:
+        real_dir = tmp_path / "actual_location"
+        real_dir.mkdir()
+        real_file = real_dir / "thing.exe"
+        real_file.write_bytes(b"x")
+        sup.record_aliases({"thing.exe": str(real_file)})
+
+        guessed_path = str(tmp_path / "wrong" / "path" / "thing.exe")
+        result = supmod.idalib_open(input_path=guessed_path)
+
+        assert result.get("success") is True, result
+        assert sup.opened[0][1]["input_path"] == str(real_file)
+        assert "notes" in result
+        assert any("alias registry by basename" in n for n in result["notes"])
+    finally:
+        supmod.supervisor = old_supervisor
+
+
+def test_idalib_open_notes_when_absolute_missing_and_no_alias(tmp_path):
+    # Path doesn't exist, alias registry doesn't know the basename either.
+    # Should fail, but the error response should carry a note telling the agent
+    # what to try next (list_pe_images on the parent folder).
+    old_supervisor = supmod.supervisor
+    sup = _FakeSupervisor()
+    supmod.supervisor = sup
+    sup.mcp = _TransportMcp(session_id="ctx-A")
+    try:
+        guessed_path = str(tmp_path / "nowhere" / "missing.exe")
+        result = supmod.idalib_open(input_path=guessed_path)
+        assert result.get("success") is False
+        assert "error" in result
+        assert "notes" in result
+        assert any("list_pe_images" in n for n in result["notes"])
+        assert any("missing.exe" in n for n in result["notes"])
+    finally:
+        supmod.supervisor = old_supervisor
+
+
+def test_idalib_open_bare_filename_success_carries_note(tmp_path):
+    # The plain bare-filename happy path: alias registry matches on the very
+    # first lookup key, so the note should mention alias resolution but NOT
+    # mention basename fallback (since the input WAS the basename already).
+    old_supervisor = supmod.supervisor
+    sup = _FakeSupervisor()
+    supmod.supervisor = sup
+    sup.mcp = _TransportMcp(session_id="ctx-A")
+    try:
+        sample = tmp_path / "thing.exe"
+        sample.write_bytes(b"x")
+        sup.record_aliases({"thing.exe": str(sample)})
+
+        result = supmod.idalib_open(input_path="thing.exe")
+        assert result.get("success") is True
+        assert "notes" in result
+        joined = " ".join(result["notes"])
+        assert "alias registry" in joined
+        assert "by basename" not in joined  # the input IS the basename here
+    finally:
+        supmod.supervisor = old_supervisor
+
+
+def test_idalib_open_absolute_existing_path_emits_no_notes(tmp_path):
+    # When the supplied absolute path exists, no alias lookup happens, and no
+    # notes should be emitted -- the happy path stays quiet.
+    old_supervisor = supmod.supervisor
+    sup = _FakeSupervisor()
+    supmod.supervisor = sup
+    sup.mcp = _TransportMcp(session_id="ctx-A")
+    try:
+        sample = tmp_path / "happy.exe"
+        sample.write_bytes(b"x")
+        result = supmod.idalib_open(input_path=str(sample))
+        assert result.get("success") is True
+        assert "notes" not in result
+    finally:
+        supmod.supervisor = old_supervisor
+
+
 def test_resolve_session_isolated_reinit_simulates_user_scenario(tmp_path):
     # Reproduces the reported scenario:
     # 1. agent-A opens "only.exe" (binds context agent-A -> sole)
