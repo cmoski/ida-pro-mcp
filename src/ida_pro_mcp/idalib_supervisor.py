@@ -182,8 +182,8 @@ class PeImageInfo(TypedDict):
     filename: str
     size: int
     mtime: str
-    sha1: NotRequired[str]
-    crc32: NotRequired[str]
+    sha1: str  # empty string when hash=False
+    crc32: str  # empty string when hash=False
     machine: str
     arch: str
     bitness: int | None
@@ -1375,9 +1375,10 @@ def list_pe_images(
     Filters to files with a valid MZ + PE\\0\\0 header. Each entry includes size, UTC
     mtime, machine/arch/bitness, and Characteristics flags (is_executable_image, is_dll,
     is_system). When ``hash=True`` (default) each entry also includes SHA1 and CRC32 over
-    the full file contents; when ``hash=False`` the sha1/crc32 fields are omitted, which
-    is much faster on large trees. Entries already opened in this supervisor are flagged
-    (loaded + session_id).
+    the full file contents; when ``hash=False`` sha1 and crc32 are returned as empty
+    strings (the fields are always present so the published schema stays consistent),
+    which is much faster on large trees. Entries already opened in this supervisor are
+    flagged (loaded + session_id).
 
     Intended for shared/supervisor mode so clients can pick a binary for idalib_open and
     compare against on-disk copies. ``directory`` must be an absolute path. For recursive
@@ -1442,8 +1443,8 @@ def list_pe_images(
         if header is None:
             continue
 
-        sha1: str | None = None
-        crc32: str | None = None
+        sha1 = ""
+        crc32 = ""
         if hash:
             try:
                 sha1, crc32 = _hash_file(full_path)
@@ -1459,11 +1460,13 @@ def list_pe_images(
 
         mtime = datetime.fromtimestamp(st.st_mtime, tz=timezone.utc).isoformat()
 
-        entry: PeImageInfo = {
+        images.append({
             "path": str(full_path),
             "filename": full_path.name,
             "size": int(st.st_size),
             "mtime": mtime,
+            "sha1": sha1,
+            "crc32": crc32,
             "machine": header["machine"],
             "arch": header["arch"],
             "bitness": header["bitness"],
@@ -1473,12 +1476,7 @@ def list_pe_images(
             "is_system": header["is_system"],
             "loaded": session_id is not None,
             "session_id": session_id,
-        }
-        if sha1 is not None:
-            entry["sha1"] = sha1
-        if crc32 is not None:
-            entry["crc32"] = crc32
-        images.append(entry)
+        })
 
     images.sort(key=lambda img: os.path.normcase(img["path"]))
     result["images"] = images

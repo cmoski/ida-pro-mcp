@@ -1127,7 +1127,10 @@ def test_list_pe_images_skips_ida_artifacts(tmp_path):
         supmod.supervisor = old_supervisor
 
 
-def test_list_pe_images_hash_false_omits_sha1_crc32(tmp_path):
+def test_list_pe_images_hash_false_returns_empty_hash_fields(tmp_path):
+    # sha1/crc32 stay in the schema (always present) but are empty strings when
+    # hash=False, so the gateway's structured-content validator stays happy and
+    # callers can branch on `if entry["sha1"]:` to detect the fast-discovery mode.
     old_supervisor = supmod.supervisor
     supmod.supervisor = _FakeSupervisor()
     try:
@@ -1136,8 +1139,8 @@ def test_list_pe_images_hash_false_omits_sha1_crc32(tmp_path):
         result = supmod.list_pe_images(str(tmp_path), hash=False)
         assert result["count"] == 2
         for img in result["images"]:
-            assert "sha1" not in img
-            assert "crc32" not in img
+            assert img["sha1"] == ""
+            assert img["crc32"] == ""
             assert img["size"] > 0
             assert img["arch"] == "x64"
     finally:
