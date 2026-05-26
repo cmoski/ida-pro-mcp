@@ -50,6 +50,7 @@ IDALIB_MANAGEMENT_TOOLS = {
     "idalib_save",
     "idalib_health",
     "idalib_warmup",
+    "list_pe_images",
 }
 IDALIB_HIDDEN_PLUGIN_TOOLS = {"list_instances", "select_instance"}
 STDIO_PROXY_START_TIMEOUT_SEC = 120.0
@@ -174,6 +175,40 @@ class IdalibWarmupResult(IdalibContextFields, total=False):
     session: IdalibSessionInfo | None
     warmup: dict[str, Any] | None
     error: str | None
+
+
+class PeImageInfo(TypedDict):
+    path: str
+    filename: str
+    size: int
+    mtime: str
+    sha1: NotRequired[str]
+    crc32: NotRequired[str]
+    machine: str
+    arch: str
+    bitness: int | None
+    characteristics: str
+    is_executable_image: bool
+    is_dll: bool
+    is_system: bool
+    loaded: bool
+    session_id: str | None
+
+
+class PeImageError(TypedDict):
+    path: str
+    error: str
+
+
+class ListPeImagesResult(TypedDict, total=False):
+    directory: str
+    recursive: bool
+    count: int
+    images: list[PeImageInfo]
+    errors: list[PeImageError]
+    truncated: bool
+    limit_hit: str
+    error: str
 
 
 @dataclass
@@ -814,6 +849,18 @@ class IdalibSupervisor:
                 session_id = self.context_bindings.get(context_id)
                 if session_id is None and not self.isolated_contexts:
                     session_id = self.context_bindings.get(SHARED_FALLBACK_CONTEXT_ID)
+                if session_id is None and self.isolated_contexts:
+                    live = [s for s in self.sessions.values() if s.is_alive()]
+                    if len(live) == 1:
+                        sole = live[0]
+                        self.bind_context(context_id, sole.session_id)
+                        session_id = sole.session_id
+                        logger.info(
+                            "Auto-rebound context %s to sole live session %s (%s)",
+                            context_id,
+                            sole.session_id,
+                            sole.filename,
+                        )
                 if session_id is None:
                     raise RuntimeError(
                         "No database bound for this context. Use idalib_open(...), "
@@ -1128,6 +1175,321 @@ def idalib_warmup(
         return {"ready": False, **sup.context_fields(context_id), "session": None, "warmup": None, "error": "Unexpected warmup result"}
     except Exception as e:
         return {"ready": False, "error": str(e)}
+
+
+_PE_MACHINE_TABLE: dict[int, tuple[str, int | None]] = {
+    0x014C: ("x86", 32),
+    0x8664: ("x64", 64),
+    0x01C0: ("arm", 32),
+    0x01C4: ("armnt", 32),
+    0xAA64: ("arm64", 64),
+    0xA641: ("arm64ec", 64),
+    0x0200: ("ia64", 64),
+}
+
+_PE_OPT_MAGIC_BITNESS: dict[int, int] = {
+    0x10B: 32,
+    0x20B: 64,
+}
+
+_HASH_CHUNK_SIZE = 1024 * 1024
+
+# IDA on-disk artifacts that sit next to an analyzed binary. They are never
+# PE images, frequently exclusively locked by a live IDA worker (PermissionError
+# on read), and would otherwise show up as noise in every result entry for any
+# folder where someone has previously run IDA.
+_IDA_ARTIFACT_SUFFIXES = frozenset({
+    ".id0", ".id1", ".id2", ".nam", ".til", ".i64", ".idb",
+})
+
+
+def _is_ida_artifact(name: str) -> bool:
+    # Path.suffix is lowercase-sensitive; normalize.
+    dot = name.rfind(".")
+    if dot < 0:
+        return False
+    return name[dot:].lower() in _IDA_ARTIFACT_SUFFIXES
+
+
+def _iter_candidate_files(
+    root: Path,
+    recursive: bool,
+    on_dir_error,
+):
+    """Yield regular files under ``root``, skipping IDA artifact files.
+
+    Symlinks are not followed. Per-directory traversal errors are passed to
+    ``on_dir_error(path, exc)`` instead of aborting the walk.
+    """
+    if recursive:
+        def _walk_error(err: OSError) -> None:
+            on_dir_error(getattr(err, "filename", str(root)) or str(root), err)
+
+        for dirpath, _dirnames, filenames in os.walk(
+            str(root), followlinks=False, onerror=_walk_error
+        ):
+            for name in filenames:
+                if _is_ida_artifact(name):
+                    continue
+                full = Path(dirpath) / name
+                try:
+                    st = full.lstat()
+                except OSError as e:
+                    on_dir_error(str(full), e)
+                    continue
+                import stat as _stat
+
+                if not _stat.S_ISREG(st.st_mode):
+                    continue
+                yield full, st
+        return
+
+    try:
+        entries = list(os.scandir(str(root)))
+    except OSError as e:
+        on_dir_error(str(root), e)
+        return
+    try:
+        import stat as _stat
+
+        for entry in entries:
+            if _is_ida_artifact(entry.name):
+                continue
+            try:
+                st = entry.stat(follow_symlinks=False)
+            except OSError as e:
+                on_dir_error(entry.path, e)
+                continue
+            if not _stat.S_ISREG(st.st_mode):
+                continue
+            yield Path(entry.path), st
+    finally:
+        for entry in entries:
+            try:
+                entry.close = entry.close  # entries from scandir are closed when GC'd
+            except Exception:
+                pass
+
+
+def _parse_pe_header(fh, file_size: int) -> dict | None:
+    """Parse a PE header from an open binary file. Returns ``None`` if not a PE."""
+    import struct
+
+    if file_size < 0x40:
+        return None
+    fh.seek(0)
+    dos = fh.read(0x40)
+    if len(dos) < 0x40 or dos[:2] != b"MZ":
+        return None
+    (e_lfanew,) = struct.unpack_from("<I", dos, 0x3C)
+    if e_lfanew < 0x40 or e_lfanew + 24 > file_size:
+        return None
+    fh.seek(e_lfanew)
+    pe_sig = fh.read(4)
+    if pe_sig != b"PE\x00\x00":
+        return None
+    file_header = fh.read(20)
+    if len(file_header) < 20:
+        return None
+    machine, _num_sections, _ts, _ptr_sym, _num_sym, size_opt, characteristics = struct.unpack(
+        "<HHIIIHH", file_header
+    )
+    bitness: int | None
+    arch_entry = _PE_MACHINE_TABLE.get(machine)
+    if arch_entry is not None:
+        arch, bitness = arch_entry
+    else:
+        arch, bitness = "unknown", None
+
+    if size_opt >= 2:
+        opt_magic_bytes = fh.read(2)
+        if len(opt_magic_bytes) == 2:
+            (opt_magic,) = struct.unpack("<H", opt_magic_bytes)
+            mag_bits = _PE_OPT_MAGIC_BITNESS.get(opt_magic)
+            if mag_bits is not None:
+                bitness = mag_bits
+
+    return {
+        "machine": "0x%04x" % machine,
+        "arch": arch,
+        "bitness": bitness,
+        "characteristics": "0x%04x" % characteristics,
+        "is_executable_image": bool(characteristics & 0x0002),
+        "is_dll": bool(characteristics & 0x2000),
+        "is_system": bool(characteristics & 0x1000),
+    }
+
+
+def _hash_file(path: Path) -> tuple[str, str]:
+    """Stream ``path`` and return ``(sha1_hex, "0x%08x" % crc32)``."""
+    import hashlib
+    import zlib
+
+    sha1 = hashlib.sha1()
+    crc = 0
+    with open(path, "rb") as f:
+        while True:
+            chunk = f.read(_HASH_CHUNK_SIZE)
+            if not chunk:
+                break
+            sha1.update(chunk)
+            crc = zlib.crc32(chunk, crc)
+    return sha1.hexdigest(), "0x%08x" % (crc & 0xFFFFFFFF)
+
+
+def _loaded_index(sup: IdalibSupervisor) -> dict[str, str]:
+    """Snapshot ``path_key -> session_id`` for live sessions, taken under the supervisor lock."""
+    snapshot: list[tuple[str, str]] = []
+    with sup._lock:
+        for session in sup.sessions.values():
+            if not session.input_path:
+                continue
+            try:
+                if not session.is_alive():
+                    continue
+            except Exception:
+                continue
+            try:
+                key = sup._path_key(session.input_path)
+            except Exception:
+                key = os.path.normcase(session.input_path)
+            snapshot.append((key, session.session_id))
+    return dict(snapshot)
+
+
+@mcp.tool
+def list_pe_images(
+    directory: Annotated[str, "Absolute path to the directory to scan"],
+    recursive: Annotated[bool, "Recurse into subdirectories"] = False,
+    max_files: Annotated[int, "Max files to include before truncating (soft cap)"] = 2000,
+    max_errors: Annotated[int, "Max per-file/dir errors to record before truncating"] = 100,
+    time_budget_sec: Annotated[
+        float, "Wall-clock budget for the scan; 0 disables. Truncates when exceeded."
+    ] = 60.0,
+    hash: Annotated[
+        bool, "Compute SHA1/CRC32 per file. Disable for a fast discovery pass."
+    ] = True,
+) -> ListPeImagesResult:
+    """List PE images (EXE, DLL, SYS, OCX, ...) under a directory.
+
+    Filters to files with a valid MZ + PE\\0\\0 header. Each entry includes size, UTC
+    mtime, machine/arch/bitness, and Characteristics flags (is_executable_image, is_dll,
+    is_system). When ``hash=True`` (default) each entry also includes SHA1 and CRC32 over
+    the full file contents; when ``hash=False`` the sha1/crc32 fields are omitted, which
+    is much faster on large trees. Entries already opened in this supervisor are flagged
+    (loaded + session_id).
+
+    Intended for shared/supervisor mode so clients can pick a binary for idalib_open and
+    compare against on-disk copies. ``directory`` must be an absolute path. For recursive
+    scans of very large trees: use ``hash=False`` for discovery, then call again with
+    ``hash=True`` on a narrowed directory. Scans truncate when any of ``max_files``,
+    ``max_errors``, or ``time_budget_sec`` is hit; the result reports ``limit_hit``.
+    """
+    from datetime import timezone
+
+    sup = _require_supervisor()
+    result: ListPeImagesResult = {
+        "directory": directory,
+        "recursive": bool(recursive),
+        "count": 0,
+        "images": [],
+    }
+
+    dir_path = Path(directory)
+    if not dir_path.is_absolute():
+        result["error"] = "directory must be an absolute path"
+        return result
+    if not dir_path.exists():
+        result["error"] = f"directory not found: {directory}"
+        return result
+    if not dir_path.is_dir():
+        result["error"] = f"not a directory: {directory}"
+        return result
+
+    loaded = _loaded_index(sup)
+
+    images: list[PeImageInfo] = []
+    errors: list[PeImageError] = []
+    truncated = False
+    limit_hit: str | None = None
+    deadline = time.monotonic() + time_budget_sec if time_budget_sec > 0 else None
+
+    def _record_error(path: str, exc: BaseException) -> None:
+        nonlocal truncated, limit_hit
+        if len(errors) >= max_errors:
+            if not truncated:
+                truncated = True
+                limit_hit = "max_errors"
+            return
+        errors.append({"path": path, "error": f"{type(exc).__name__}: {exc}"})
+
+    for full_path, st in _iter_candidate_files(dir_path, bool(recursive), _record_error):
+        if len(images) >= max_files:
+            truncated = True
+            limit_hit = "max_files"
+            break
+        if deadline is not None and time.monotonic() >= deadline:
+            truncated = True
+            limit_hit = "time_budget"
+            break
+
+        try:
+            with open(full_path, "rb") as fh:
+                header = _parse_pe_header(fh, st.st_size)
+        except OSError as e:
+            _record_error(str(full_path), e)
+            continue
+        if header is None:
+            continue
+
+        sha1: str | None = None
+        crc32: str | None = None
+        if hash:
+            try:
+                sha1, crc32 = _hash_file(full_path)
+            except OSError as e:
+                _record_error(str(full_path), e)
+                continue
+
+        try:
+            key = sup._path_key(str(full_path))
+        except Exception:
+            key = os.path.normcase(str(full_path))
+        session_id = loaded.get(key)
+
+        mtime = datetime.fromtimestamp(st.st_mtime, tz=timezone.utc).isoformat()
+
+        entry: PeImageInfo = {
+            "path": str(full_path),
+            "filename": full_path.name,
+            "size": int(st.st_size),
+            "mtime": mtime,
+            "machine": header["machine"],
+            "arch": header["arch"],
+            "bitness": header["bitness"],
+            "characteristics": header["characteristics"],
+            "is_executable_image": header["is_executable_image"],
+            "is_dll": header["is_dll"],
+            "is_system": header["is_system"],
+            "loaded": session_id is not None,
+            "session_id": session_id,
+        }
+        if sha1 is not None:
+            entry["sha1"] = sha1
+        if crc32 is not None:
+            entry["crc32"] = crc32
+        images.append(entry)
+
+    images.sort(key=lambda img: os.path.normcase(img["path"]))
+    result["images"] = images
+    result["count"] = len(images)
+    if errors:
+        result["errors"] = errors
+    if truncated:
+        result["truncated"] = True
+        if limit_hit is not None:
+            result["limit_hit"] = limit_hit
+    return result
 
 
 @mcp.resource("ida://databases")

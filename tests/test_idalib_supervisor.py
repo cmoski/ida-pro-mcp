@@ -828,3 +828,480 @@ def test_closed_gui_session_does_not_reappear_if_closed_during_headless_fallback
         assert sup.spawned[-1].process.returncode == 0
     finally:
         restore()
+
+
+# ---------------------------------------------------------------------------
+# list_pe_images
+# ---------------------------------------------------------------------------
+
+
+def _make_pe_blob(
+    *,
+    machine: int = 0x8664,
+    characteristics: int = 0x0022,  # IMAGE_FILE_EXECUTABLE_IMAGE | LARGE_ADDRESS_AWARE
+    opt_magic: int = 0x20B,
+    body: bytes = b"PEDATA",
+) -> bytes:
+    """Build a minimal PE-shaped blob suitable for header parsing.
+
+    Layout: 64-byte DOS header with e_lfanew=0x40, then ``PE\\0\\0``, then a
+    20-byte IMAGE_FILE_HEADER with SizeOfOptionalHeader=2, then a 2-byte
+    Optional Header Magic, then ``body`` to make the file non-trivial.
+    """
+    import struct
+
+    dos = bytearray(0x40)
+    dos[:2] = b"MZ"
+    struct.pack_into("<I", dos, 0x3C, 0x40)
+    file_header = struct.pack(
+        "<HHIIIHH",
+        machine,          # Machine
+        0,                # NumberOfSections
+        0,                # TimeDateStamp
+        0,                # PointerToSymbolTable
+        0,                # NumberOfSymbols
+        2,                # SizeOfOptionalHeader
+        characteristics,  # Characteristics
+    )
+    opt = struct.pack("<H", opt_magic)
+    return bytes(dos) + b"PE\x00\x00" + file_header + opt + body
+
+
+def test_list_pe_images_in_management_set():
+    assert "list_pe_images" in supmod.IDALIB_MANAGEMENT_TOOLS
+
+
+def test_list_pe_images_tools_list_visibility():
+    old_supervisor = supmod.supervisor
+    supmod.supervisor = _FakeSupervisor()
+    try:
+        result = supmod._handle_tools_list({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
+        names = [t["name"] for t in result["result"]["tools"]]
+        assert "list_pe_images" in names
+    finally:
+        supmod.supervisor = old_supervisor
+
+
+def test_list_pe_images_routes_locally(tmp_path):
+    old_supervisor = supmod.supervisor
+    supmod.supervisor = _FakeSupervisor()
+    try:
+        result = supmod._handle_tools_call(
+            {
+                "jsonrpc": "2.0",
+                "id": 7,
+                "method": "tools/call",
+                "params": {
+                    "name": "list_pe_images",
+                    "arguments": {"directory": str(tmp_path)},
+                },
+            }
+        )
+        assert result is not None
+        assert not supmod.supervisor.forwarded
+        text = result["result"]["content"][0]["text"]
+        import json as _json
+
+        payload = _json.loads(text)
+        assert payload["directory"] == str(tmp_path)
+        assert payload["count"] == 0
+    finally:
+        supmod.supervisor = old_supervisor
+
+
+def test_list_pe_images_requires_absolute_path(tmp_path):
+    old_supervisor = supmod.supervisor
+    supmod.supervisor = _FakeSupervisor()
+    try:
+        result = supmod.list_pe_images("relative\\dir")
+        assert "error" in result
+        assert "absolute" in result["error"]
+        assert result["images"] == []
+        assert result["count"] == 0
+    finally:
+        supmod.supervisor = old_supervisor
+
+
+def test_list_pe_images_nonexistent_directory(tmp_path):
+    old_supervisor = supmod.supervisor
+    supmod.supervisor = _FakeSupervisor()
+    try:
+        missing = tmp_path / "missing"
+        result = supmod.list_pe_images(str(missing))
+        assert "error" in result
+        assert "not found" in result["error"]
+        assert result["images"] == []
+        assert result["count"] == 0
+    finally:
+        supmod.supervisor = old_supervisor
+
+
+def test_list_pe_images_omits_non_pe(tmp_path):
+    old_supervisor = supmod.supervisor
+    supmod.supervisor = _FakeSupervisor()
+    try:
+        (tmp_path / "notes.txt").write_bytes(b"hello world")
+        pe_blob = _make_pe_blob(machine=0x8664)
+        (tmp_path / "hello.exe").write_bytes(pe_blob)
+
+        # DLL with the DLL characteristics bit
+        dll_blob = _make_pe_blob(machine=0x8664, characteristics=0x2022)
+        (tmp_path / "lib.dll").write_bytes(dll_blob)
+
+        result = supmod.list_pe_images(str(tmp_path))
+        assert result["count"] == 2
+        by_name = {img["filename"]: img for img in result["images"]}
+        assert "notes.txt" not in by_name
+        assert by_name["hello.exe"]["arch"] == "x64"
+        assert by_name["hello.exe"]["bitness"] == 64
+        assert by_name["hello.exe"]["is_executable_image"] is True
+        assert by_name["hello.exe"]["is_dll"] is False
+        assert by_name["lib.dll"]["is_dll"] is True
+        assert by_name["lib.dll"]["is_executable_image"] is True
+    finally:
+        supmod.supervisor = old_supervisor
+
+
+def test_list_pe_images_hashes(tmp_path):
+    import hashlib
+    import zlib
+
+    old_supervisor = supmod.supervisor
+    supmod.supervisor = _FakeSupervisor()
+    try:
+        pe_blob = _make_pe_blob(body=b"abc123" * 100)
+        target = tmp_path / "sample.bin"
+        target.write_bytes(pe_blob)
+
+        result = supmod.list_pe_images(str(tmp_path))
+        assert result["count"] == 1
+        img = result["images"][0]
+        assert img["sha1"] == hashlib.sha1(pe_blob).hexdigest()
+        assert img["crc32"] == "0x%08x" % (zlib.crc32(pe_blob) & 0xFFFFFFFF)
+        assert img["size"] == len(pe_blob)
+    finally:
+        supmod.supervisor = old_supervisor
+
+
+def test_list_pe_images_loaded_session_marker(tmp_path):
+    old_supervisor = supmod.supervisor
+    sup = _FakeSupervisor()
+    supmod.supervisor = sup
+    try:
+        pe_one = tmp_path / "one.exe"
+        pe_two = tmp_path / "two.exe"
+        pe_one.write_bytes(_make_pe_blob(body=b"one"))
+        pe_two.write_bytes(_make_pe_blob(body=b"two"))
+
+        live_session = supmod.WorkerSession(
+            session_id="sess-one",
+            input_path=str(pe_one),
+            filename=pe_one.name,
+            host="127.0.0.1",
+            port=4242,
+            process=_FakeProcess(),
+        )
+        sup.sessions[live_session.session_id] = live_session
+        sup.path_to_session[sup._path_key(str(pe_one))] = live_session.session_id
+
+        result = supmod.list_pe_images(str(tmp_path))
+        by_name = {img["filename"]: img for img in result["images"]}
+        assert by_name["one.exe"]["loaded"] is True
+        assert by_name["one.exe"]["session_id"] == "sess-one"
+        assert by_name["two.exe"]["loaded"] is False
+        assert by_name["two.exe"]["session_id"] is None
+    finally:
+        supmod.supervisor = old_supervisor
+
+
+def test_list_pe_images_dead_sessions_are_not_marked_loaded(tmp_path):
+    old_supervisor = supmod.supervisor
+    sup = _FakeSupervisor()
+    supmod.supervisor = sup
+    try:
+        pe_path = tmp_path / "ghost.exe"
+        pe_path.write_bytes(_make_pe_blob())
+        dead_session = supmod.WorkerSession(
+            session_id="dead",
+            input_path=str(pe_path),
+            filename=pe_path.name,
+            host="127.0.0.1",
+            port=4243,
+            process=_DeadProcess(),
+        )
+        sup.sessions[dead_session.session_id] = dead_session
+
+        result = supmod.list_pe_images(str(tmp_path))
+        img = result["images"][0]
+        assert img["loaded"] is False
+        assert img["session_id"] is None
+    finally:
+        supmod.supervisor = old_supervisor
+
+
+def test_list_pe_images_truncation(tmp_path):
+    old_supervisor = supmod.supervisor
+    supmod.supervisor = _FakeSupervisor()
+    try:
+        for i in range(5):
+            (tmp_path / f"bin{i}.exe").write_bytes(_make_pe_blob(body=b"x" * (i + 1)))
+        result = supmod.list_pe_images(str(tmp_path), max_files=3)
+        assert result["count"] == 3
+        assert result.get("truncated") is True
+        assert result.get("limit_hit") == "max_files"
+    finally:
+        supmod.supervisor = old_supervisor
+
+
+def test_list_pe_images_recursive_dir_error(tmp_path, monkeypatch):
+    old_supervisor = supmod.supervisor
+    supmod.supervisor = _FakeSupervisor()
+    try:
+        readable = tmp_path / "ok"
+        readable.mkdir()
+        (readable / "a.exe").write_bytes(_make_pe_blob())
+        bad_dir_path = str(tmp_path / "denied")
+
+        real_walk = supmod.os.walk
+
+        def fake_walk(root, followlinks=False, onerror=None):
+            # First yield real contents, then synthesize an onerror call for a bad subdir
+            for triple in real_walk(root, followlinks=followlinks, onerror=onerror):
+                yield triple
+            if onerror is not None:
+                err = OSError(13, "Permission denied")
+                err.filename = bad_dir_path
+                onerror(err)
+
+        monkeypatch.setattr(supmod.os, "walk", fake_walk)
+
+        result = supmod.list_pe_images(str(tmp_path), recursive=True)
+        assert result["count"] == 1
+        assert "errors" in result
+        assert any(bad_dir_path in e["path"] for e in result["errors"])
+    finally:
+        supmod.supervisor = old_supervisor
+
+
+def test_list_pe_images_arch_variants(tmp_path):
+    old_supervisor = supmod.supervisor
+    supmod.supervisor = _FakeSupervisor()
+    try:
+        cases = [
+            ("x86.exe",   0x014C, 0x10B, "x86",   32),
+            ("x64.exe",   0x8664, 0x20B, "x64",   64),
+            ("arm64.dll", 0xAA64, 0x20B, "arm64", 64),
+            ("weird.bin", 0x9999, 0x20B, "unknown", 64),
+        ]
+        for name, machine, opt_magic, _arch, _bits in cases:
+            (tmp_path / name).write_bytes(
+                _make_pe_blob(machine=machine, opt_magic=opt_magic)
+            )
+        result = supmod.list_pe_images(str(tmp_path))
+        by_name = {img["filename"]: img for img in result["images"]}
+        for name, _machine, _magic, arch, bits in cases:
+            assert by_name[name]["arch"] == arch
+            assert by_name[name]["bitness"] == bits
+    finally:
+        supmod.supervisor = old_supervisor
+
+
+def test_list_pe_images_skips_ida_artifacts(tmp_path):
+    old_supervisor = supmod.supervisor
+    supmod.supervisor = _FakeSupervisor()
+    try:
+        (tmp_path / "sole_v1.05.exe").write_bytes(_make_pe_blob())
+        # IDA artifacts that would otherwise either parse as non-PE (and be silently
+        # dropped) or hit PermissionError on a locked database. They must not appear
+        # in `images` and must not show up in `errors[]` either.
+        for suffix in (".id0", ".id1", ".id2", ".nam", ".til", ".i64", ".idb"):
+            (tmp_path / f"sole_v1.05.exe{suffix}").write_bytes(b"\x00" * 16)
+        # And the uppercase variant — Windows is case-insensitive.
+        (tmp_path / "OTHER.ID0").write_bytes(b"\x00" * 16)
+
+        result = supmod.list_pe_images(str(tmp_path))
+        names = {img["filename"] for img in result["images"]}
+        assert names == {"sole_v1.05.exe"}
+        assert "errors" not in result
+    finally:
+        supmod.supervisor = old_supervisor
+
+
+def test_list_pe_images_hash_false_omits_sha1_crc32(tmp_path):
+    old_supervisor = supmod.supervisor
+    supmod.supervisor = _FakeSupervisor()
+    try:
+        (tmp_path / "a.exe").write_bytes(_make_pe_blob(body=b"abc"))
+        (tmp_path / "b.exe").write_bytes(_make_pe_blob(body=b"xyz"))
+        result = supmod.list_pe_images(str(tmp_path), hash=False)
+        assert result["count"] == 2
+        for img in result["images"]:
+            assert "sha1" not in img
+            assert "crc32" not in img
+            assert img["size"] > 0
+            assert img["arch"] == "x64"
+    finally:
+        supmod.supervisor = old_supervisor
+
+
+def test_list_pe_images_time_budget(tmp_path, monkeypatch):
+    old_supervisor = supmod.supervisor
+    supmod.supervisor = _FakeSupervisor()
+    try:
+        for i in range(5):
+            (tmp_path / f"bin{i}.exe").write_bytes(_make_pe_blob(body=bytes([i]) * 8))
+
+        # Fake clock: each call advances by 1.0s. Budget=2.5s -> loop should
+        # admit ~2 files then trip the deadline.
+        ticks = {"t": 0.0}
+
+        def fake_monotonic():
+            ticks["t"] += 1.0
+            return ticks["t"]
+
+        monkeypatch.setattr(supmod.time, "monotonic", fake_monotonic)
+        result = supmod.list_pe_images(str(tmp_path), time_budget_sec=2.5)
+        assert result.get("truncated") is True
+        assert result.get("limit_hit") == "time_budget"
+        assert result["count"] < 5
+    finally:
+        supmod.supervisor = old_supervisor
+
+
+def test_list_pe_images_time_budget_disabled(tmp_path, monkeypatch):
+    old_supervisor = supmod.supervisor
+    supmod.supervisor = _FakeSupervisor()
+    try:
+        for i in range(3):
+            (tmp_path / f"bin{i}.exe").write_bytes(_make_pe_blob(body=bytes([i])))
+
+        # Even if the clock claims big jumps, time_budget_sec=0 disables the check.
+        monkeypatch.setattr(supmod.time, "monotonic", lambda: 1e9)
+        result = supmod.list_pe_images(str(tmp_path), time_budget_sec=0)
+        assert result["count"] == 3
+        assert "truncated" not in result
+    finally:
+        supmod.supervisor = old_supervisor
+
+
+# ---------------------------------------------------------------------------
+# auto-rebind heuristic in resolve_session (isolated-contexts mode)
+# ---------------------------------------------------------------------------
+
+
+def _make_live_worker_session(session_id: str, input_path: str) -> supmod.WorkerSession:
+    return supmod.WorkerSession(
+        session_id=session_id,
+        input_path=input_path,
+        filename=Path(input_path).name,
+        host="127.0.0.1",
+        port=4242,
+        process=_FakeProcess(),
+    )
+
+
+def test_resolve_session_auto_rebinds_when_single_live_session_isolated(tmp_path):
+    sup = _FakeSupervisor()
+    sup.isolated_contexts = True
+    sup.mcp = _TransportMcp(session_id="agent-A")
+
+    sample = tmp_path / "only.exe"
+    sample.write_bytes(b"x")
+    only_session = _make_live_worker_session("sole", str(sample))
+    sup.sessions[only_session.session_id] = only_session
+
+    assert "agent-A" not in sup.context_bindings
+    resolved = sup.resolve_session()
+    assert resolved.session_id == "sole"
+    # Binding now persists for this context, so a second call is a plain lookup.
+    assert sup.context_bindings["agent-A"] == "sole"
+
+
+def test_resolve_session_does_not_auto_rebind_with_multiple_live_sessions(tmp_path):
+    sup = _FakeSupervisor()
+    sup.isolated_contexts = True
+    sup.mcp = _TransportMcp(session_id="agent-A")
+
+    a = tmp_path / "a.exe"
+    b = tmp_path / "b.exe"
+    a.write_bytes(b"x")
+    b.write_bytes(b"x")
+    sup.sessions["a"] = _make_live_worker_session("a", str(a))
+    sup.sessions["b"] = _make_live_worker_session("b", str(b))
+
+    try:
+        sup.resolve_session()
+    except RuntimeError as e:
+        assert "No database bound" in str(e)
+    else:
+        raise AssertionError("expected RuntimeError when ambiguous")
+    assert "agent-A" not in sup.context_bindings
+
+
+def test_resolve_session_does_not_auto_rebind_when_only_session_is_dead(tmp_path):
+    sup = _FakeSupervisor()
+    sup.isolated_contexts = True
+    sup.mcp = _TransportMcp(session_id="agent-A")
+
+    dead = tmp_path / "dead.exe"
+    dead.write_bytes(b"x")
+    dead_session = supmod.WorkerSession(
+        session_id="dead",
+        input_path=str(dead),
+        filename=dead.name,
+        host="127.0.0.1",
+        port=4242,
+        process=_DeadProcess(),
+    )
+    sup.sessions[dead_session.session_id] = dead_session
+
+    try:
+        sup.resolve_session()
+    except RuntimeError as e:
+        assert "No database bound" in str(e)
+    else:
+        raise AssertionError("expected RuntimeError when no live sessions")
+    assert "agent-A" not in sup.context_bindings
+
+
+def test_resolve_session_shared_mode_still_uses_fallback(tmp_path):
+    # In non-isolated mode, the existing fallback to SHARED_FALLBACK_CONTEXT_ID
+    # must still win before the auto-rebind path is even considered.
+    sup = _FakeSupervisor()
+    sup.isolated_contexts = False
+    sup.mcp = _TransportMcp(session_id="agent-A")
+
+    sample = tmp_path / "only.exe"
+    sample.write_bytes(b"x")
+    only_session = _make_live_worker_session("sole", str(sample))
+    sup.sessions["sole"] = only_session
+    sup.context_bindings[supmod.SHARED_FALLBACK_CONTEXT_ID] = "sole"
+
+    resolved = sup.resolve_session()
+    assert resolved.session_id == "sole"
+    # We did NOT touch the per-transport context binding; the shared fallback resolved it.
+    assert "agent-A" not in sup.context_bindings
+
+
+def test_resolve_session_isolated_reinit_simulates_user_scenario(tmp_path):
+    # Reproduces the reported scenario:
+    # 1. agent-A opens "only.exe" (binds context agent-A -> sole)
+    # 2. agent-A's transport drops; client re-initializes as agent-B
+    # 3. agent-B calls a tool with no database arg -> would have failed pre-fix
+    #    Now: auto-rebind finds the lone live session and binds context agent-B -> sole.
+    sup = _FakeSupervisor()
+    sup.isolated_contexts = True
+
+    sample = tmp_path / "only.exe"
+    sample.write_bytes(b"x")
+    only_session = _make_live_worker_session("sole", str(sample))
+    sup.sessions["sole"] = only_session
+    sup.context_bindings["agent-A"] = "sole"  # left over from prior connection
+
+    sup.mcp = _TransportMcp(session_id="agent-B")
+    resolved = sup.resolve_session()
+    assert resolved.session_id == "sole"
+    assert sup.context_bindings["agent-B"] == "sole"
+    # The stale binding from the previous transport is left alone — explicit cleanup
+    # only happens via idalib_close/idalib_unbind.
+    assert sup.context_bindings["agent-A"] == "sole"
