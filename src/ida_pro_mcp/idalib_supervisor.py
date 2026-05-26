@@ -2199,6 +2199,11 @@ def main() -> None:
 
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO)
 
+    # worker_args is forwarded to idalib_server worker subprocesses (one per
+    # opened binary). Those workers accept --verbose / --unsafe / --profile but
+    # NOT supervisor-only flags like --search-root: a worker just opens one
+    # file, it never pre-scans directories. Adding supervisor-only flags here
+    # crashes every worker spawn with argparse exit code 2.
     worker_args: list[str] = []
     if args.verbose:
         worker_args.append("--verbose")
@@ -2206,15 +2211,19 @@ def main() -> None:
         worker_args.append("--unsafe")
     if args.profile is not None:
         worker_args.extend(["--profile", str(args.profile)])
+
+    # Supervisor-only flags that re-spawning the supervisor as a daemon
+    # (--stdio-shared) needs to re-receive. Not forwarded to worker subprocesses.
+    supervisor_only_args: list[str] = []
     for root in args.search_root:
-        worker_args.extend(["--search-root", str(root)])
+        supervisor_only_args.extend(["--search-root", str(root)])
     if args.search_root_recursive:
-        worker_args.append("--search-root-recursive")
+        supervisor_only_args.append("--search-root-recursive")
 
     if args.stdio_shared:
         if args.input_path is not None and not args.input_path.exists():
             raise SystemExit(f"Input file not found: {args.input_path}")
-        daemon_args = list(worker_args)
+        daemon_args = list(worker_args) + list(supervisor_only_args)
         if args.isolated_contexts:
             daemon_args.append("--isolated-contexts")
         daemon_args.extend(["--max-workers", str(args.max_workers)])

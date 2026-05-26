@@ -1912,6 +1912,58 @@ def test_cli_accepts_search_root_repeatable(monkeypatch, tmp_path):
     assert args.search_root_recursive is True
 
 
+def test_search_root_not_forwarded_to_worker_args(monkeypatch, tmp_path):
+    # Regression: worker subprocesses don't accept --search-root and exit with
+    # code 2 if they receive it, which broke every worker spawn the first time
+    # the flag shipped. Verify the supervisor's main() never injects
+    # --search-root / --search-root-recursive into the worker_args sent down
+    # to idalib_server worker subprocesses.
+    captured: dict = {}
+
+    class _FakeSup(supmod.IdalibSupervisor):
+        def __init__(self, mcp, *, isolated_contexts=False, max_workers=4, worker_args=None):
+            super().__init__(
+                mcp,
+                isolated_contexts=isolated_contexts,
+                max_workers=max_workers,
+                worker_args=worker_args,
+            )
+            captured["worker_args"] = list(worker_args or [])
+
+        def shutdown(self):
+            pass
+
+    monkeypatch.setattr(supmod, "IdalibSupervisor", _FakeSup)
+
+    # Prevent main() from actually serving / installing signal handlers.
+    class _StopServe(Exception):
+        pass
+
+    def _no_serve(*args, **kwargs):
+        raise _StopServe()
+
+    monkeypatch.setattr(supmod.mcp, "serve", _no_serve)
+    monkeypatch.setattr(supmod.signal, "signal", lambda *a, **k: None)
+
+    monkeypatch.setattr(supmod.sys, "argv", [
+        "idalib-mcp",
+        "--host", "127.0.0.1",
+        "--port", "0",
+        "--search-root", str(tmp_path),
+        "--search-root-recursive",
+    ])
+
+    try:
+        supmod.main()
+    except _StopServe:
+        pass
+
+    assert "--search-root" not in captured["worker_args"]
+    assert "--search-root-recursive" not in captured["worker_args"]
+    # Sanity: the supervisor itself did record + scan the root.
+    assert str(tmp_path) in supmod.supervisor.search_roots
+
+
 def test_resolve_session_isolated_reinit_simulates_user_scenario(tmp_path):
     # Reproduces the reported scenario:
     # 1. agent-A opens "only.exe" (binds context agent-A -> sole)
