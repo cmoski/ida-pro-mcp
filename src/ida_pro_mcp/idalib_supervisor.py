@@ -50,6 +50,7 @@ IDALIB_MANAGEMENT_TOOLS = {
     "idalib_save",
     "idalib_health",
     "idalib_warmup",
+    "idalib_aliases",
     "list_pe_images",
 }
 IDALIB_HIDDEN_PLUGIN_TOOLS = {"list_instances", "select_instance"}
@@ -275,6 +276,10 @@ class IdalibSupervisor:
         self.sessions: dict[str, WorkerSession] = {}
         self.path_to_session: dict[str, str] = {}
         self.context_bindings: dict[str, str] = {}
+        # Filename -> absolute paths seen via list_pe_images. Lets callers open
+        # binaries by bare filename when their upstream safety layer rejects
+        # absolute paths.
+        self.alias_registry: dict[str, set[str]] = {}
         self._schema_worker: WorkerSession | None = None
         self._tools_cache: dict[tuple[str, ...], list[dict]] = {}
         self._resources_cache: dict[str, list[dict]] = {}
@@ -307,6 +312,47 @@ class IdalibSupervisor:
 
     def unbind_context(self, context_id: str) -> bool:
         return self.context_bindings.pop(context_id, None) is not None
+
+    # ------------------------------------------------------------------
+    # Alias registry — filename -> absolute paths seen via discovery
+    # ------------------------------------------------------------------
+
+    def record_aliases(self, filename_to_paths: dict[str, str]) -> None:
+        """Add (filename, absolute_path) pairs to the registry. Idempotent."""
+        with self._lock:
+            for name, path in filename_to_paths.items():
+                self.alias_registry.setdefault(name, set()).add(path)
+
+    def resolve_alias(
+        self, name_or_path: str, directory_hint: str | None = None
+    ) -> str | None:
+        """Resolve a bare filename to an absolute path via the alias registry.
+
+        - Returns the matching path on unique resolution.
+        - Returns None when no match is registered (caller falls back to its own logic).
+        - Raises RuntimeError when multiple paths share the filename and the caller
+          did not narrow with ``directory_hint``.
+        """
+        with self._lock:
+            paths = set(self.alias_registry.get(name_or_path) or ())
+        if not paths:
+            return None
+        if directory_hint:
+            try:
+                hint_key = os.path.normcase(str(Path(directory_hint).resolve()))
+            except Exception:
+                hint_key = os.path.normcase(directory_hint)
+            paths = {
+                p for p in paths if os.path.normcase(p).startswith(hint_key)
+            }
+            if not paths:
+                return None
+        if len(paths) == 1:
+            return next(iter(paths))
+        raise RuntimeError(
+            f"Ambiguous alias '{name_or_path}'; pass directory= to disambiguate. "
+            f"Candidates: {sorted(paths)}"
+        )
 
     # ------------------------------------------------------------------
     # Worker process lifecycle
@@ -969,15 +1015,43 @@ def _jsonrpc_error(request_id: Any, code: int, message: str) -> dict | None:
 
 @mcp.tool
 def idalib_open(
-    input_path: Annotated[str, "Path to the binary file to analyze"],
+    input_path: Annotated[
+        str,
+        "Absolute path to the binary, OR a bare filename previously surfaced by "
+        "list_pe_images (resolved via the supervisor alias registry).",
+    ],
     run_auto_analysis: Annotated[bool, "Run automatic analysis on the binary"] = True,
     session_id: Annotated[
         Optional[str], "Custom session ID (auto-generated if not provided)"
     ] = None,
+    directory: Annotated[
+        Optional[str],
+        "Optional directory hint that narrows alias resolution when the same "
+        "filename has been seen in multiple folders.",
+    ] = None,
 ) -> IdalibOpenResult:
-    """Open a binary in its own idalib worker process and bind it to this context."""
+    """Open a binary in its own idalib worker process and bind it to this context.
+
+    ``input_path`` accepts either an absolute filesystem path or a bare filename
+    that was returned by a prior ``list_pe_images`` call on this supervisor — the
+    registry built up by ``list_pe_images`` makes it safe for clients whose
+    upstream safety layer strips absolute paths to still address discovered
+    binaries by name. Use ``directory`` to disambiguate if the same filename has
+    been seen in multiple folders.
+    """
     sup = _require_supervisor()
     try:
+        # Resolve bare filenames / non-existent paths via the alias registry
+        # before handing to open_session (which expects a real filesystem path).
+        candidate = Path(input_path)
+        if not candidate.is_absolute() or not candidate.exists():
+            try:
+                resolved = sup.resolve_alias(input_path, directory_hint=directory)
+            except RuntimeError as e:
+                return {"error": str(e)}
+            if resolved is not None:
+                input_path = resolved
+
         context_id = sup.resolve_context_id()
         session = sup.open_session(
             input_path,
@@ -1175,6 +1249,30 @@ def idalib_warmup(
         return {"ready": False, **sup.context_fields(context_id), "session": None, "warmup": None, "error": "Unexpected warmup result"}
     except Exception as e:
         return {"ready": False, "error": str(e)}
+
+
+@mcp.tool
+def idalib_aliases(
+    filename: Annotated[
+        Optional[str],
+        "If set, return only paths matching this filename (or empty if unknown).",
+    ] = None,
+) -> dict:
+    """Show filenames known to the supervisor alias registry.
+
+    The registry is populated by ``list_pe_images`` and lets ``idalib_open``
+    resolve bare filenames to absolute paths — useful when an upstream safety
+    layer strips absolute paths from tool arguments.
+    """
+    sup = _require_supervisor()
+    with sup._lock:
+        if filename is not None:
+            paths = sorted(sup.alias_registry.get(filename, ()))
+            return {"filename": filename, "paths": paths, "count": len(paths)}
+        snapshot = {
+            name: sorted(paths) for name, paths in sup.alias_registry.items()
+        }
+    return {"count": len(snapshot), "aliases": snapshot}
 
 
 _PE_MACHINE_TABLE: dict[int, tuple[str, int | None]] = {
@@ -1479,6 +1577,9 @@ def list_pe_images(
         })
 
     images.sort(key=lambda img: os.path.normcase(img["path"]))
+    # Record (filename -> absolute path) so callers whose upstream safety layer
+    # strips absolute paths can later open these binaries by bare filename.
+    sup.record_aliases({img["filename"]: img["path"] for img in images})
     result["images"] = images
     result["count"] = len(images)
     if errors:

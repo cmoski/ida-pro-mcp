@@ -1286,6 +1286,185 @@ def test_resolve_session_shared_mode_still_uses_fallback(tmp_path):
     assert "agent-A" not in sup.context_bindings
 
 
+# ---------------------------------------------------------------------------
+# alias registry (bare-filename resolution for upstream path-stripped clients)
+# ---------------------------------------------------------------------------
+
+
+def test_list_pe_images_populates_alias_registry(tmp_path):
+    old_supervisor = supmod.supervisor
+    sup = _FakeSupervisor()
+    supmod.supervisor = sup
+    try:
+        (tmp_path / "alpha.exe").write_bytes(_make_pe_blob(body=b"a"))
+        (tmp_path / "beta.exe").write_bytes(_make_pe_blob(body=b"b"))
+        result = supmod.list_pe_images(str(tmp_path))
+        assert result["count"] == 2
+        assert "alpha.exe" in sup.alias_registry
+        assert "beta.exe" in sup.alias_registry
+        assert str(tmp_path / "alpha.exe") in sup.alias_registry["alpha.exe"]
+    finally:
+        supmod.supervisor = old_supervisor
+
+
+def test_resolve_alias_unique_match(tmp_path):
+    sup = _FakeSupervisor()
+    p = str(tmp_path / "only.exe")
+    sup.record_aliases({"only.exe": p})
+    assert sup.resolve_alias("only.exe") == p
+
+
+def test_resolve_alias_missing_returns_none():
+    sup = _FakeSupervisor()
+    assert sup.resolve_alias("never_seen.exe") is None
+
+
+def test_resolve_alias_ambiguous_raises(tmp_path):
+    sup = _FakeSupervisor()
+    a = tmp_path / "dir1"
+    b = tmp_path / "dir2"
+    a.mkdir()
+    b.mkdir()
+    sup.record_aliases({"shared.exe": str(a / "shared.exe")})
+    sup.record_aliases({"shared.exe": str(b / "shared.exe")})
+    try:
+        sup.resolve_alias("shared.exe")
+    except RuntimeError as e:
+        assert "Ambiguous alias" in str(e)
+        assert "directory=" in str(e)
+    else:
+        raise AssertionError("expected RuntimeError on ambiguous alias")
+
+
+def test_resolve_alias_directory_hint_disambiguates(tmp_path):
+    sup = _FakeSupervisor()
+    a_dir = tmp_path / "dir1"
+    b_dir = tmp_path / "dir2"
+    a_dir.mkdir()
+    b_dir.mkdir()
+    pa = str(a_dir / "shared.exe")
+    pb = str(b_dir / "shared.exe")
+    sup.record_aliases({"shared.exe": pa})
+    sup.record_aliases({"shared.exe": pb})
+    assert sup.resolve_alias("shared.exe", directory_hint=str(a_dir)) == pa
+    assert sup.resolve_alias("shared.exe", directory_hint=str(b_dir)) == pb
+
+
+def test_resolve_alias_directory_hint_no_match_returns_none(tmp_path):
+    sup = _FakeSupervisor()
+    a_dir = tmp_path / "real"
+    a_dir.mkdir()
+    sup.record_aliases({"x.exe": str(a_dir / "x.exe")})
+    assert sup.resolve_alias("x.exe", directory_hint=str(tmp_path / "wrong")) is None
+
+
+def test_idalib_open_resolves_bare_filename_via_registry(tmp_path):
+    old_supervisor = supmod.supervisor
+    sup = _FakeSupervisor()
+    supmod.supervisor = sup
+    sup.mcp = _TransportMcp(session_id="ctx-A")
+    try:
+        sample = tmp_path / "sole.exe"
+        sample.write_bytes(b"x")  # any contents fine; _FakeSupervisor stubs IDA.
+        sup.record_aliases({"sole.exe": str(sample)})
+
+        result = supmod.idalib_open(input_path="sole.exe")
+        assert result.get("success") is True
+        # open_session was invoked with the resolved absolute path, not the bare name.
+        assert sup.opened, "expected idalib_open to reach open_session"
+        assert sup.opened[0][1]["input_path"] == str(sample)
+    finally:
+        supmod.supervisor = old_supervisor
+
+
+def test_idalib_open_bare_filename_unknown_yields_clear_error(tmp_path):
+    old_supervisor = supmod.supervisor
+    sup = _FakeSupervisor()
+    supmod.supervisor = sup
+    sup.mcp = _TransportMcp(session_id="ctx-A")
+    try:
+        result = supmod.idalib_open(input_path="nope.exe")
+        # No registry entry, no real file -> open_session will raise FileNotFoundError.
+        assert "error" in result
+        assert "nope.exe" in result["error"]
+    finally:
+        supmod.supervisor = old_supervisor
+
+
+def test_idalib_open_ambiguous_alias_returns_error(tmp_path):
+    old_supervisor = supmod.supervisor
+    sup = _FakeSupervisor()
+    supmod.supervisor = sup
+    sup.mcp = _TransportMcp(session_id="ctx-A")
+    try:
+        d1 = tmp_path / "v1"
+        d2 = tmp_path / "v2"
+        d1.mkdir()
+        d2.mkdir()
+        sup.record_aliases({"sole.exe": str(d1 / "sole.exe")})
+        sup.record_aliases({"sole.exe": str(d2 / "sole.exe")})
+        result = supmod.idalib_open(input_path="sole.exe")
+        assert "error" in result
+        assert "Ambiguous alias" in result["error"]
+    finally:
+        supmod.supervisor = old_supervisor
+
+
+def test_idalib_open_ambiguous_alias_directory_hint_resolves(tmp_path):
+    old_supervisor = supmod.supervisor
+    sup = _FakeSupervisor()
+    supmod.supervisor = sup
+    sup.mcp = _TransportMcp(session_id="ctx-A")
+    try:
+        d1 = tmp_path / "v1"
+        d2 = tmp_path / "v2"
+        d1.mkdir()
+        d2.mkdir()
+        sole_v1 = d1 / "sole.exe"
+        sole_v2 = d2 / "sole.exe"
+        sole_v1.write_bytes(b"x")
+        sole_v2.write_bytes(b"x")
+        sup.record_aliases({"sole.exe": str(sole_v1)})
+        sup.record_aliases({"sole.exe": str(sole_v2)})
+
+        result = supmod.idalib_open(input_path="sole.exe", directory=str(d1))
+        assert result.get("success") is True
+        assert sup.opened[0][1]["input_path"] == str(sole_v1)
+    finally:
+        supmod.supervisor = old_supervisor
+
+
+def test_idalib_aliases_inspection_tool(tmp_path):
+    old_supervisor = supmod.supervisor
+    sup = _FakeSupervisor()
+    supmod.supervisor = sup
+    try:
+        p1 = str(tmp_path / "a.exe")
+        p2 = str(tmp_path / "b.exe")
+        sup.record_aliases({"a.exe": p1, "b.exe": p2})
+
+        # Full listing
+        full = supmod.idalib_aliases()
+        assert full["count"] == 2
+        assert full["aliases"]["a.exe"] == [p1]
+
+        # Filtered lookup
+        one = supmod.idalib_aliases(filename="a.exe")
+        assert one["paths"] == [p1]
+        assert one["count"] == 1
+
+        # Unknown filename
+        miss = supmod.idalib_aliases(filename="missing.exe")
+        assert miss["paths"] == []
+        assert miss["count"] == 0
+    finally:
+        supmod.supervisor = old_supervisor
+
+
+def test_idalib_aliases_in_management_set():
+    assert "idalib_aliases" in supmod.IDALIB_MANAGEMENT_TOOLS
+
+
 def test_resolve_session_isolated_reinit_simulates_user_scenario(tmp_path):
     # Reproduces the reported scenario:
     # 1. agent-A opens "only.exe" (binds context agent-A -> sole)
