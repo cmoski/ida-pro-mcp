@@ -51,6 +51,7 @@ IDALIB_MANAGEMENT_TOOLS = {
     "idalib_health",
     "idalib_warmup",
     "idalib_aliases",
+    "idalib_search_roots",
     "list_pe_images",
 }
 IDALIB_HIDDEN_PLUGIN_TOOLS = {"list_instances", "select_instance"}
@@ -279,8 +280,12 @@ class IdalibSupervisor:
         self.context_bindings: dict[str, str] = {}
         # Filename -> absolute paths seen via list_pe_images. Lets callers open
         # binaries by bare filename when their upstream safety layer rejects
-        # absolute paths.
+        # absolute paths, or when they don't know what paths the server uses.
         self.alias_registry: dict[str, set[str]] = {}
+        # Directories pre-scanned at startup via --search-root (see main()).
+        # Recorded purely for introspection by idalib_search_roots(); the
+        # actual filename -> absolute path mappings live in alias_registry.
+        self.search_roots: list[str] = []
         self._schema_worker: WorkerSession | None = None
         self._tools_cache: dict[tuple[str, ...], list[dict]] = {}
         self._resources_cache: dict[str, list[dict]] = {}
@@ -323,6 +328,100 @@ class IdalibSupervisor:
         with self._lock:
             for name, path in filename_to_paths.items():
                 self.alias_registry.setdefault(name, set()).add(path)
+
+    def suggest_aliases(self, name: str, n: int = 3) -> list[str]:
+        """Return up to ``n`` registered filenames similar to ``name``.
+
+        Matching is case-insensitive and combines difflib ratio similarity with
+        a substring fallback so common casing/format variants surface even when
+        difflib's ratio is borderline. Order is best-match first, no duplicates.
+        """
+        import difflib
+
+        with self._lock:
+            registry_names = list(self.alias_registry.keys())
+        if not registry_names:
+            return []
+        norm = (name or "").lower()
+        if not norm:
+            return []
+        lower_to_orig: dict[str, str] = {}
+        for orig in registry_names:
+            lower_to_orig.setdefault(orig.lower(), orig)
+        result: list[str] = []
+        seen: set[str] = set()
+        for low in difflib.get_close_matches(
+            norm, list(lower_to_orig.keys()), n=n, cutoff=0.5
+        ):
+            orig = lower_to_orig[low]
+            if orig in seen:
+                continue
+            seen.add(orig)
+            result.append(orig)
+        if len(result) < n:
+            for orig in registry_names:
+                if orig in seen:
+                    continue
+                low = orig.lower()
+                if norm in low or low in norm:
+                    seen.add(orig)
+                    result.append(orig)
+                    if len(result) >= n:
+                        break
+        return result[:n]
+
+    def prepopulate_aliases(
+        self, roots: list[str], *, recursive: bool = False
+    ) -> dict[str, dict[str, Any]]:
+        """Scan each root for PE images and register them in alias_registry.
+
+        Used by ``main()`` to honor ``--search-root`` flags at startup so that
+        ``idalib_aliases()`` returns useful data before any client call. Each
+        root is summarized as ``{"count": int, "error": str | None}``. A failing
+        root does not abort the scan of others. Recorded roots are surfaced via
+        ``idalib_search_roots()`` for caller introspection.
+        """
+        summary: dict[str, dict[str, Any]] = {}
+        for raw_root in roots:
+            # Record every attempted root for introspection regardless of
+            # outcome -- operators want to see "you asked for this, here's
+            # what happened" via idalib_search_roots().
+            with self._lock:
+                if raw_root not in self.search_roots:
+                    self.search_roots.append(raw_root)
+            entry: dict[str, Any] = {"count": 0, "error": None}
+            root_path = Path(raw_root)
+            if not root_path.is_absolute():
+                entry["error"] = "not an absolute path"
+                summary[raw_root] = entry
+                continue
+            if not root_path.exists():
+                entry["error"] = "not found"
+                summary[raw_root] = entry
+                continue
+            if not root_path.is_dir():
+                entry["error"] = "not a directory"
+                summary[raw_root] = entry
+                continue
+            count = 0
+            try:
+                for full_path, st in _iter_candidate_files(
+                    root_path, recursive, lambda *_: None
+                ):
+                    try:
+                        with open(full_path, "rb") as fh:
+                            header = _parse_pe_header(fh, st.st_size)
+                    except OSError:
+                        continue
+                    if header is None:
+                        continue
+                    self.record_aliases({full_path.name: str(full_path)})
+                    count += 1
+            except Exception as e:
+                entry["error"] = f"{type(e).__name__}: {e}"
+            entry["count"] = count
+            summary[raw_root] = entry
+        return summary
 
     def resolve_alias(
         self, name_or_path: str, directory_hint: str | None = None
@@ -1091,12 +1190,30 @@ def idalib_open(
                         f"Path '{original_input}' did not exist; resolved via alias "
                         f"registry by basename '{matched_key}' to '{resolved}'."
                     )
-            elif candidate.is_absolute() and not candidate.exists():
-                notes.append(
-                    f"Path '{original_input}' did not exist and the alias registry "
-                    f"has no entry for basename '{candidate.name}'. Run list_pe_images "
-                    f"on the parent folder first if you want bare-filename resolution."
-                )
+            else:
+                # Alias resolution missed. Build a useful breadcrumb so the
+                # caller can self-correct: explain WHY we couldn't resolve,
+                # what they could try next, and any near-matches in the
+                # registry (catches typos and casing/format variants like
+                # SOLE_v_1.05_original.exe vs sole_v1.05.exe).
+                if candidate.is_absolute() and not candidate.exists():
+                    notes.append(
+                        f"Path '{original_input}' did not exist and the alias "
+                        f"registry has no entry for basename '{candidate.name}'. "
+                        f"Run list_pe_images on the parent folder first if you "
+                        f"want bare-filename resolution."
+                    )
+                elif not candidate.is_absolute():
+                    notes.append(
+                        f"'{original_input}' is not an absolute path and was not "
+                        f"found in the alias registry. Call idalib_aliases() to "
+                        f"see what is registered, or list_pe_images on the "
+                        f"directory containing this file."
+                    )
+                suggestion_key = candidate.name or original_input
+                suggestions = sup.suggest_aliases(suggestion_key)
+                if suggestions:
+                    notes.append(f"Did you mean: {', '.join(suggestions)}?")
 
         session = sup.open_session(
             input_path,
@@ -1324,6 +1441,22 @@ def idalib_aliases(
             name: sorted(paths) for name, paths in sup.alias_registry.items()
         }
     return {"count": len(snapshot), "aliases": snapshot}
+
+
+@mcp.tool
+def idalib_search_roots() -> dict:
+    """Show directories the supervisor pre-scanned at startup via --search-root.
+
+    Each --search-root directory is walked once at supervisor startup and every
+    PE image found is registered in the alias registry. This means a freshly
+    connected client can call ``idalib_aliases()`` immediately to see what
+    binaries are available -- no need to know any server-side absolute path or
+    call ``list_pe_images`` first.
+    """
+    sup = _require_supervisor()
+    with sup._lock:
+        roots = list(sup.search_roots)
+    return {"roots": roots, "count": len(roots)}
 
 
 _PE_MACHINE_TABLE: dict[int, tuple[str, int | None]] = {
@@ -2045,6 +2178,22 @@ def main() -> None:
         default=int(os.environ.get("IDA_MCP_MAX_WORKERS", "4")),
         help="Maximum simultaneous idalib worker databases (0 = unlimited, default: 4).",
     )
+    parser.add_argument(
+        "--search-root",
+        action="append",
+        default=[],
+        metavar="DIR",
+        help=(
+            "Absolute directory to pre-scan at startup. Every PE image found is "
+            "registered in the alias registry so clients can call idalib_open(filename) "
+            "without knowing the server-side absolute path. Repeatable."
+        ),
+    )
+    parser.add_argument(
+        "--search-root-recursive",
+        action="store_true",
+        help="Walk --search-root directories recursively. Off by default.",
+    )
     parser.add_argument("input_path", type=Path, nargs="?", help="Optional binary to open on startup.")
     args = parser.parse_args()
 
@@ -2057,6 +2206,10 @@ def main() -> None:
         worker_args.append("--unsafe")
     if args.profile is not None:
         worker_args.extend(["--profile", str(args.profile)])
+    for root in args.search_root:
+        worker_args.extend(["--search-root", str(root)])
+    if args.search_root_recursive:
+        worker_args.append("--search-root-recursive")
 
     if args.stdio_shared:
         if args.input_path is not None and not args.input_path.exists():
@@ -2082,6 +2235,23 @@ def main() -> None:
     )
     mcp.registry.dispatch = dispatch_supervisor
     mcp.require_streamable_http_session = args.isolated_contexts
+
+    if args.search_root:
+        summary = supervisor.prepopulate_aliases(
+            [str(r) for r in args.search_root],
+            recursive=args.search_root_recursive,
+        )
+        for root, info in summary.items():
+            if info.get("error"):
+                logger.warning(
+                    "--search-root %s skipped: %s", root, info["error"]
+                )
+            else:
+                logger.info(
+                    "--search-root %s: registered %d PE image(s)",
+                    root,
+                    info["count"],
+                )
 
     if args.input_path is not None:
         startup_context_id = STDIO_DEFAULT_CONTEXT_ID if args.isolated_contexts else SHARED_FALLBACK_CONTEXT_ID

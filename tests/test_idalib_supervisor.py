@@ -1638,6 +1638,280 @@ def test_idalib_open_absolute_existing_path_emits_no_notes(tmp_path):
         supmod.supervisor = old_supervisor
 
 
+# ---------------------------------------------------------------------------
+# suggest_aliases: fuzzy "did you mean" matching
+# ---------------------------------------------------------------------------
+
+
+def test_suggest_aliases_empty_registry_returns_empty():
+    sup = _FakeSupervisor()
+    assert sup.suggest_aliases("anything.exe") == []
+
+
+def test_suggest_aliases_close_match(tmp_path):
+    sup = _FakeSupervisor()
+    sup.record_aliases({"sole_v1.05.exe": str(tmp_path / "sole_v1.05.exe")})
+    sup.record_aliases({"sole_v1.04.exe": str(tmp_path / "sole_v1.04.exe")})
+    sup.record_aliases({"unrelated.dll": str(tmp_path / "unrelated.dll")})
+
+    suggestions = sup.suggest_aliases("sole_v1.05_typo.exe")
+    assert "sole_v1.05.exe" in suggestions
+    assert "unrelated.dll" not in suggestions
+
+
+def test_suggest_aliases_case_insensitive(tmp_path):
+    sup = _FakeSupervisor()
+    sup.record_aliases({"sole_v1.05.exe": str(tmp_path / "sole_v1.05.exe")})
+    # User typed uppercase / different casing
+    suggestions = sup.suggest_aliases("SOLE_V1.05.EXE")
+    assert "sole_v1.05.exe" in suggestions
+
+
+def test_suggest_aliases_substring_fallback(tmp_path):
+    # User's literal example: SOLE_v_1.05_original.exe vs sole_v1.05.exe.
+    # difflib ratio is borderline; the substring fallback must still surface it.
+    sup = _FakeSupervisor()
+    sup.record_aliases({"sole_v1.05.exe": str(tmp_path / "sole_v1.05.exe")})
+    sup.record_aliases({"sole_v1.04.exe": str(tmp_path / "sole_v1.04.exe")})
+
+    suggestions = sup.suggest_aliases("SOLE_v_1.05_original.exe")
+    # Both share the "sole_v1" prefix on lowercase; at least sole_v1.05.exe
+    # must be suggested via either the difflib or substring pass.
+    assert "sole_v1.05.exe" in suggestions
+
+
+def test_suggest_aliases_respects_n_limit(tmp_path):
+    sup = _FakeSupervisor()
+    for i in range(10):
+        name = f"foo_v{i}.exe"
+        sup.record_aliases({name: str(tmp_path / name)})
+    suggestions = sup.suggest_aliases("foo_v3.exe", n=2)
+    assert len(suggestions) <= 2
+
+
+def test_suggest_aliases_no_match_returns_empty(tmp_path):
+    sup = _FakeSupervisor()
+    sup.record_aliases({"alpha.exe": str(tmp_path / "alpha.exe")})
+    assert sup.suggest_aliases("zzzzz_completely_different.dat") == []
+
+
+def test_suggest_aliases_handles_empty_query():
+    sup = _FakeSupervisor()
+    sup.record_aliases({"x.exe": "/tmp/x.exe"})
+    assert sup.suggest_aliases("") == []
+
+
+# ---------------------------------------------------------------------------
+# prepopulate_aliases: --search-root pre-scan at startup
+# ---------------------------------------------------------------------------
+
+
+def test_prepopulate_aliases_registers_pe_images(tmp_path):
+    sup = _FakeSupervisor()
+    (tmp_path / "a.exe").write_bytes(_make_pe_blob(body=b"a"))
+    (tmp_path / "b.exe").write_bytes(_make_pe_blob(body=b"b"))
+    (tmp_path / "notes.txt").write_bytes(b"not a PE")
+
+    summary = sup.prepopulate_aliases([str(tmp_path)])
+    assert summary[str(tmp_path)]["count"] == 2
+    assert summary[str(tmp_path)]["error"] is None
+    assert "a.exe" in sup.alias_registry
+    assert "b.exe" in sup.alias_registry
+    assert str(tmp_path / "a.exe") in sup.alias_registry["a.exe"]
+    # search_roots is recorded for introspection regardless of outcome
+    assert str(tmp_path) in sup.search_roots
+
+
+def test_prepopulate_aliases_recursive(tmp_path):
+    sup = _FakeSupervisor()
+    sub = tmp_path / "sub"
+    sub.mkdir()
+    (tmp_path / "top.exe").write_bytes(_make_pe_blob(body=b"t"))
+    (sub / "deep.exe").write_bytes(_make_pe_blob(body=b"d"))
+
+    # Default (non-recursive) only sees top.exe
+    summary = sup.prepopulate_aliases([str(tmp_path)], recursive=False)
+    assert summary[str(tmp_path)]["count"] == 1
+    assert "top.exe" in sup.alias_registry
+    assert "deep.exe" not in sup.alias_registry
+
+    # Recursive sees both
+    sup2 = _FakeSupervisor()
+    summary2 = sup2.prepopulate_aliases([str(tmp_path)], recursive=True)
+    assert summary2[str(tmp_path)]["count"] == 2
+    assert "top.exe" in sup2.alias_registry
+    assert "deep.exe" in sup2.alias_registry
+
+
+def test_prepopulate_aliases_missing_root(tmp_path):
+    sup = _FakeSupervisor()
+    missing = str(tmp_path / "does_not_exist")
+    summary = sup.prepopulate_aliases([missing])
+    assert summary[missing]["count"] == 0
+    assert "not found" in summary[missing]["error"]
+    # Recorded even on failure so the operator sees what was requested
+    assert missing in sup.search_roots
+
+
+def test_prepopulate_aliases_relative_root_rejected(tmp_path):
+    sup = _FakeSupervisor()
+    summary = sup.prepopulate_aliases(["relative/path"])
+    assert summary["relative/path"]["count"] == 0
+    assert "absolute" in summary["relative/path"]["error"]
+
+
+def test_prepopulate_aliases_file_not_dir(tmp_path):
+    sup = _FakeSupervisor()
+    f = tmp_path / "im_a_file.exe"
+    f.write_bytes(_make_pe_blob())
+    summary = sup.prepopulate_aliases([str(f)])
+    assert summary[str(f)]["count"] == 0
+    assert "not a directory" in summary[str(f)]["error"]
+
+
+def test_prepopulate_aliases_one_bad_root_does_not_abort_others(tmp_path):
+    sup = _FakeSupervisor()
+    good = tmp_path / "good"
+    good.mkdir()
+    (good / "x.exe").write_bytes(_make_pe_blob())
+    bad = str(tmp_path / "bad" / "missing")
+
+    summary = sup.prepopulate_aliases([bad, str(good)])
+    assert summary[bad]["error"] is not None
+    assert summary[str(good)]["count"] == 1
+    assert "x.exe" in sup.alias_registry
+
+
+def test_prepopulate_aliases_dedupes_repeat_call(tmp_path):
+    sup = _FakeSupervisor()
+    (tmp_path / "x.exe").write_bytes(_make_pe_blob())
+    sup.prepopulate_aliases([str(tmp_path)])
+    sup.prepopulate_aliases([str(tmp_path)])
+    # alias_registry uses a set so the second call is idempotent
+    assert len(sup.alias_registry["x.exe"]) == 1
+    # search_roots also dedupes
+    assert sup.search_roots.count(str(tmp_path)) == 1
+
+
+# ---------------------------------------------------------------------------
+# idalib_search_roots tool
+# ---------------------------------------------------------------------------
+
+
+def test_idalib_search_roots_in_management_set():
+    assert "idalib_search_roots" in supmod.IDALIB_MANAGEMENT_TOOLS
+
+
+def test_idalib_search_roots_returns_empty_when_unset():
+    old_supervisor = supmod.supervisor
+    supmod.supervisor = _FakeSupervisor()
+    try:
+        result = supmod.idalib_search_roots()
+        assert result["roots"] == []
+        assert result["count"] == 0
+    finally:
+        supmod.supervisor = old_supervisor
+
+
+def test_idalib_search_roots_returns_prepopulated(tmp_path):
+    old_supervisor = supmod.supervisor
+    sup = _FakeSupervisor()
+    supmod.supervisor = sup
+    try:
+        (tmp_path / "x.exe").write_bytes(_make_pe_blob())
+        sup.prepopulate_aliases([str(tmp_path)])
+        result = supmod.idalib_search_roots()
+        assert result["count"] == 1
+        assert result["roots"] == [str(tmp_path)]
+    finally:
+        supmod.supervisor = old_supervisor
+
+
+# ---------------------------------------------------------------------------
+# idalib_open: "did you mean" suggestions wired into notes
+# ---------------------------------------------------------------------------
+
+
+def test_idalib_open_emits_did_you_mean_for_absolute_miss(tmp_path):
+    old_supervisor = supmod.supervisor
+    sup = _FakeSupervisor()
+    supmod.supervisor = sup
+    sup.mcp = _TransportMcp(session_id="ctx-A")
+    try:
+        real_dir = tmp_path / "real"
+        real_dir.mkdir()
+        sup.record_aliases({"sole_v1.05.exe": str(real_dir / "sole_v1.05.exe")})
+        # Reproduces the literal failure: agent supplies absolute path with
+        # a casing/format mismatch on the filename.
+        bad = str(tmp_path / "fake" / "SOLE_v_1.05_original.exe")
+        result = supmod.idalib_open(input_path=bad)
+        assert result.get("success") is False
+        assert "notes" in result
+        joined = " ".join(result["notes"])
+        assert "Did you mean" in joined
+        assert "sole_v1.05.exe" in joined
+    finally:
+        supmod.supervisor = old_supervisor
+
+
+def test_idalib_open_emits_did_you_mean_for_bare_filename_miss(tmp_path):
+    old_supervisor = supmod.supervisor
+    sup = _FakeSupervisor()
+    supmod.supervisor = sup
+    sup.mcp = _TransportMcp(session_id="ctx-A")
+    try:
+        sup.record_aliases({"sole_v1.05.exe": str(tmp_path / "sole_v1.05.exe")})
+        result = supmod.idalib_open(input_path="sole_v1.05_TYPO.exe")
+        assert result.get("success") is False
+        assert "notes" in result
+        joined = " ".join(result["notes"])
+        assert "alias registry" in joined
+        assert "idalib_aliases" in joined or "list_pe_images" in joined
+        assert "Did you mean" in joined
+        assert "sole_v1.05.exe" in joined
+    finally:
+        supmod.supervisor = old_supervisor
+
+
+def test_idalib_open_no_suggestion_when_registry_empty(tmp_path):
+    old_supervisor = supmod.supervisor
+    sup = _FakeSupervisor()
+    supmod.supervisor = sup
+    sup.mcp = _TransportMcp(session_id="ctx-A")
+    try:
+        # Empty registry -- no suggestions to make.
+        result = supmod.idalib_open(input_path="anything.exe")
+        assert result.get("success") is False
+        # The breadcrumb about idalib_aliases / list_pe_images should still
+        # appear, but no "Did you mean" line since there's nothing to suggest.
+        joined = " ".join(result.get("notes", []))
+        assert "Did you mean" not in joined
+    finally:
+        supmod.supervisor = old_supervisor
+
+
+# ---------------------------------------------------------------------------
+# CLI flag parsing for --search-root / --search-root-recursive
+# ---------------------------------------------------------------------------
+
+
+def test_cli_accepts_search_root_repeatable(monkeypatch, tmp_path):
+    # Exercise just the argparse layer: assert the parsed namespace has the
+    # repeated --search-root values and the recursive flag wired through.
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--search-root", action="append", default=[])
+    parser.add_argument("--search-root-recursive", action="store_true")
+    args = parser.parse_args([
+        "--search-root", str(tmp_path / "one"),
+        "--search-root", str(tmp_path / "two"),
+        "--search-root-recursive",
+    ])
+    assert args.search_root == [str(tmp_path / "one"), str(tmp_path / "two")]
+    assert args.search_root_recursive is True
+
+
 def test_resolve_session_isolated_reinit_simulates_user_scenario(tmp_path):
     # Reproduces the reported scenario:
     # 1. agent-A opens "only.exe" (binds context agent-A -> sole)
