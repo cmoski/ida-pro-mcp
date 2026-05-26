@@ -1529,6 +1529,12 @@ def list_pe_images(
     which is much faster on large trees. Entries already opened in this supervisor are
     flagged (loaded + session_id).
 
+    The ``path`` field is relative to the queried ``directory`` (forward-slash
+    separated) -- non-recursive scans return paths equal to the filename, recursive
+    scans return ``subdir/file.exe`` style relatives. Absolute paths stay strictly
+    server-internal: the alias registry built by this call uses absolute paths under
+    the hood so callers can pass either ``path`` or ``filename`` to ``idalib_open``.
+
     Intended for shared/supervisor mode so clients can pick a binary for idalib_open and
     compare against on-disk copies. ``directory`` must be an absolute path. For recursive
     scans of very large trees: use ``hash=False`` for discovery, then call again with
@@ -1558,7 +1564,10 @@ def list_pe_images(
 
     loaded = _loaded_index(sup)
 
-    images: list[PeImageInfo] = []
+    # Each pending entry pairs the wire-format PeImageInfo (relative `path`) with the
+    # absolute filesystem path used for internal cross-referencing and registry
+    # population. Absolute paths never escape this function.
+    pending: list[tuple[PeImageInfo, str]] = []
     errors: list[PeImageError] = []
     truncated = False
     limit_hit: str | None = None
@@ -1574,7 +1583,7 @@ def list_pe_images(
         errors.append({"path": path, "error": f"{type(exc).__name__}: {exc}"})
 
     for full_path, st in _iter_candidate_files(dir_path, bool(recursive), _record_error):
-        if len(images) >= max_files:
+        if len(pending) >= max_files:
             truncated = True
             limit_hit = "max_files"
             break
@@ -1601,16 +1610,25 @@ def list_pe_images(
                 _record_error(str(full_path), e)
                 continue
 
+        abs_path = str(full_path)
         try:
-            key = sup._path_key(str(full_path))
+            key = sup._path_key(abs_path)
         except Exception:
-            key = os.path.normcase(str(full_path))
+            key = os.path.normcase(abs_path)
         session_id = loaded.get(key)
+
+        try:
+            rel_path = full_path.relative_to(dir_path).as_posix()
+        except ValueError:
+            # Walker promised a file under dir_path; if relative_to ever
+            # fails, fall back to the basename so we still emit something
+            # non-absolute on the wire.
+            rel_path = full_path.name
 
         mtime = datetime.fromtimestamp(st.st_mtime, tz=timezone.utc).isoformat()
 
-        images.append({
-            "path": str(full_path),
+        entry: PeImageInfo = {
+            "path": rel_path,
             "filename": full_path.name,
             "size": int(st.st_size),
             "mtime": mtime,
@@ -1625,12 +1643,16 @@ def list_pe_images(
             "is_system": header["is_system"],
             "loaded": session_id is not None,
             "session_id": session_id,
-        })
+        }
+        pending.append((entry, abs_path))
 
-    images.sort(key=lambda img: os.path.normcase(img["path"]))
-    # Record (filename -> absolute path) so callers whose upstream safety layer
-    # strips absolute paths can later open these binaries by bare filename.
-    sup.record_aliases({img["filename"]: img["path"] for img in images})
+    pending.sort(key=lambda pair: pair[0]["path"].lower())
+    # Record (filename -> absolute path) so callers can later open these binaries
+    # by bare filename (or by the relative `path` we just returned, which the
+    # idalib_open basename fallback handles). The registry keeps absolute paths
+    # internally; only the wire response uses relative paths.
+    sup.record_aliases({entry["filename"]: abs_p for entry, abs_p in pending})
+    images = [entry for entry, _ in pending]
     result["images"] = images
     result["count"] = len(images)
     if errors:

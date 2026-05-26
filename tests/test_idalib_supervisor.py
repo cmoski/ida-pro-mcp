@@ -1106,6 +1106,93 @@ def test_list_pe_images_arch_variants(tmp_path):
         supmod.supervisor = old_supervisor
 
 
+def test_list_pe_images_path_is_relative_non_recursive(tmp_path):
+    # Non-recursive: wire-format `path` must equal `filename`. Absolute server
+    # paths (drive letters, leading slashes, the tmp_path prefix) must NEVER
+    # appear in the response.
+    old_supervisor = supmod.supervisor
+    supmod.supervisor = _FakeSupervisor()
+    try:
+        (tmp_path / "thing.exe").write_bytes(_make_pe_blob())
+        result = supmod.list_pe_images(str(tmp_path))
+        assert result["count"] == 1
+        img = result["images"][0]
+        assert img["path"] == "thing.exe"
+        assert img["path"] == img["filename"]
+        # No leaked absolute prefix anywhere
+        assert str(tmp_path) not in img["path"]
+    finally:
+        supmod.supervisor = old_supervisor
+
+
+def test_list_pe_images_path_is_posix_relative_recursive(tmp_path):
+    # Recursive scan keeps locality info via forward-slash relative paths,
+    # but still doesn't leak the absolute root prefix.
+    old_supervisor = supmod.supervisor
+    supmod.supervisor = _FakeSupervisor()
+    try:
+        sub = tmp_path / "sub"
+        sub.mkdir()
+        nested = sub / "deeper"
+        nested.mkdir()
+        (tmp_path / "root.exe").write_bytes(_make_pe_blob(body=b"r"))
+        (sub / "child.exe").write_bytes(_make_pe_blob(body=b"c"))
+        (nested / "grand.exe").write_bytes(_make_pe_blob(body=b"g"))
+
+        result = supmod.list_pe_images(str(tmp_path), recursive=True)
+        assert result["count"] == 3
+        paths = {img["path"] for img in result["images"]}
+        assert paths == {"root.exe", "sub/child.exe", "sub/deeper/grand.exe"}
+        for img in result["images"]:
+            assert str(tmp_path) not in img["path"]
+            # Forward slashes only -- no Windows backslashes leak into wire format
+            assert "\\" not in img["path"]
+    finally:
+        supmod.supervisor = old_supervisor
+
+
+def test_list_pe_images_registers_absolute_path_internally(tmp_path):
+    # The wire response uses relative paths, but the alias registry must still
+    # hold the absolute path -- otherwise idalib_open could not actually open
+    # the file. This is the critical "leak nothing on the wire, keep absolute
+    # paths internal" guarantee.
+    old_supervisor = supmod.supervisor
+    sup = _FakeSupervisor()
+    supmod.supervisor = sup
+    try:
+        (tmp_path / "alpha.exe").write_bytes(_make_pe_blob(body=b"a"))
+        result = supmod.list_pe_images(str(tmp_path))
+        # Wire path is relative
+        assert result["images"][0]["path"] == "alpha.exe"
+        # But the registry has the absolute path
+        registered = sup.alias_registry["alpha.exe"]
+        assert str(tmp_path / "alpha.exe") in registered
+    finally:
+        supmod.supervisor = old_supervisor
+
+
+def test_idalib_open_accepts_wire_path_from_list_pe_images(tmp_path):
+    # End-to-end: take a `path` straight from a list_pe_images response and pass
+    # it back to idalib_open. The basename fallback should resolve it via the
+    # registry.
+    old_supervisor = supmod.supervisor
+    sup = _FakeSupervisor()
+    supmod.supervisor = sup
+    sup.mcp = _TransportMcp(session_id="ctx-A")
+    try:
+        (tmp_path / "beta.exe").write_bytes(_make_pe_blob(body=b"b"))
+        listing = supmod.list_pe_images(str(tmp_path))
+        wire_path = listing["images"][0]["path"]
+        assert wire_path == "beta.exe"  # sanity
+
+        result = supmod.idalib_open(input_path=wire_path)
+        assert result.get("success") is True
+        # open_session received the absolute path the registry resolved to
+        assert sup.opened[0][1]["input_path"] == str(tmp_path / "beta.exe")
+    finally:
+        supmod.supervisor = old_supervisor
+
+
 def test_list_pe_images_skips_ida_artifacts(tmp_path):
     old_supervisor = supmod.supervisor
     supmod.supervisor = _FakeSupervisor()
