@@ -52,11 +52,21 @@ IDALIB_MANAGEMENT_TOOLS = {
     "idalib_warmup",
     "idalib_aliases",
     "idalib_search_roots",
+    "idalib_restart_worker",
     "list_pe_images",
 }
 IDALIB_HIDDEN_PLUGIN_TOOLS = {"list_instances", "select_instance"}
 STDIO_PROXY_START_TIMEOUT_SEC = 120.0
 STDIO_PROXY_PROBE_SESSION_ID = "idalib-stdio-proxy-probe"
+
+# Bounded supervisor -> worker HTTP timeouts. Without these, a wedged worker
+# blocks the supervisor request thread forever. Ordinary tool calls get a
+# generous cap (they may legitimately run minutes of analysis); probe-style
+# calls get short timeouts so the supervisor can always answer "is this worker
+# wedged?" quickly instead of hanging behind the wedge.
+_DEFAULT_WORKER_TOOL_TIMEOUT_SEC = 300.0
+_PROBE_WORKER_TIMEOUT_SEC = 5.0
+_WARMUP_WORKER_TIMEOUT_SEC = 180.0
 
 
 def _import_zeromcp():
@@ -171,6 +181,14 @@ class IdalibHealthResult(IdalibContextFields, total=False):
     session: IdalibSessionInfo | None
     health: dict[str, Any] | None
     error: str | None
+    # Liveness fields from the non-blocking server_liveness probe. These answer
+    # even when the worker is busy, distinguishing "alive but busy" (alive=True,
+    # busy=True, inflight_*) from "wedged/dead" (alive=False).
+    alive: bool
+    busy: bool
+    inflight_tool: str | None
+    inflight_seconds: float
+    inflight_depth: int
 
 
 class IdalibWarmupResult(IdalibContextFields, total=False):
@@ -633,11 +651,26 @@ class IdalibSupervisor:
         finally:
             conn.close()
 
-    def forward_raw(self, worker: WorkerSession, request_obj: dict[str, Any]) -> dict[str, Any]:
-        return self._worker_rpc(worker, request_obj)
+    def forward_raw(
+        self,
+        worker: WorkerSession,
+        request_obj: dict[str, Any],
+        *,
+        timeout: float | None = _DEFAULT_WORKER_TOOL_TIMEOUT_SEC,
+    ) -> dict[str, Any]:
+        # Bounded backstop: the worker's own @tool_timeout normally fires first
+        # and returns a clean error. This cap protects against the case where
+        # the worker is wedged in a C-level call that the setprofile timeout
+        # hook can't interrupt, so the supervisor thread isn't lost forever.
+        return self._worker_rpc(worker, request_obj, timeout=timeout)
 
     def call_worker_tool(
-        self, worker: WorkerSession, name: str, arguments: dict[str, Any] | None = None
+        self,
+        worker: WorkerSession,
+        name: str,
+        arguments: dict[str, Any] | None = None,
+        *,
+        timeout: float | None = _DEFAULT_WORKER_TOOL_TIMEOUT_SEC,
     ) -> Any:
         response = self._worker_rpc(
             worker,
@@ -647,6 +680,7 @@ class IdalibSupervisor:
                 "method": "tools/call",
                 "params": {"name": name, "arguments": arguments or {}},
             },
+            timeout=timeout,
         )
         if "error" in response:
             raise RuntimeError(response["error"].get("message", "Unknown worker error"))
@@ -882,6 +916,22 @@ class IdalibSupervisor:
                 logger.debug("Worker idalib_close failed for %s", session_id, exc_info=True)
         self._terminate_worker(session)
         return True
+
+    def restart_worker(self, session_id: str) -> WorkerSession | None:
+        """Force-kill a (possibly wedged) worker and clear its session.
+
+        Unlike close_session, this does NOT attempt a graceful idalib_close RPC
+        first -- a wedged worker would never answer it. The process is
+        terminated directly and the session/bindings are dropped so the next
+        tool call re-spawns a fresh worker. Returns the removed session, or
+        None if no such session exists. In-flight work in that worker is lost.
+        """
+        with self._lock:
+            session = self._unregister_session_locked(session_id)
+        if session is None:
+            return None
+        self._terminate_worker(session)
+        return session
 
     def _resolve_gui_fallback_path(self, session: WorkerSession) -> str:
         candidates = [session.input_path]
@@ -1259,6 +1309,34 @@ def idalib_close(session_id: Annotated[str, "Session ID to close"]) -> IdalibClo
 
 
 @mcp.tool
+def idalib_restart_worker(
+    session_id: Annotated[str, "Session ID of the wedged worker to force-restart"],
+) -> dict:
+    """Force-kill a wedged worker and clear its session.
+
+    The escape hatch for a hard wedge: when a worker is stuck in a tight
+    C-level IDA call that timeouts and notifications/cancelled can't interrupt,
+    use this to terminate the worker process and drop its session so the next
+    tool call spawns a fresh one -- without a full gateway reload. In-flight
+    work in that worker is lost. Use idalib_health(full=false) first to confirm
+    the worker is actually wedged (alive=false or busy with a large
+    inflight_seconds) before restarting.
+    """
+    sup = _require_supervisor()
+    try:
+        session = sup.restart_worker(session_id)
+        if session is None:
+            return {"success": False, "error": f"Session not found: {session_id}"}
+        return {
+            "success": True,
+            "message": f"Worker for session {session_id} terminated; next call respawns.",
+            "session_id": session_id,
+        }
+    except Exception as e:
+        return {"success": False, "error": f"Failed to restart worker: {e}"}
+
+
+@mcp.tool
 def idalib_switch(session_id: Annotated[str, "Session ID to bind to active context"]) -> IdalibSwitchResult:
     """Bind the active idalib context to an existing database worker."""
     sup = _require_supervisor()
@@ -1356,29 +1434,92 @@ def idalib_save(
 @mcp.tool
 def idalib_health(
     session_id: Annotated[Optional[str], "Optional session to probe"] = None,
+    full: Annotated[
+        bool, "Also fetch IDB readiness details (queues behind in-flight work)"
+    ] = True,
 ) -> IdalibHealthResult:
-    """Health/ready probe for a database worker."""
+    """Health/ready probe for a database worker.
+
+    Liveness-first: probes the worker's non-blocking server_liveness with a
+    short timeout, so it answers even when the worker is busy or wedged. When
+    alive and idle (or full=True and not busy), it also fetches full IDB
+    readiness details. A busy worker returns alive=True, busy=True and the
+    in-flight tool / seconds instead of timing out behind the wedge.
+    """
     sup = _require_supervisor()
     try:
         context_id = sup.resolve_context_id()
         session = sup.resolve_session(session_id)
         if session_id:
             sup.bind_context(context_id, session.session_id)
-        if session.backend == "gui":
-            health = sup.call_worker_tool(session, "server_health", {})
+
+        ctx = sup.context_fields(context_id)
+
+        # 1) Liveness probe — short timeout, non-@idasync on the worker, so it
+        #    answers regardless of in-flight work. If it times out, the worker
+        #    is genuinely wedged/dead.
+        try:
+            live = sup.call_worker_tool(
+                session, "server_liveness", {}, timeout=_PROBE_WORKER_TIMEOUT_SEC
+            )
+        except Exception as e:
             return {
-                "ready": bool(isinstance(health, dict) and not health.get("error")),
-                **sup.context_fields(context_id),
+                "ready": False,
+                "alive": False,
+                **ctx,
                 "session": session.to_dict(),
-                "health": health if isinstance(health, dict) else None,
+                "health": None,
+                "error": f"worker not responsive to liveness probe: {e}",
+            }
+
+        live = live if isinstance(live, dict) else {}
+        busy = bool(live.get("busy"))
+        base: IdalibHealthResult = {
+            **ctx,
+            "session": session.to_dict(),
+            "alive": True,
+            "busy": busy,
+            "inflight_tool": live.get("inflight_tool"),
+            "inflight_seconds": float(live.get("inflight_seconds") or 0.0),
+            "inflight_depth": int(live.get("inflight_depth") or 0),
+        }
+
+        # 2) Full readiness details only if requested AND the worker isn't busy
+        #    (fetching them is @idasync and would queue behind the in-flight tool).
+        if not full or busy:
+            base["ready"] = not busy
+            base["health"] = None
+            base["error"] = None
+            return base
+
+        health_tool = "server_health" if session.backend == "gui" else "idalib_health"
+        try:
+            result = sup.call_worker_tool(
+                session, health_tool, {}, timeout=_DEFAULT_WORKER_TOOL_TIMEOUT_SEC
+            )
+        except Exception as e:
+            # Liveness said alive; full health failed (likely just became busy).
+            base["ready"] = False
+            base["health"] = None
+            base["error"] = f"full health unavailable: {e}"
+            return base
+
+        if isinstance(result, dict):
+            # idalib_health worker tool already returns {ready, session, health}.
+            if health_tool == "idalib_health":
+                return {**result, **base}
+            return {
+                **base,
+                "ready": bool(not result.get("error")),
+                "health": result,
                 "error": None,
             }
-        result = sup.call_worker_tool(session, "idalib_health", {})
-        if isinstance(result, dict):
-            return {**result, **sup.context_fields(context_id)}
-        return {"ready": False, **sup.context_fields(context_id), "session": None, "health": None, "error": "Unexpected health result"}
+        base["ready"] = False
+        base["health"] = None
+        base["error"] = "Unexpected health result"
+        return base
     except Exception as e:
-        return {"ready": False, "error": str(e)}
+        return {"ready": False, "alive": False, "error": str(e)}
 
 
 @mcp.tool
@@ -1404,6 +1545,7 @@ def idalib_warmup(
                     "build_caches": build_caches,
                     "init_hexrays": init_hexrays,
                 },
+                timeout=_WARMUP_WORKER_TIMEOUT_SEC,
             )
             return {
                 "ready": bool(isinstance(warmup, dict) and warmup.get("ok")),
@@ -1420,6 +1562,7 @@ def idalib_warmup(
                 "build_caches": build_caches,
                 "init_hexrays": init_hexrays,
             },
+            timeout=_WARMUP_WORKER_TIMEOUT_SEC,
         )
         if isinstance(result, dict):
             return {**result, **sup.context_fields(context_id)}

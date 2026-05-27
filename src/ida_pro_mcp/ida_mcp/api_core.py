@@ -20,7 +20,7 @@ import ida_typeinf
 import idc
 
 from .rpc import tool
-from .sync import idasync
+from .sync import idasync, inflight_snapshot, tool_timeout
 from .utils import (
     ConvertedNumber,
     EntityQuery,
@@ -375,8 +375,33 @@ def _build_health_payload() -> dict:
 @tool
 @idasync
 def server_health() -> ServerHealthResult:
-    """Health/ready probe for MCP server and current IDB state."""
+    """Health/ready probe for MCP server and current IDB state.
+
+    Note: this is @idasync, so it queues behind any in-flight tool on the IDA
+    main thread. For a liveness signal that answers instantly even while the
+    worker is busy, use server_liveness() instead.
+    """
     return _build_health_payload()
+
+
+@tool
+def server_liveness() -> dict:
+    """Instant liveness/busy probe. NOT @idasync.
+
+    Never touches the IDA main thread, so it answers in milliseconds even while
+    a long-running tool holds execute_sync(MFF_WRITE). Use this to tell
+    "alive but busy" (returns busy=true with inflight_tool / inflight_seconds)
+    from "wedged/dead" (the call itself times out). depth is the number of
+    @idasync calls currently queued+running on this worker.
+    """
+    snap = inflight_snapshot()
+    return {
+        "alive": True,
+        "busy": snap["depth"] > 0,
+        "inflight_depth": snap["depth"],
+        "inflight_tool": snap["tool"],
+        "inflight_seconds": snap["inflight_seconds"],
+    }
 
 
 @tool
@@ -965,6 +990,7 @@ def _all_segments() -> list[tuple[int, int]]:
 
 @tool
 @idasync
+@tool_timeout(90.0)
 def search_text(
     pattern: Annotated[str, "Text to search for in the rendered listing (literal substring by default)"],
     limit: Annotated[int, "Max hits per page (default: 30, max: 500)"] = 30,
@@ -973,12 +999,18 @@ def search_text(
     case_sensitive: Annotated[bool, "Case-sensitive match (default: false)"] = False,
     include: Annotated[str, "'disasm' | 'comments' | 'all' (default: all)"] = "all",
     code_only: Annotated[bool, "Restrict search to executable segments (default: true)"] = True,
+    time_budget_sec: Annotated[
+        float, "Wall-clock budget for the scan; 0 disables. Returns partial on hit."
+    ] = 30.0,
 ) -> SearchTextResult:
     """Search the rendered listing using IDA's native text search (fast C++ scan).
 
     Discovers candidate EAs with `ida_search.find_text()`, then renders each hit
     once via `ida_lines.generate_disassembly()` to extract matching lines and
-    classify them as disasm or comment. Returns one hit per EA.
+    classify them as disasm or comment. Returns one hit per EA. If the
+    wall-clock budget is exceeded mid-scan, returns the hits found so far with
+    cursor.truncated=True and cursor.limit_hit="time_budget"; resume from
+    cursor.next.
     """
     if limit <= 0:
         limit = 30
@@ -1030,6 +1062,8 @@ def search_text(
 
     hits: list[SearchTextHit] = []
     next_cursor: int | None = None
+    timed_out = False
+    deadline = time.monotonic() + time_budget_sec if time_budget_sec > 0 else None
     seg_idx = 0
     # Skip ahead to the segment that contains/follows cursor_ea.
     while seg_idx < len(segments) and segments[seg_idx][1] <= cursor_ea:
@@ -1038,6 +1072,10 @@ def search_text(
         cursor_ea = segments[seg_idx][0]
 
     while seg_idx < len(segments) and len(hits) < limit:
+        if deadline is not None and time.monotonic() >= deadline:
+            next_cursor = cursor_ea
+            timed_out = True
+            break
         seg_start, seg_end = segments[seg_idx]
         ea = ida_search.find_text(cursor_ea, 0, 0, pattern, sflag)
         if ea == idaapi.BADADDR or ea >= seg_end:
@@ -1076,7 +1114,9 @@ def search_text(
         cursor_ea = ea + (size if size > 0 else 1)
 
     cursor: dict[str, Any]
-    if next_cursor is not None:
+    if timed_out and next_cursor is not None:
+        cursor = {"next": hex(next_cursor), "truncated": True, "limit_hit": "time_budget"}
+    elif next_cursor is not None:
         cursor = {"next": hex(next_cursor)}
     else:
         cursor = {"done": True}

@@ -8,6 +8,7 @@ import time
 import idaapi
 import idc
 from .rpc import McpToolError
+from .inflight import inflight_enter, inflight_exit, inflight_snapshot  # noqa: F401
 from .zeromcp.jsonrpc import get_current_cancel_event, RequestCancelledError
 
 # ============================================================================
@@ -38,7 +39,11 @@ class CancelledError(RequestCancelledError):
 
 logger = logging.getLogger(__name__)
 _TOOL_TIMEOUT_ENV = "IDA_MCP_TOOL_TIMEOUT_SEC"
-_DEFAULT_TOOL_TIMEOUT_SEC = 60.0
+# Tightened from 60s: tools that legitimately run longer carry an explicit
+# @tool_timeout override, so this default only governs tools expected to be
+# fast. A 30s ceiling surfaces a clean server-side timeout before a typical
+# ~30s MCP-client request timeout HTTP-hangs the caller.
+_DEFAULT_TOOL_TIMEOUT_SEC = 30.0
 
 
 def _get_tool_timeout_seconds() -> float:
@@ -156,30 +161,36 @@ def sync_wrapper(
     timeout = timeout_override
     if timeout is None:
         timeout = _get_tool_timeout_seconds()
-    if timeout > 0 or cancel_event is not None:
+    # Register inflight BEFORE execute_sync so a concurrent server_liveness()
+    # probe sees this call even while it's blocked waiting for the main thread.
+    token = inflight_enter(getattr(ff, "__name__", "<tool>"))
+    try:
+        if timeout > 0 or cancel_event is not None:
 
-        def timed_ff():
-            # Calculate deadline when execution starts on IDA main thread,
-            # not when the request was queued (avoids stale deadlines)
-            deadline = time.monotonic() + timeout if timeout > 0 else None
+            def timed_ff():
+                # Calculate deadline when execution starts on IDA main thread,
+                # not when the request was queued (avoids stale deadlines)
+                deadline = time.monotonic() + timeout if timeout > 0 else None
 
-            def profilefunc(frame, event, arg):
-                # Check cancellation first (higher priority)
-                if cancel_event is not None and cancel_event.is_set():
-                    raise CancelledError("Request was cancelled")
-                if deadline is not None and time.monotonic() >= deadline:
-                    raise IDASyncError(f"Tool timed out after {timeout:.2f}s")
+                def profilefunc(frame, event, arg):
+                    # Check cancellation first (higher priority)
+                    if cancel_event is not None and cancel_event.is_set():
+                        raise CancelledError("Request was cancelled")
+                    if deadline is not None and time.monotonic() >= deadline:
+                        raise IDASyncError(f"Tool timed out after {timeout:.2f}s")
 
-            old_profile = sys.getprofile()
-            sys.setprofile(profilefunc)
-            try:
-                return ff()
-            finally:
-                sys.setprofile(old_profile)
+                old_profile = sys.getprofile()
+                sys.setprofile(profilefunc)
+                try:
+                    return ff()
+                finally:
+                    sys.setprofile(old_profile)
 
-        timed_ff.__name__ = ff.__name__
-        return _sync_wrapper(timed_ff, keep_batch=keep_batch)
-    return _sync_wrapper(ff, keep_batch=keep_batch)
+            timed_ff.__name__ = ff.__name__
+            return _sync_wrapper(timed_ff, keep_batch=keep_batch)
+        return _sync_wrapper(ff, keep_batch=keep_batch)
+    finally:
+        inflight_exit(token)
 
 
 def idasync(f):

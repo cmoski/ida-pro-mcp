@@ -1,5 +1,6 @@
 from itertools import islice
 import struct
+import time
 from typing import Annotated, Any, NotRequired, Optional, TypedDict
 import ida_lines
 import ida_funcs
@@ -1223,6 +1224,7 @@ def analyze_batch(
 
 @tool
 @idasync
+@tool_timeout(90.0)
 def xrefs_to(
     addrs: Annotated[list[str] | str, "Addresses or function names to find cross-references to (e.g. '0x11a9', 'check_pw', 'main')"],
     limit: Annotated[int, "Max xrefs per address (default: 100, max: 1000)"] = 100,
@@ -1259,6 +1261,7 @@ def xrefs_to(
 
 @tool
 @idasync
+@tool_timeout(90.0)
 def xref_query(
     queries: Annotated[
         list[XrefQuery] | XrefQuery,
@@ -1379,6 +1382,7 @@ def xref_query(
 
 @tool
 @idasync
+@tool_timeout(90.0)
 def xrefs_to_field(
     queries: list[StructFieldQuery] | StructFieldQuery,
 ) -> list[StructFieldXrefsResult]:
@@ -1473,6 +1477,7 @@ def xrefs_to_field(
 
 @tool
 @idasync
+@tool_timeout(60.0)
 def callees(
     addrs: Annotated[list[str] | str, "Function addresses or names to get callees for (e.g. '0x123e', 'main')"],
     limit: Annotated[int, "Max callees per function (default: 200, max: 500)"] = 200,
@@ -1555,14 +1560,24 @@ def callees(
 
 @tool
 @idasync
+@tool_timeout(90.0)
 def find_bytes(
     patterns: Annotated[
         list[str] | str, "Byte patterns to search for (e.g. '48 8B ?? ??')"
     ],
     limit: Annotated[int, "Max matches per pattern (default: 1000, max: 10000)"] = 1000,
     offset: Annotated[int, "Skip first N matches (default: 0)"] = 0,
+    time_budget_sec: Annotated[
+        float, "Wall-clock budget per pattern; 0 disables. Returns partial on hit."
+    ] = 30.0,
 ) -> list[FindBytesResult]:
-    """Search byte patterns (supports ??) with offset/limit pagination."""
+    """Search byte patterns (supports ??) with offset/limit pagination.
+
+    Returns partial results with cursor.truncated=True and
+    cursor.limit_hit="time_budget" if the per-pattern wall-clock budget is
+    exceeded, so a big-binary scan yields what it found instead of timing out.
+    Resume from cursor.next.
+    """
     patterns = normalize_list_input(patterns)
 
     # Enforce max limit
@@ -1582,6 +1597,9 @@ def find_bytes(
         matches = []
         skipped = 0
         more = False
+        timed_out = False
+        deadline = time.monotonic() + time_budget_sec if time_budget_sec > 0 else None
+        scanned = 0
         try:
             searcher, build_err = _make_searcher(pattern)
             if build_err is not None:
@@ -1612,6 +1630,13 @@ def find_bytes(
                         next_ea = searcher(ea + 1, max_ea)
                         more = next_ea != idaapi.BADADDR
                         break
+                # Check the wall-clock budget periodically (the searcher call
+                # itself can be slow, so check after each hit / every 256 steps).
+                scanned += 1
+                if deadline is not None and (scanned & 0xFF) == 0 and time.monotonic() >= deadline:
+                    more = True
+                    timed_out = True
+                    break
                 ea += 1
         except Exception as e:
             results.append(
@@ -1625,12 +1650,15 @@ def find_bytes(
             )
             continue
 
+        cursor = {"next": offset + limit} if more else {"done": True}
+        if timed_out:
+            cursor = {"next": offset + len(matches), "truncated": True, "limit_hit": "time_budget"}
         results.append(
             {
                 "pattern": pattern,
                 "matches": matches,
                 "n": len(matches),
-                "cursor": {"next": offset + limit} if more else {"done": True},
+                "cursor": cursor,
             }
         )
     return results
@@ -1643,6 +1671,7 @@ def find_bytes(
 
 @tool
 @idasync
+@tool_timeout(60.0)
 def basic_blocks(
     addrs: Annotated[list[str] | str, "Function addresses or names to get basic blocks for (e.g. '0x123e', 'main')"],
     max_blocks: Annotated[
@@ -1723,6 +1752,7 @@ def basic_blocks(
 
 @tool
 @idasync
+@tool_timeout(90.0)
 def find(
     type: Annotated[
         str, "Search type: 'string', 'immediate', 'data_ref', or 'code_ref'"
@@ -1732,8 +1762,16 @@ def find(
     ],
     limit: Annotated[int, "Max matches per target (default: 1000, max: 10000)"] = 1000,
     offset: Annotated[int, "Skip first N matches (default: 0)"] = 0,
+    time_budget_sec: Annotated[
+        float, "Wall-clock budget for the string scan; 0 disables. Partial on hit."
+    ] = 30.0,
 ) -> list[FindResult]:
-    """Search strings/immediates/refs for targets with offset/limit pagination."""
+    """Search strings/immediates/refs for targets with offset/limit pagination.
+
+    For type='string' (a raw byte scan over the whole image, the slow case), a
+    wall-clock budget returns partial results with cursor.truncated=True and
+    cursor.limit_hit="time_budget" instead of timing out. Resume from cursor.next.
+    """
     if not isinstance(targets, list):
         targets = [targets]
 
@@ -1763,6 +1801,8 @@ def find(
             matches = []
             skipped = 0
             more = False
+            timed_out = False
+            deadline = time.monotonic() + time_budget_sec if time_budget_sec > 0 else None
             try:
                 ea = ida_ida.inf_get_min_ea()
                 max_ea = ida_ida.inf_get_max_ea()
@@ -1780,9 +1820,31 @@ def find(
                                 )
                                 more = next_ea != idaapi.BADADDR
                                 break
+                        # Each _raw_bin_search call can scan a large span, so
+                        # check the budget after every hit.
+                        if deadline is not None and time.monotonic() >= deadline:
+                            more = True
+                            timed_out = True
+                            break
                         ea += 1
             except Exception:
                 pass
+
+            if timed_out:
+                results.append(
+                    {
+                        "query": pattern_str,
+                        "matches": matches,
+                        "count": len(matches),
+                        "cursor": {
+                            "next": offset + len(matches),
+                            "truncated": True,
+                            "limit_hit": "time_budget",
+                        },
+                        "error": None,
+                    }
+                )
+                continue
 
             results.append(
                 {
@@ -2102,6 +2164,7 @@ def _scan_insn_ranges(
 
 @tool
 @idasync
+@tool_timeout(90.0)
 def insn_query(
     queries: Annotated[
         list[InsnPattern] | InsnPattern,
@@ -2221,6 +2284,7 @@ def insn_query(
 
 @tool
 @idasync
+@tool_timeout(120.0)
 def export_funcs(
     addrs: Annotated[list[str] | str, "Function addresses or names to export (e.g. '0x123e', 'main')"],
     format: Annotated[
@@ -2285,6 +2349,7 @@ def export_funcs(
 
 @tool
 @idasync
+@tool_timeout(120.0)
 def callgraph(
     roots: Annotated[
         list[str] | str, "Root function addresses to start call graph traversal from"

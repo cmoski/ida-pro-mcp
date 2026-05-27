@@ -32,6 +32,20 @@ class _FakeSupervisor(supmod.IdalibSupervisor):
         super().__init__(supmod.McpServer("test"), max_workers=4)
         self.forwarded: list[dict] = []
         self.opened: list[tuple[str, dict]] = []
+        # Records (tool_name, timeout) for every call_worker_tool invocation so
+        # tests can assert the supervisor passes the intended timeouts.
+        self.tool_calls: list[tuple[str, float | None]] = []
+        # Canned server_liveness response; tests tweak busy/inflight as needed.
+        self.liveness = {
+            "alive": True,
+            "busy": False,
+            "inflight_tool": None,
+            "inflight_seconds": 0.0,
+            "inflight_depth": 0,
+        }
+        # If set, call_worker_tool raises this for server_liveness (simulates a
+        # wedged/unreachable worker that can't even answer the liveness probe).
+        self.liveness_error: Exception | None = None
 
     def _spawn_worker(self):
         return supmod.WorkerSession(
@@ -72,7 +86,8 @@ class _FakeSupervisor(supmod.IdalibSupervisor):
         self.forwarded.append(payload)
         return {"jsonrpc": "2.0", "id": payload.get("id"), "result": {"ok": True}}
 
-    def call_worker_tool(self, worker, name, arguments=None):
+    def call_worker_tool(self, worker, name, arguments=None, *, timeout=None):
+        self.tool_calls.append((name, timeout))
         if name == "idalib_open":
             assert arguments is not None
             self.opened.append((name, arguments))
@@ -88,6 +103,12 @@ class _FakeSupervisor(supmod.IdalibSupervisor):
                     "metadata": {},
                 },
             }
+        if name == "server_liveness":
+            if self.liveness_error is not None:
+                raise self.liveness_error
+            return dict(self.liveness)
+        if name in ("idalib_health", "server_health"):
+            return {"ready": True, "session": None, "health": {"status": "ok"}, "error": None}
         return {"ok": True, "error": None}
 
 
@@ -2193,3 +2214,203 @@ def test_resolve_session_isolated_reinit_simulates_user_scenario(tmp_path):
     # The stale binding from the previous transport is left alone — explicit cleanup
     # only happens via idalib_close/idalib_unbind.
     assert sup.context_bindings["agent-A"] == "sole"
+
+
+# ---------------------------------------------------------------------------
+# Timeout fixes: bounded worker HTTP timeouts (Fix B)
+# ---------------------------------------------------------------------------
+
+
+def test_call_worker_tool_default_timeout_is_bounded():
+    # The real call_worker_tool must default to a bounded timeout (not None),
+    # so a wedged worker can't block the supervisor thread forever.
+    import inspect
+
+    sig = inspect.signature(supmod.IdalibSupervisor.call_worker_tool)
+    default = sig.parameters["timeout"].default
+    assert default == supmod._DEFAULT_WORKER_TOOL_TIMEOUT_SEC
+    assert isinstance(default, float) and default > 0
+
+
+def test_forward_raw_passes_bounded_timeout(monkeypatch):
+    sup = _FakeSupervisor()
+    captured = {}
+
+    def fake_rpc(worker, payload, *, timeout=None):
+        captured["timeout"] = timeout
+        return {"jsonrpc": "2.0", "id": 1, "result": {"ok": True}}
+
+    monkeypatch.setattr(sup, "_worker_rpc", fake_rpc)
+    worker = supmod.WorkerSession(
+        session_id="w", input_path="", filename="", host="127.0.0.1", port=1,
+        process=_FakeProcess(),
+    )
+    sup.forward_raw(worker, {"jsonrpc": "2.0", "id": 1, "method": "tools/call"})
+    assert captured["timeout"] == supmod._DEFAULT_WORKER_TOOL_TIMEOUT_SEC
+
+
+# ---------------------------------------------------------------------------
+# Timeout fixes: liveness-first idalib_health (Fix A + B)
+# ---------------------------------------------------------------------------
+
+
+def _bind_session(sup, session_id="s1", input_path="C:/x/bin.exe"):
+    session = supmod.WorkerSession(
+        session_id=session_id,
+        input_path=input_path,
+        filename="bin.exe",
+        host="127.0.0.1",
+        port=4242,
+        process=_FakeProcess(),
+    )
+    sup.sessions[session_id] = session
+    return session
+
+
+def test_idalib_health_reports_busy_without_full_health(tmp_path):
+    old_supervisor = supmod.supervisor
+    sup = _FakeSupervisor()
+    supmod.supervisor = sup
+    sup.mcp = _TransportMcp(session_id="ctx-A")
+    try:
+        _bind_session(sup, "s1")
+        sup.context_bindings["ctx-A"] = "s1"
+        sup.liveness = {
+            "alive": True,
+            "busy": True,
+            "inflight_tool": "decompile",
+            "inflight_seconds": 42.5,
+            "inflight_depth": 2,
+        }
+        result = supmod.idalib_health(session_id="s1")
+        assert result["alive"] is True
+        assert result["busy"] is True
+        assert result["inflight_tool"] == "decompile"
+        assert result["inflight_seconds"] == 42.5
+        assert result["ready"] is False
+        # When busy, the supervisor must NOT call the @idasync full-health tool
+        # (it would queue behind the wedge). Only the liveness probe was made.
+        called = [name for name, _ in sup.tool_calls]
+        assert "server_liveness" in called
+        assert "idalib_health" not in called
+        assert "server_health" not in called
+        # Liveness probe used the short probe timeout.
+        live_timeout = next(t for n, t in sup.tool_calls if n == "server_liveness")
+        assert live_timeout == supmod._PROBE_WORKER_TIMEOUT_SEC
+    finally:
+        supmod.supervisor = old_supervisor
+
+
+def test_idalib_health_wedged_worker_reports_not_alive(tmp_path):
+    old_supervisor = supmod.supervisor
+    sup = _FakeSupervisor()
+    supmod.supervisor = sup
+    sup.mcp = _TransportMcp(session_id="ctx-A")
+    try:
+        _bind_session(sup, "s1")
+        sup.context_bindings["ctx-A"] = "s1"
+        # Even the non-blocking liveness probe times out -> genuinely wedged.
+        sup.liveness_error = TimeoutError("liveness probe timed out")
+        result = supmod.idalib_health(session_id="s1")
+        assert result["alive"] is False
+        assert result["ready"] is False
+        assert "not responsive" in result["error"]
+    finally:
+        supmod.supervisor = old_supervisor
+
+
+def test_idalib_health_idle_fetches_full_health(tmp_path):
+    old_supervisor = supmod.supervisor
+    sup = _FakeSupervisor()
+    supmod.supervisor = sup
+    sup.mcp = _TransportMcp(session_id="ctx-A")
+    try:
+        _bind_session(sup, "s1")
+        sup.context_bindings["ctx-A"] = "s1"
+        sup.liveness = {
+            "alive": True, "busy": False, "inflight_tool": None,
+            "inflight_seconds": 0.0, "inflight_depth": 0,
+        }
+        result = supmod.idalib_health(session_id="s1")
+        assert result["alive"] is True
+        assert result["busy"] is False
+        # Idle -> full health was fetched.
+        called = [name for name, _ in sup.tool_calls]
+        assert "server_liveness" in called
+        assert "idalib_health" in called
+    finally:
+        supmod.supervisor = old_supervisor
+
+
+def test_idalib_health_full_false_skips_full_health(tmp_path):
+    old_supervisor = supmod.supervisor
+    sup = _FakeSupervisor()
+    supmod.supervisor = sup
+    sup.mcp = _TransportMcp(session_id="ctx-A")
+    try:
+        _bind_session(sup, "s1")
+        sup.context_bindings["ctx-A"] = "s1"
+        result = supmod.idalib_health(session_id="s1", full=False)
+        assert result["alive"] is True
+        called = [name for name, _ in sup.tool_calls]
+        assert called == ["server_liveness"]
+    finally:
+        supmod.supervisor = old_supervisor
+
+
+# ---------------------------------------------------------------------------
+# Timeout fixes: idalib_restart_worker (Fix D)
+# ---------------------------------------------------------------------------
+
+
+def test_idalib_restart_worker_in_management_set():
+    assert "idalib_restart_worker" in supmod.IDALIB_MANAGEMENT_TOOLS
+
+
+def test_restart_worker_terminates_and_unregisters(tmp_path):
+    sup = _FakeSupervisor()
+    session = _bind_session(sup, "s1", input_path=str(tmp_path / "bin.exe"))
+    sup.path_to_session[sup._path_key(str(tmp_path / "bin.exe"))] = "s1"
+    sup.context_bindings["ctx-A"] = "s1"
+
+    removed = sup.restart_worker("s1")
+    assert removed is session
+    # Process terminated.
+    assert session.process.returncode == 0
+    # Session + bindings cleared.
+    assert "s1" not in sup.sessions
+    assert "ctx-A" not in sup.context_bindings
+    assert all(v != "s1" for v in sup.path_to_session.values())
+
+
+def test_restart_worker_unknown_session_returns_none():
+    sup = _FakeSupervisor()
+    assert sup.restart_worker("does-not-exist") is None
+
+
+def test_idalib_restart_worker_tool(tmp_path):
+    old_supervisor = supmod.supervisor
+    sup = _FakeSupervisor()
+    supmod.supervisor = sup
+    try:
+        _bind_session(sup, "s1")
+        result = supmod.idalib_restart_worker("s1")
+        assert result["success"] is True
+        assert "s1" in result["message"]
+        assert "s1" not in sup.sessions
+
+        # Restarting an unknown session is a clean failure, not an exception.
+        missing = supmod.idalib_restart_worker("nope")
+        assert missing["success"] is False
+        assert "not found" in missing["error"]
+    finally:
+        supmod.supervisor = old_supervisor
+
+
+def test_restart_worker_does_not_call_graceful_close(tmp_path):
+    # A wedged worker can't answer idalib_close, so restart_worker must NOT
+    # attempt it (unlike close_session). Assert no worker tool call was made.
+    sup = _FakeSupervisor()
+    _bind_session(sup, "s1")
+    sup.restart_worker("s1")
+    assert sup.tool_calls == []
