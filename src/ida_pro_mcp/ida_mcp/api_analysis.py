@@ -1758,7 +1758,10 @@ def find(
         str, "Search type: 'string', 'immediate', 'data_ref', or 'code_ref'"
     ],
     targets: Annotated[
-        list[str | int] | str | int, "Search targets (strings, integers, or addresses)"
+        list[str | int] | str | int,
+        "Search targets. Quote hex as strings (e.g. \"0x84000\") -- JSON has no "
+        "hex literals, so a bare 0x84000 is invalid JSON and is rejected before "
+        "the tool runs. Decimal integers (e.g. 540672) and plain strings are fine.",
     ],
     limit: Annotated[int, "Max matches per target (default: 1000, max: 10000)"] = 1000,
     offset: Annotated[int, "Skip first N matches (default: 0)"] = 0,
