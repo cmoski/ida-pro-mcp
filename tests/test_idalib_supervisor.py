@@ -2407,6 +2407,96 @@ def test_idalib_restart_worker_tool(tmp_path):
         supmod.supervisor = old_supervisor
 
 
+def test_idalib_restart_worker_defaults_to_own_session():
+    old_supervisor = supmod.supervisor
+    sup = _FakeSupervisor()
+    sup.isolated_contexts = True
+    sup.mcp = _TransportMcp(session_id="agent-A")
+    supmod.supervisor = sup
+    try:
+        _bind_session(sup, "mine")
+        sup.context_bindings["agent-A"] = "mine"
+        result = supmod.idalib_restart_worker()
+        assert result["success"] is True
+        assert result["session_id"] == "mine"
+        assert "mine" not in sup.sessions
+    finally:
+        supmod.supervisor = old_supervisor
+
+
+def test_idalib_restart_worker_no_binding_requires_explicit_id():
+    old_supervisor = supmod.supervisor
+    sup = _FakeSupervisor()
+    sup.isolated_contexts = True
+    sup.mcp = _TransportMcp(session_id="agent-A")
+    supmod.supervisor = sup
+    try:
+        result = supmod.idalib_restart_worker()
+        assert result["success"] is False
+        assert "No session bound to your context" in result["error"]
+    finally:
+        supmod.supervisor = old_supervisor
+
+
+def test_idalib_restart_worker_rejects_other_agents_session():
+    # Agent B must not restart Agent A's worker without force.
+    old_supervisor = supmod.supervisor
+    sup = _FakeSupervisor()
+    sup.isolated_contexts = True
+    sup.mcp = _TransportMcp(session_id="agent-B")
+    supmod.supervisor = sup
+    try:
+        _bind_session(sup, "owned-by-A")
+        sup.context_bindings["agent-A"] = "owned-by-A"
+        result = supmod.idalib_restart_worker("owned-by-A")
+        assert result["success"] is False
+        assert "not bound to your context" in result["error"]
+        assert "owned-by-A" in sup.sessions
+    finally:
+        supmod.supervisor = old_supervisor
+
+
+def test_idalib_restart_worker_force_overrides_cross_agent():
+    old_supervisor = supmod.supervisor
+    sup = _FakeSupervisor()
+    sup.isolated_contexts = True
+    sup.mcp = _TransportMcp(session_id="agent-B")
+    supmod.supervisor = sup
+    try:
+        _bind_session(sup, "owned-by-A")
+        sup.context_bindings["agent-A"] = "owned-by-A"
+        result = supmod.idalib_restart_worker("owned-by-A", force=True)
+        assert result["success"] is True
+        assert "owned-by-A" not in sup.sessions
+    finally:
+        supmod.supervisor = old_supervisor
+
+
+def test_idalib_restart_worker_rejects_shared_worker():
+    # Same binary opened by two agents -> one worker bound by 2 contexts.
+    # The owner still can't restart it without force (kills the other's work).
+    old_supervisor = supmod.supervisor
+    sup = _FakeSupervisor()
+    sup.isolated_contexts = True
+    sup.mcp = _TransportMcp(session_id="agent-A")
+    supmod.supervisor = sup
+    try:
+        _bind_session(sup, "shared")
+        sup.context_bindings["agent-A"] = "shared"
+        sup.context_bindings["agent-B"] = "shared"
+        result = supmod.idalib_restart_worker("shared")
+        assert result["success"] is False
+        assert "shared by" in result["error"]
+        assert result["bound_other_contexts"] == 1
+        assert "shared" in sup.sessions
+
+        forced = supmod.idalib_restart_worker("shared", force=True)
+        assert forced["success"] is True
+        assert "shared" not in sup.sessions
+    finally:
+        supmod.supervisor = old_supervisor
+
+
 def test_restart_worker_does_not_call_graceful_close(tmp_path):
     # A wedged worker can't answer idalib_close, so restart_worker must NOT
     # attempt it (unlike close_session). Assert no worker tool call was made.

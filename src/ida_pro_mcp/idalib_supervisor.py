@@ -1310,7 +1310,14 @@ def idalib_close(session_id: Annotated[str, "Session ID to close"]) -> IdalibClo
 
 @mcp.tool
 def idalib_restart_worker(
-    session_id: Annotated[str, "Session ID of the wedged worker to force-restart"],
+    session_id: Annotated[
+        Optional[str],
+        "Session to restart. Default: the session bound to YOUR context.",
+    ] = None,
+    force: Annotated[
+        bool,
+        "Restart even if the session isn't yours or is shared by other contexts.",
+    ] = False,
 ) -> dict:
     """Force-kill a wedged worker and clear its session.
 
@@ -1321,9 +1328,66 @@ def idalib_restart_worker(
     work in that worker is lost. Use idalib_health(full=false) first to confirm
     the worker is actually wedged (alive=false or busy with a large
     inflight_seconds) before restarting.
+
+    Multi-agent safety: by default this only restarts the session bound to your
+    own context, and refuses to restart a session that other contexts are also
+    bound to (a worker is shared when multiple agents opened the same binary) --
+    so one agent can't nuke another's in-flight work by accident. Pass
+    force=true to override (e.g. to clear a genuinely orphaned/wedged worker).
     """
     sup = _require_supervisor()
     try:
+        context_id = sup.resolve_context_id()
+
+        # Default to the caller's own bound session.
+        if not session_id:
+            session_id = sup.context_bindings.get(context_id)
+            if not session_id and not sup.isolated_contexts:
+                session_id = sup.context_bindings.get(SHARED_FALLBACK_CONTEXT_ID)
+            if not session_id:
+                return {
+                    "success": False,
+                    "error": (
+                        "No session bound to your context. Pass session_id "
+                        "explicitly (and force=true if it isn't yours)."
+                    ),
+                }
+
+        with sup._lock:
+            exists = session_id in sup.sessions
+            bound_contexts = [c for c, s in sup.context_bindings.items() if s == session_id]
+        if not exists:
+            return {"success": False, "error": f"Session not found: {session_id}"}
+
+        owns = context_id in bound_contexts
+        other_contexts = [c for c in bound_contexts if c != context_id]
+
+        if not force:
+            # In isolated mode, restarting a session you aren't bound to is a
+            # cross-agent action -- require force.
+            if sup.isolated_contexts and not owns:
+                return {
+                    "success": False,
+                    "error": (
+                        f"Session {session_id} is not bound to your context. "
+                        f"It belongs to {len(bound_contexts)} other context(s). "
+                        f"Pass force=true to restart someone else's worker."
+                    ),
+                    "bound_other_contexts": len(other_contexts),
+                }
+            # The worker is shared by other agents (same binary opened by
+            # multiple contexts) -- restarting kills their work too.
+            if other_contexts:
+                return {
+                    "success": False,
+                    "error": (
+                        f"Session {session_id} is shared by {len(other_contexts)} "
+                        f"other context(s); restarting kills their in-flight work "
+                        f"too. Pass force=true to proceed."
+                    ),
+                    "bound_other_contexts": len(other_contexts),
+                }
+
         session = sup.restart_worker(session_id)
         if session is None:
             return {"success": False, "error": f"Session not found: {session_id}"}
@@ -1331,6 +1395,7 @@ def idalib_restart_worker(
             "success": True,
             "message": f"Worker for session {session_id} terminated; next call respawns.",
             "session_id": session_id,
+            "affected_contexts": len(bound_contexts),
         }
     except Exception as e:
         return {"success": False, "error": f"Failed to restart worker: {e}"}
