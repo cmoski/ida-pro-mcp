@@ -52,7 +52,11 @@ class PatchAsmResult(TypedDict):
 class RenameItemResult(TypedDict, total=False):
     addr: str
     func_addr: str
-    old: str
+    # Nullable: the previous name is None when the symbol was unnamed before the
+    # rename. Declared str (non-null) before, which made the output-schema
+    # validator reject the (already-committed) rename with 'None is not of type
+    # string'. Matches `new`, which is likewise nullable.
+    old: str | None
     new: str | None
     name: str
     dir: str

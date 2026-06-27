@@ -31,6 +31,7 @@ from ..api_analysis import (
     find,
     export_funcs,
     callgraph,
+    find_orphan_functions,
 )
 
 
@@ -802,3 +803,84 @@ def test_analyze_batch():
             "constant_count",
             "basic_block_count",
         )
+
+
+# ============================================================================
+# Tests for find_orphan_functions
+# ============================================================================
+
+
+@test()
+def test_find_orphan_functions_envelope_and_shape():
+    """Returns a well-formed envelope; each orphan carries the full metric set."""
+    res = find_orphan_functions(count=20)
+    assert_has_keys(res, "total", "dead_code_candidates", "data", "next_offset", "truncated")
+    assert isinstance(res["total"], int) and res["total"] >= 0
+    assert res["dead_code_candidates"] <= res["total"]
+    assert len(res["data"]) <= 20
+    for o in res["data"]:
+        assert_has_keys(
+            o, "addr", "name", "size", "size_int", "instruction_count",
+            "basic_block_count", "edges", "cyclomatic_complexity",
+            "data_xref_count", "is_thunk", "is_library",
+        )
+        assert is_hex_address(o["addr"]), f"bad addr {o['addr']!r}"
+        assert o["size_int"] >= 0
+        assert o["cyclomatic_complexity"] >= 1
+
+
+@test()
+def test_find_orphan_functions_are_actually_orphans():
+    """Every reported orphan really has zero incoming code xrefs."""
+    import idautils
+
+    res = find_orphan_functions(count=50)
+    if res["total"] == 0:
+        skip_test("binary has no orphan functions under default filters")
+    for o in res["data"]:
+        ea = int(o["addr"], 16)
+        first = next(iter(idautils.CodeRefsTo(ea, 0)), None)
+        assert first is None, f"{o['addr']} ({o['name']}) has a code xref from {first:#x}"
+
+
+@test()
+def test_find_orphan_functions_sort_by_size_descending():
+    """Default sort puts the largest orphans first."""
+    res = find_orphan_functions(sort_by="size", descending=True, count=100)
+    sizes = [o["size_int"] for o in res["data"]]
+    assert sizes == sorted(sizes, reverse=True), "orphans not sorted by size desc"
+
+
+@test()
+def test_find_orphan_functions_sort_by_complexity_descending():
+    res = find_orphan_functions(sort_by="complexity", descending=True, count=100)
+    cc = [o["cyclomatic_complexity"] for o in res["data"]]
+    assert cc == sorted(cc, reverse=True), "orphans not sorted by complexity desc"
+
+
+@test()
+def test_find_orphan_functions_invalid_sort_errors():
+    res = find_orphan_functions(sort_by="bogus")
+    assert "error" in res
+    assert res["total"] == 0
+
+
+@test()
+def test_find_orphan_functions_only_dead_code_have_no_data_xrefs():
+    """only_dead_code restricts results to entries whose address is never taken."""
+    res = find_orphan_functions(only_dead_code=True, count=100)
+    for o in res["data"]:
+        assert o["data_xref_count"] == 0, f"{o['addr']} has data xrefs but was flagged dead code"
+
+
+@test()
+def test_find_orphan_functions_pagination_advances():
+    """Paging by count yields disjoint, count-bounded pages."""
+    page1 = find_orphan_functions(count=3, offset=0)
+    if page1["total"] <= 3 or page1["next_offset"] is None:
+        skip_test("not enough orphans to paginate")
+    page2 = find_orphan_functions(count=3, offset=page1["next_offset"])
+    a1 = {o["addr"] for o in page1["data"]}
+    a2 = {o["addr"] for o in page2["data"]}
+    assert len(page1["data"]) <= 3
+    assert not (a1 & a2), f"pages overlap: {a1 & a2}"

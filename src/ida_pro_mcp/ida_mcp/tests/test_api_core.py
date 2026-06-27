@@ -30,7 +30,12 @@ from ..api_core import (
     server_warmup,
     find_regex,
     search_text,
+    _build_text_matcher,
+    _maybe_search_text_fast,
+    _prime_search_meta_cache,
+    _get_search_meta_cache,
 )
+from .. import _objdump_search
 
 
 CRACKME_MAIN = "0x123e"
@@ -553,3 +558,164 @@ def test_search_text_regex_mode():
         skip_test("no call/jmp in binary")
     for h in result["hits"]:
         assert h["matches"]
+
+
+# ============================================================================
+# Tests for the objdump fast path (search_text when IDA is busy)
+# ============================================================================
+
+
+def _require_objdump():
+    od = _objdump_search.find_objdump()
+    if not od:
+        skip_test("objdump not available (bundled w64devkit or PATH)")
+    return od
+
+
+def _exec_seg_ranges():
+    import idaapi
+    import idautils
+
+    ranges = []
+    for ea in idautils.Segments():
+        seg = idaapi.getseg(ea)
+        if seg and (seg.perm & idaapi.SEGPERM_EXEC):
+            ranges.append((seg.start_ea, seg.end_ea))
+    return ranges
+
+
+@test()
+def test_fastpath_prime_caches_input_path_and_imagebase():
+    """The IDA path primes the off-thread cache with a usable path + base."""
+    import idaapi
+
+    _prime_search_meta_cache()
+    cache = _get_search_meta_cache()
+    assert cache is not None, "cache not primed"
+    assert_has_keys(cache, "input_path", "imagebase")
+    assert cache["input_path"], "empty input path"
+    assert cache["imagebase"] == idaapi.get_imagebase()
+
+
+@test()
+def test_fastpath_objdump_base_matches_imagebase_for_unrebased_fixture():
+    """objdump's assumed base == IDA imagebase here, so the address delta is 0."""
+    import idaapi
+
+    od = _require_objdump()
+    _prime_search_meta_cache()
+    cache = _get_search_meta_cache()
+    base = _objdump_search.objdump_base(od, cache["input_path"])
+    assert base is not None, "could not determine objdump base"
+    # crackme03/typed_fixture are loaded at their preferred base (no rebase).
+    assert idaapi.get_imagebase() - base == 0
+
+
+@test()
+def test_fastpath_disasm_hits_are_valid_code_addresses():
+    """objdump fast-path hits carry the SearchText shape and land in exec segments."""
+    od = _require_objdump()
+    _prime_search_meta_cache()
+    cache = _get_search_meta_cache()
+    base = _objdump_search.objdump_base(od, cache["input_path"])
+    matcher = _build_text_matcher("call", regex=False, case_sensitive=False)
+    res = _objdump_search.search_disasm(
+        od, cache["input_path"], matcher,
+        delta=cache["imagebase"] - base, limit=10,
+    )
+    assert res.get("engine") == "objdump"
+    if res["n"] == 0:
+        skip_test("no 'call' found by objdump")
+    ranges = _exec_seg_ranges()
+    for h in res["hits"]:
+        assert_has_keys(h, "addr", "matches")
+        assert is_hex_address(h["addr"]), f"bad addr {h['addr']!r}"
+        ea = int(h["addr"], 16)
+        assert any(s <= ea < e for s, e in ranges), f"{h['addr']} not in any exec segment"
+        for m in h["matches"]:
+            assert m["kind"] == "disasm"
+            assert isinstance(m["text"], str) and m["text"]
+
+
+@test()
+def test_fastpath_addresses_agree_with_ida_search():
+    """For the same 'call' token, objdump hit addresses overlap IDA's listing scan."""
+    od = _require_objdump()
+    _prime_search_meta_cache()
+    cache = _get_search_meta_cache()
+    base = _objdump_search.objdump_base(od, cache["input_path"])
+    matcher = _build_text_matcher("call", regex=False, case_sensitive=False)
+    fast = _objdump_search.search_disasm(
+        od, cache["input_path"], matcher,
+        delta=cache["imagebase"] - base, limit=200,
+    )
+    ida = search_text("call", include="disasm", limit=200)
+    if fast["n"] == 0 or ida["n"] == 0:
+        skip_test("'call' not found by both engines")
+    fast_addrs = {int(h["addr"], 16) for h in fast["hits"]}
+    ida_addrs = {int(h["addr"], 16) for h in ida["hits"]}
+    # Both scan the same code; their call-site addresses should overlap.
+    assert fast_addrs & ida_addrs, "objdump and IDA found no common call sites"
+
+
+@test()
+def test_fastpath_resume_cursor_does_not_duplicate():
+    """Resuming from cursor.next yields strictly later, non-overlapping hits."""
+    od = _require_objdump()
+    _prime_search_meta_cache()
+    cache = _get_search_meta_cache()
+    base = _objdump_search.objdump_base(od, cache["input_path"])
+    delta = cache["imagebase"] - base
+    matcher = _build_text_matcher("call", regex=False, case_sensitive=False)
+    page1 = _objdump_search.search_disasm(od, cache["input_path"], matcher, delta=delta, limit=2)
+    if page1["n"] < 2 or page1["cursor"].get("done"):
+        skip_test("not enough matches to paginate")
+    nxt = int(page1["cursor"]["next"], 16)
+    page2 = _objdump_search.search_disasm(
+        od, cache["input_path"], matcher, delta=delta, limit=2, start_ea=nxt
+    )
+    a1 = {h["addr"] for h in page1["hits"]}
+    a2 = {h["addr"] for h in page2["hits"]}
+    assert not (a1 & a2), f"duplicate hits across pages: {a1 & a2}"
+
+
+@test()
+def test_fastpath_declines_when_ida_not_busy():
+    """With no in-flight @idasync calls, the fast path declines (returns None)."""
+    # In the test harness nothing else is holding the main thread, so depth==0
+    # and search_text should stay on the IDA engine.
+    out = _maybe_search_text_fast(
+        "call", 5, "", False, False, "all", True, 5.0
+    )
+    assert out is None
+
+
+@test()
+def test_fastpath_declines_unsupported_requests():
+    """comments-only and data (code_only=False) searches never use objdump."""
+    assert _maybe_search_text_fast("x", 5, "", False, False, "comments", True, 5.0) is None
+    assert _maybe_search_text_fast("x", 5, "", False, False, "all", False, 5.0) is None
+
+
+@test()
+def test_fastpath_intel_syntax_matches_ida_mnemonics():
+    """On x86, -M intel makes objdump emit Intel mnemonics/registers like IDA.
+
+    A query written against IDA's Intel listing (e.g. 'call rax') matches under
+    intel=True but not under objdump's AT&T default ('call *%rax').
+    """
+    import idaapi
+
+    od = _require_objdump()
+    _prime_search_meta_cache()
+    cache = _get_search_meta_cache()
+    if not _objdump_search.is_x86(od, cache["input_path"]):
+        skip_test("non-x86 target; -M intel not applicable")
+    base = _objdump_search.objdump_base(od, cache["input_path"])
+    delta = cache["imagebase"] - base
+    matcher = _build_text_matcher(r"call\s+rax", regex=True, case_sensitive=False)
+    intel = _objdump_search.search_disasm(od, cache["input_path"], matcher, delta=delta, limit=20, intel=True)
+    att = _objdump_search.search_disasm(od, cache["input_path"], matcher, delta=delta, limit=20, intel=False)
+    if intel["n"] == 0:
+        skip_test("no 'call rax' in this binary")
+    assert intel["n"] > att["n"], "intel syntax should match Intel-style queries that AT&T does not"

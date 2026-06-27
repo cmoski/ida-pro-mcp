@@ -2478,3 +2478,163 @@ def callgraph(
             results.append({"root": root, "error": str(e), "nodes": [], "edges": []})
 
     return results
+
+
+# ============================================================================
+# Orphan function discovery
+# ============================================================================
+
+
+class OrphanFunction(TypedDict, total=False):
+    addr: str
+    name: str
+    size: str
+    size_int: int
+    instruction_count: int
+    basic_block_count: int
+    edges: int
+    cyclomatic_complexity: int
+    # Number of data references to the entry (function-pointer tables, vtables).
+    # >0 means the address is taken — likely called indirectly, not dead.
+    data_xref_count: int
+    is_thunk: bool
+    is_library: bool
+
+
+class OrphanFunctionsResult(TypedDict, total=False):
+    total: int
+    # Orphans that also have zero data xrefs — the strongest dead-code signal.
+    dead_code_candidates: int
+    data: list[OrphanFunction]
+    next_offset: int | None
+    truncated: bool
+    error: str
+
+
+def _flow_metrics(func: ida_funcs.func_t) -> tuple[int, int]:
+    """Return (basic_block_count, edge_count) from the function's flow chart."""
+    nblocks = 0
+    edges = 0
+    try:
+        for block in idaapi.FlowChart(func):
+            nblocks += 1
+            edges += sum(1 for _ in block.succs())
+    except Exception:
+        return (1, 0)
+    return (nblocks, edges)
+
+
+@tool
+@idasync
+@tool_timeout(180.0)
+def find_orphan_functions(
+    sort_by: Annotated[str, "'size' | 'complexity' (default: size)"] = "size",
+    descending: Annotated[bool, "Sort high→low so the biggest/most complex come first (default: true)"] = True,
+    offset: Annotated[int, "Pagination offset into the sorted orphan list (default: 0)"] = 0,
+    count: Annotated[int, "Max orphans per page (default: 100, max: 1000)"] = 100,
+    min_size: Annotated[int, "Skip functions smaller than this many bytes (default: 0)"] = 0,
+    exclude_thunks: Annotated[bool, "Skip FUNC_THUNK wrappers (default: true)"] = True,
+    exclude_library: Annotated[bool, "Skip FUNC_LIB / FLIRT-matched library (CRT) code (default: true)"] = True,
+    exclude_entrypoints: Annotated[bool, "Skip the program entry and exported/entry symbols (default: true)"] = True,
+    only_dead_code: Annotated[bool, "Only orphans with no code AND no data xrefs (default: false)"] = False,
+    name_filter: Annotated[str, "Glob filter on function name (e.g. 'sub_*'); empty = all"] = "",
+    time_budget_sec: Annotated[float, "Wall-clock budget for the scan; 0 disables. Marks truncated on hit."] = 120.0,
+) -> OrphanFunctionsResult:
+    """Find orphan functions (no incoming code xrefs) ranked by size and complexity.
+
+    An orphan has zero code references into its entry — no caller reaches it via
+    call or jump. These are dead-code candidates or functions invoked only
+    indirectly (function-pointer tables, vtables). `data_xref_count` tells them
+    apart: 0 means the address is never taken (strongest dead-code signal);
+    >0 means it's likely an indirect call target. By default thunks, library
+    (CRT/FLIRT) code, and entry/exported symbols are excluded — useful for
+    surveying hand-written code in Watcom and other statically-linked binaries.
+
+    Complexity is cyclomatic complexity (edges - blocks + 2). Sort by 'size' or
+    'complexity'; the other metric is the tie-breaker. Paginated via offset/count.
+    """
+    sort_by = (sort_by or "size").lower()
+    if sort_by not in ("size", "complexity"):
+        return {"total": 0, "dead_code_candidates": 0, "data": [], "next_offset": None, "error": f"invalid sort_by: {sort_by!r}"}
+    count = _clamp_int(count, 100, 0, 1000)
+    offset = _clamp_int(offset, 0, 0, 2_000_000_000)
+    min_size = _clamp_int(min_size, 0, 0, 2_000_000_000)
+
+    entry_eas: set[int] = set()
+    if exclude_entrypoints:
+        for _idx, _ord, ea, _name in idautils.Entries():
+            entry_eas.add(ea)
+        start_ea = ida_ida.inf_get_start_ea()
+        if start_ea != idaapi.BADADDR:
+            entry_eas.add(start_ea)
+
+    deadline = time.monotonic() + time_budget_sec if time_budget_sec > 0 else None
+    truncated = False
+    orphans: list[OrphanFunction] = []
+
+    for fn_ea in idautils.Functions():
+        if deadline is not None and time.monotonic() >= deadline:
+            truncated = True
+            break
+        fn = idaapi.get_func(fn_ea)
+        if not fn:
+            continue
+
+        is_thunk = bool(fn.flags & idaapi.FUNC_THUNK)
+        is_library = bool(fn.flags & idaapi.FUNC_LIB)
+        if exclude_thunks and is_thunk:
+            continue
+        if exclude_library and is_library:
+            continue
+        if exclude_entrypoints and fn.start_ea in entry_eas:
+            continue
+
+        size_int = fn.end_ea - fn.start_ea
+        if size_int < min_size:
+            continue
+
+        # Orphan == no incoming code reference (call or jump) to the entry.
+        if next(iter(idautils.CodeRefsTo(fn.start_ea, 0)), None) is not None:
+            continue
+
+        data_xref_count = sum(1 for _ in idautils.DataRefsTo(fn.start_ea))
+        if only_dead_code and data_xref_count > 0:
+            continue
+
+        nblocks, edges = _flow_metrics(fn)
+        orphans.append(
+            {
+                "addr": hex(fn.start_ea),
+                "name": ida_funcs.get_func_name(fn.start_ea) or "<unnamed>",
+                "size": hex(size_int),
+                "size_int": size_int,
+                "instruction_count": sum(1 for _ in idautils.FuncItems(fn.start_ea)),
+                "basic_block_count": nblocks,
+                "edges": edges,
+                "cyclomatic_complexity": max(1, edges - nblocks + 2),
+                "data_xref_count": data_xref_count,
+                "is_thunk": is_thunk,
+                "is_library": is_library,
+            }
+        )
+
+    if name_filter:
+        orphans = pattern_filter(orphans, name_filter, "name")
+
+    dead_code_candidates = sum(1 for o in orphans if o["data_xref_count"] == 0)
+
+    def _key(o: OrphanFunction) -> tuple[int, int]:
+        if sort_by == "complexity":
+            return (o["cyclomatic_complexity"], o["size_int"])
+        return (o["size_int"], o["cyclomatic_complexity"])
+
+    orphans.sort(key=_key, reverse=descending)
+    page = paginate(orphans, offset, count)
+
+    return {
+        "total": len(orphans),
+        "dead_code_candidates": dead_code_candidates,
+        "data": page["data"],
+        "next_offset": page["next_offset"],
+        "truncated": truncated,
+    }

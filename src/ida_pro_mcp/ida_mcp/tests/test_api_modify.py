@@ -208,6 +208,82 @@ def test_rename_function_roundtrip():
     assert restored["fn"]["name"] == original_name
 
 
+@test()
+def test_rename_output_schema_accepts_null_old():
+    """Regression: renaming a previously-unnamed symbol yields old=None, which the
+    tool's advertised outputSchema must accept.
+
+    Before the fix RenameItemResult.old was typed `str`, so the generated
+    outputSchema declared old as a non-null string and a client validating the
+    (already-committed) response rejected it with 'None is not of type string'.
+    """
+    try:
+        from jsonschema import Draft202012Validator
+    except Exception:
+        skip_test("jsonschema not installed")
+
+    from ..rpc import MCP_SERVER
+
+    schema = MCP_SERVER._generate_tool_schema(
+        "rename", MCP_SERVER.tools.methods["rename"]
+    ).get("outputSchema")
+    assert schema is not None, "rename has no outputSchema"
+
+    # A faithful shape of a real result where the target was unnamed.
+    sample = {"data": [{"addr": "0x1000", "old": None, "new": "renamed_thing"}]}
+    # Must not raise ValidationError.
+    Draft202012Validator(schema).validate(sample)
+
+
+@test()
+def test_rename_unnamed_address_returns_null_old():
+    """Renaming a previously-unnamed address commits and reports old=None (no error)."""
+    import idaapi
+    import idautils
+    import ida_bytes
+    import idc
+
+    # Collect unnamed item heads in non-executable segments — set_name only
+    # accepts head addresses, so iterate heads rather than raw bytes.
+    candidates: list[int] = []
+    for seg_ea in idautils.Segments():
+        seg = idaapi.getseg(seg_ea)
+        if not seg or (seg.perm & idaapi.SEGPERM_EXEC):
+            continue
+        ea = seg.start_ea
+        scanned = 0
+        while ea != idaapi.BADADDR and ea < seg.end_ea and scanned < 4000:
+            if ida_bytes.is_loaded(ea) and not idaapi.get_name(ea):
+                candidates.append(ea)
+                if len(candidates) >= 20:
+                    break
+            ea = idc.next_head(ea, seg.end_ea)
+            scanned += 1
+        if len(candidates) >= 20:
+            break
+    if not candidates:
+        skip_test("no unnamed data head available in this binary")
+
+    new_name = "__test_unnamed_rename__"
+    target = None
+    try:
+        for cand in candidates:
+            result = rename({"data": [{"addr": hex(cand), "new": new_name}]})
+            item = result["data"][0]
+            if "error" in item:
+                continue
+            target = cand
+            # The committed rename of a previously-unnamed head must report old=None.
+            assert item["old"] is None, f"expected old=None for unnamed target, got {item['old']!r}"
+            assert idaapi.get_name(target) == new_name, "rename did not commit"
+            break
+        if target is None:
+            skip_test("no unnamed head accepted a name in this binary")
+    finally:
+        if target is not None:
+            idc.set_name(target, "", idaapi.SN_NOWARN)
+
+
 @test(binary="crackme03.elf")
 def test_rename_data_roundtrip():
     """rename can rename a global/data symbol and restore it."""

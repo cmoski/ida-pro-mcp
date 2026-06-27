@@ -1,7 +1,9 @@
 """Core API Functions - IDB metadata and basic queries"""
 
 import logging
+import os
 import re
+import threading
 import time
 from typing import Annotated, Any, NotRequired, TypedDict
 
@@ -19,6 +21,7 @@ import ida_nalt
 import ida_typeinf
 import idc
 
+from . import _objdump_search
 from .rpc import tool
 from .sync import idasync, inflight_snapshot, tool_timeout
 from .utils import (
@@ -136,6 +139,9 @@ class SearchTextResult(TypedDict, total=False):
     hits: list[SearchTextHit]
     cursor: dict[str, Any]
     error: str
+    # Set to "objdump" when the busy fast path served the request (raw
+    # disassembly only — no IDA names/comments). Absent on the IDA path.
+    engine: str
 
 
 # Cached strings list: [(ea, text), ...]
@@ -988,9 +994,149 @@ def _all_segments() -> list[tuple[int, int]]:
     return ranges
 
 
+# ----------------------------------------------------------------------------
+# search_text objdump fast path
+#
+# When the IDA main thread is busy, search_text would queue behind it. Instead
+# we can disassemble the on-disk input file with objdump (off the main thread)
+# and grep the instruction lines. That requires two values we can only read on
+# the main thread — the input file path and the image base — so we cache them
+# the first time the IDA path runs while IDA is free, and reuse them while busy.
+# ----------------------------------------------------------------------------
+
+_FASTPATH_BUSY_ENV = "IDA_MCP_FASTPATH_BUSY_SEC"
+_FASTPATH_DISABLE_ENV = "IDA_MCP_FASTPATH_DISABLE"
+_DEFAULT_FASTPATH_BUSY_SEC = 2.0
+
+_meta_cache_lock = threading.Lock()
+# {"input_path": str, "imagebase": int}
+_search_meta_cache: dict[str, Any] | None = None
+
+
+def _prime_search_meta_cache() -> None:
+    """Cache the input path + image base. MUST run on the IDA main thread."""
+    global _search_meta_cache
+    try:
+        input_path = ida_nalt.get_input_file_path()
+        imagebase = idaapi.get_imagebase()
+    except Exception:
+        return
+    if not input_path:
+        return
+    with _meta_cache_lock:
+        _search_meta_cache = {"input_path": input_path, "imagebase": imagebase}
+
+
+def _get_search_meta_cache() -> dict[str, Any] | None:
+    with _meta_cache_lock:
+        return dict(_search_meta_cache) if _search_meta_cache is not None else None
+
+
+def _fastpath_disabled() -> bool:
+    return os.environ.get(_FASTPATH_DISABLE_ENV, "").strip().lower() in ("1", "true", "yes")
+
+
+def _fastpath_busy_threshold() -> float:
+    raw = os.environ.get(_FASTPATH_BUSY_ENV, "").strip()
+    if not raw:
+        return _DEFAULT_FASTPATH_BUSY_SEC
+    try:
+        return float(raw)
+    except ValueError:
+        return _DEFAULT_FASTPATH_BUSY_SEC
+
+
+def _build_text_matcher(pattern: str, regex: bool, case_sensitive: bool):
+    """Return a matcher callable, or a SearchTextResult error envelope."""
+    if regex:
+        try:
+            flags = 0 if case_sensitive else re.IGNORECASE
+            rx = re.compile(pattern, flags)
+        except re.error as e:
+            return {"n": 0, "hits": [], "cursor": {"done": True}, "error": f"invalid regex: {e}"}
+        return lambda s: bool(rx.search(s))
+    if case_sensitive:
+        needle = pattern
+        return lambda s: needle in s
+    needle = pattern.lower()
+    return lambda s: needle in s.lower()
+
+
+def _maybe_search_text_fast(
+    pattern: str,
+    limit: int,
+    start: str,
+    regex: bool,
+    case_sensitive: bool,
+    include: str,
+    code_only: bool,
+    time_budget_sec: float,
+) -> SearchTextResult | None:
+    """Serve search_text via objdump when IDA is busy, else return None.
+
+    Returns None whenever the fast path can't faithfully serve the request
+    (feature unsupported, IDA not busy, cache not primed, objdump missing,
+    base undeterminable) so the caller falls back to the IDA path. A returned
+    dict is authoritative — including an error envelope for an invalid regex.
+    """
+    if _fastpath_disabled():
+        return None
+    # objdump disassembles executable code only: it can't see comments or data.
+    if (include or "all").lower() == "comments" or not code_only:
+        return None
+
+    snap = inflight_snapshot()
+    if snap.get("depth", 0) <= 0 or snap.get("inflight_seconds", 0.0) < _fastpath_busy_threshold():
+        return None
+
+    # Resume cursor must be a bare address here — symbol resolution needs IDA.
+    start_ea: int | None = None
+    if start:
+        try:
+            start_ea = int(start, 0)
+        except (TypeError, ValueError):
+            return None
+
+    cache = _get_search_meta_cache()
+    if cache is None:
+        return None
+
+    objdump = _objdump_search.find_objdump()
+    if not objdump:
+        return None
+    base = _objdump_search.objdump_base(objdump, cache["input_path"])
+    if base is None:
+        return None
+
+    matcher = _build_text_matcher(pattern, regex, case_sensitive)
+    if isinstance(matcher, dict):  # invalid regex envelope
+        return matcher
+
+    # Match the IDA path's clamp so paging behaves identically across engines.
+    if limit <= 0:
+        limit = 30
+    elif limit > 500:
+        limit = 500
+
+    delta = cache["imagebase"] - base
+    result = _objdump_search.search_disasm(
+        objdump,
+        cache["input_path"],
+        matcher,
+        delta=delta,
+        limit=limit,
+        start_ea=start_ea,
+        time_budget_sec=time_budget_sec,
+        # x86 → Intel syntax so mnemonics/registers match IDA's listing.
+        intel=_objdump_search.is_x86(objdump, cache["input_path"]),
+    )
+    if result.get("error"):
+        # objdump errored mid-flight (e.g. unknown format); fall back to IDA.
+        return None
+    return result
+
+
 @tool
-@idasync
-@tool_timeout(90.0)
 def search_text(
     pattern: Annotated[str, "Text to search for in the rendered listing (literal substring by default)"],
     limit: Annotated[int, "Max hits per page (default: 30, max: 500)"] = 30,
@@ -1007,11 +1153,39 @@ def search_text(
 
     Discovers candidate EAs with `ida_search.find_text()`, then renders each hit
     once via `ida_lines.generate_disassembly()` to extract matching lines and
-    classify them as disasm or comment. Returns one hit per EA. If the
-    wall-clock budget is exceeded mid-scan, returns the hits found so far with
-    cursor.truncated=True and cursor.limit_hit="time_budget"; resume from
-    cursor.next.
+    classify them as disasm or comment. One hit per EA. If the wall-clock budget
+    is exceeded mid-scan, returns the hits found so far with cursor.truncated=True
+    and cursor.limit_hit="time_budget"; resume from cursor.next.
+
+    Fast path: when the IDA main thread is busy, disasm-only code searches are
+    served off-thread via objdump on the on-disk file. Those results carry
+    engine="objdump" and see raw disassembly only (no IDA names/comments).
     """
+    fast = _maybe_search_text_fast(
+        pattern, limit, start, regex, case_sensitive, include, code_only, time_budget_sec
+    )
+    if fast is not None:
+        return fast
+    return _search_text_ida(
+        pattern, limit, start, regex, case_sensitive, include, code_only, time_budget_sec
+    )
+
+
+@idasync
+@tool_timeout(90.0)
+def _search_text_ida(
+    pattern: str,
+    limit: int,
+    start: str,
+    regex: bool,
+    case_sensitive: bool,
+    include: str,
+    code_only: bool,
+    time_budget_sec: float,
+) -> SearchTextResult:
+    # Runs on the IDA main thread; opportunistically prime the fast-path cache
+    # so a later busy call can use objdump.
+    _prime_search_meta_cache()
     if limit <= 0:
         limit = 30
     if limit > 500:
