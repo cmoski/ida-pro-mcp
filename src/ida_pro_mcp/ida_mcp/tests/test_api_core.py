@@ -34,6 +34,10 @@ from ..api_core import (
     _maybe_search_text_fast,
     _prime_search_meta_cache,
     _get_search_meta_cache,
+    submit_job,
+    job_status,
+    job_list,
+    job_cancel,
 )
 from .. import _objdump_search
 
@@ -719,3 +723,97 @@ def test_fastpath_intel_syntax_matches_ida_mnemonics():
     if intel["n"] == 0:
         skip_test("no 'call rax' in this binary")
     assert intel["n"] > att["n"], "intel syntax should match Intel-style queries that AT&T does not"
+
+
+# ============================================================================
+# Tests for async jobs (submit_job / job_status / job_list / job_cancel)
+#
+# These exercise the job plumbing through the real MCP registry. To stay safe
+# under the single-threaded headless test server, the round-trip uses a
+# non-@idasync tool (server_liveness) so the job never needs main-thread pumping.
+# ============================================================================
+
+
+def _wait_job(job_id, status, timeout=5.0):
+    """Poll job_status until `status` (or any terminal state if asking for
+    'completed'); fail after timeout."""
+    import time
+
+    deadline = time.monotonic() + timeout
+    last = None
+    while time.monotonic() < deadline:
+        last = job_status(job_id)
+        if last.get("status") == status:
+            return last
+        if last.get("status") in ("failed", "cancelled") and status == "completed":
+            raise AssertionError(f"job ended {last['status']}: {last.get('error')}")
+        time.sleep(0.01)
+    raise AssertionError(f"job {job_id} did not reach {status!r} in {timeout}s (last={last})")
+
+
+@test()
+def test_submit_job_unknown_tool_returns_error():
+    """submit_job rejects an unregistered tool name up front."""
+    result = submit_job("___no_such_tool___", {})
+    assert "error" in result
+    assert "unknown tool" in result["error"]
+
+
+@test()
+def test_submit_job_rejects_job_control_tool():
+    """Job-control tools cannot be scheduled as jobs (recursion/footgun guard)."""
+    result = submit_job("job_status", {"job_id": "x"})
+    assert "error" in result
+    assert "cannot be run as a job" in result["error"]
+
+
+@test()
+def test_submit_job_roundtrip_completes_with_result():
+    """A submitted job runs the target tool and its result is retrievable.
+
+    Uses server_liveness (not @idasync) so this is safe on the single-threaded
+    headless test server as well as the threaded GUI plugin.
+    """
+    submitted = submit_job("server_liveness", {})
+    assert "error" not in submitted, submitted
+    job_id = submitted["job_id"]
+    assert submitted["tool"] == "server_liveness"
+
+    done = _wait_job(job_id, "completed")
+    assert "result" in done, done
+    # server_liveness always reports alive=True.
+    assert done["result"].get("alive") is True
+
+
+@test()
+def test_job_status_unknown_returns_error():
+    result = job_status("does-not-exist")
+    assert "error" in result
+    assert "unknown job" in result["error"]
+
+
+@test()
+def test_job_list_contains_submitted_job():
+    """A submitted job appears in job_list (no result payload there)."""
+    submitted = submit_job("server_liveness", {})
+    job_id = submitted["job_id"]
+    _wait_job(job_id, "completed")
+
+    listing = job_list()
+    assert "jobs" in listing
+    ids = [j["job_id"] for j in listing["jobs"]]
+    assert job_id in ids
+    # job_list entries never carry the result payload.
+    entry = next(j for j in listing["jobs"] if j["job_id"] == job_id)
+    assert "result" not in entry
+
+    # Status filter narrows the set and never returns a non-matching status.
+    completed = job_list(status="completed")
+    assert all(j["status"] == "completed" for j in completed["jobs"])
+
+
+@test()
+def test_job_cancel_unknown_returns_false():
+    result = job_cancel("does-not-exist")
+    assert result["cancelled"] is False
+    assert result["job_id"] == "does-not-exist"

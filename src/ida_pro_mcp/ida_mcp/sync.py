@@ -76,6 +76,23 @@ def get_pre_call_batch() -> int | None:
     return getattr(_sync_state, "pre_call_batch", None)
 
 
+def get_thread_timeout_override() -> float | None:
+    """Per-thread tool-timeout override, or None when unset.
+
+    Set by the async job worker (see jobs / api_core) so a job can opt a tool
+    out of its synchronous-path timeout: jobs are polled and cancellable, so a
+    long decompile shouldn't trip the 30s/90s ceiling meant to protect a held
+    HTTP request. Takes precedence over a tool's @tool_timeout and the env
+    default. A value of 0 means "no deadline" (still cancellable).
+    """
+    return getattr(_sync_state, "timeout_override", None)
+
+
+def set_thread_timeout_override(seconds: float | None) -> None:
+    """Set (or clear with None) the per-thread tool-timeout override."""
+    _sync_state.timeout_override = seconds
+
+
 def _sync_wrapper(ff, keep_batch=False):
     """Call a function ff with a specific IDA safety_mode.
 
@@ -158,8 +175,13 @@ def sync_wrapper(
     # Capture cancel event from thread-local before execute_sync
     cancel_event = get_current_cancel_event()
 
-    timeout = timeout_override
-    if timeout is None:
+    # Precedence: per-thread override (async job) > @tool_timeout attr > env default.
+    thread_override = get_thread_timeout_override()
+    if thread_override is not None:
+        timeout = thread_override
+    elif timeout_override is not None:
+        timeout = timeout_override
+    else:
         timeout = _get_tool_timeout_seconds()
     # Register inflight BEFORE execute_sync so a concurrent server_liveness()
     # probe sees this call even while it's blocked waiting for the main thread.

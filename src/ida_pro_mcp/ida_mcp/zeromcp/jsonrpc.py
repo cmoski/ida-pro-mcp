@@ -28,6 +28,18 @@ def get_current_cancel_event() -> threading.Event | None:
     return getattr(_current_request, "cancel_event", None)
 
 
+def set_current_cancel_event(event: threading.Event | None) -> None:
+    """Bind a cancel event to the current thread without a global registration.
+
+    Used by the async job worker thread: a job carries its own cancel Event
+    (settable from another thread via the job API), and the sync layer reads it
+    through get_current_cancel_event(). Unlike register_pending_request this does
+    NOT touch the global _pending_requests map — there is no JSON-RPC request id
+    to cancel via notifications/cancelled; cancellation flows through job_cancel.
+    """
+    _current_request.cancel_event = event
+
+
 def register_pending_request(request_id: int | str) -> threading.Event:
     """Register a request as pending and return its cancel event."""
     event = threading.Event()

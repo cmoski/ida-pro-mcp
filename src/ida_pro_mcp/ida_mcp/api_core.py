@@ -22,8 +22,15 @@ import ida_typeinf
 import idc
 
 from . import _objdump_search
-from .rpc import tool
-from .sync import idasync, inflight_snapshot, tool_timeout
+from . import jobs
+from .rpc import tool, MCP_SERVER
+from .sync import (
+    idasync,
+    inflight_snapshot,
+    tool_timeout,
+    set_thread_timeout_override,
+)
+from .zeromcp.jsonrpc import set_current_cancel_event
 from .utils import (
     ConvertedNumber,
     EntityQuery,
@@ -408,6 +415,140 @@ def server_liveness() -> dict:
         "inflight_tool": snap["tool"],
         "inflight_seconds": snap["inflight_seconds"],
     }
+
+
+# ----------------------------------------------------------------------------
+# Async jobs: submit a long-running tool, poll for its result
+#
+# IDA's SDK is single-threaded, so jobs do NOT run in parallel — they serialize
+# on the one main thread just like synchronous calls. The win is decoupling the
+# work from the HTTP request: submit_job returns a job_id immediately, the client
+# polls job_status (a cheap dict read, like server_liveness), and the result is
+# delivered when ready. Cancellation reuses the existing cancel_event +
+# sys.setprofile machinery in sync.py.
+# ----------------------------------------------------------------------------
+
+_JOB_MANAGER = jobs.JobManager()
+
+# Tools that manage jobs must never themselves be run as jobs (footgun/recursion).
+_JOB_CONTROL_TOOLS = frozenset(
+    {"submit_job", "job_status", "job_list", "job_cancel"}
+)
+
+
+def _jobs_run_async() -> bool:
+    """True only when the HTTP server is threaded (the in-IDA GUI plugin).
+
+    A job runs its tool on a background worker thread, which reaches the IDA main
+    thread via execute_sync(MFF_WRITE). That is only serviced when something pumps
+    the main thread — the Qt UI loop in the GUI plugin, which also runs a threaded
+    HTTP server. Headless idalib serves single-threaded on the main thread with no
+    pump, so a background execute_sync would deadlock; there we run jobs inline.
+    """
+    from http.server import ThreadingHTTPServer
+
+    return isinstance(getattr(MCP_SERVER, "_http_server", None), ThreadingHTTPServer)
+
+
+def _run_job_dispatch(job: jobs.Job) -> Any:
+    """Worker-thread runner: dispatch the tool through the MCP registry with the
+    job's cancel event and timeout override bound to this thread so the @idasync
+    sync layer picks them up. Returns the tool's `result` payload."""
+    set_current_cancel_event(job.cancel_event)
+    # None -> 0.0 means "no deadline" (still cancellable); a positive value sets one.
+    set_thread_timeout_override(job.timeout if job.timeout is not None else 0.0)
+    try:
+        response = MCP_SERVER.tools.dispatch(
+            {
+                "jsonrpc": "2.0",
+                "method": job.tool,
+                "params": job.arguments,
+                "id": None,
+            }
+        )
+        if response and "error" in response:
+            raise RuntimeError(response["error"].get("message", "tool error"))
+        return response.get("result") if response else None
+    finally:
+        set_current_cancel_event(None)
+        set_thread_timeout_override(None)
+
+
+@tool
+def submit_job(
+    tool: Annotated[str, "Name of the tool to run asynchronously (e.g. 'search_text')"],
+    arguments: Annotated[dict | None, "Arguments dict for that tool"] = None,
+    timeout: Annotated[
+        float | None,
+        "Per-job timeout in seconds; 0 or omitted = no deadline (still cancellable via job_cancel)",
+    ] = None,
+) -> dict:
+    """Run a long-running tool asynchronously and return a job_id immediately.
+
+    For work that would otherwise hold the request open long enough to trip a
+    client timeout (full analysis, huge decompiles, whole-binary search). Poll
+    job_status(job_id) until 'completed' (result attached) or 'failed'/'cancelled';
+    cancel with job_cancel(job_id).
+
+    Jobs do NOT run in parallel: IDA's main thread is single-threaded, so a running
+    job blocks other IDA calls until done or cancelled — like a synchronous call,
+    just without holding your HTTP request open. server_liveness() stays responsive.
+    In headless idalib the job runs inline and returns already terminal.
+    """
+    if tool in _JOB_CONTROL_TOOLS:
+        return {"error": f"tool '{tool}' cannot be run as a job"}
+    if tool not in MCP_SERVER.tools.methods:
+        return {"error": f"unknown tool: {tool}"}
+    if _jobs_run_async():
+        job = _JOB_MANAGER.submit(tool, arguments, _run_job_dispatch, timeout=timeout)
+    else:
+        job = _JOB_MANAGER.run_inline(
+            tool, arguments, _run_job_dispatch, timeout=timeout
+        )
+    return job.to_dict()
+
+
+@tool
+def job_status(
+    job_id: Annotated[str, "Job id returned by submit_job"],
+) -> dict:
+    """Get a job's status, and its result once completed.
+
+    Cheap (NOT @idasync): reads in-memory state and answers instantly even while
+    the job holds the IDA main thread. On 'completed' the tool's result is under
+    'result'; on 'failed' the message is under 'error'.
+    """
+    job = _JOB_MANAGER.get(job_id)
+    if job is None:
+        return {"error": f"unknown job: {job_id}"}
+    return job.to_dict(include_result=True)
+
+
+@tool
+def job_list(
+    status: Annotated[
+        str | None,
+        "Optional filter: pending|running|completed|failed|cancelled",
+    ] = None,
+) -> dict:
+    """List jobs (most recent first), optionally filtered by status. Results are
+    not included here — fetch a specific job's result via job_status."""
+    return {"jobs": [j.to_dict() for j in _JOB_MANAGER.list(status)]}
+
+
+@tool
+def job_cancel(
+    job_id: Annotated[str, "Job id to cancel"],
+) -> dict:
+    """Request cancellation of a pending or running job.
+
+    A pending job is cancelled immediately. A running job is signalled to abort
+    cooperatively via the same mechanism as notifications/cancelled — it stops at
+    the next Python opcode in the tool body, but cannot interrupt a tight C-level
+    IDA call (use idalib_restart_worker for a hard wedge).
+    """
+    cancelled = _JOB_MANAGER.cancel(job_id)
+    return {"job_id": job_id, "cancelled": cancelled}
 
 
 @tool
