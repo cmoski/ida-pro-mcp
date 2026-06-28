@@ -44,6 +44,44 @@ even though the code on disk is correct. This has bitten us more than once.
 - Response rejected by schema validation after a confirmed code update?
   **`hard=true` warm reload** to refresh the gateway manifest cache.
 
+## Gateway tool invocation
+
+- Through a gateway, tools are namespaced `ida-pro__<tool>`. But `submit_job`'s
+  `tool` argument takes the **bare** worker tool name (`rename`, not
+  `ida-pro__rename`) — it dispatches within the worker's own registry. Passing
+  the namespaced name returns `unknown tool`.
+- Most tools need a database bound to the calling context. Either `idalib_open`
+  / `idalib_switch` first, or pass `database=<session_id>` explicitly.
+
+## Async jobs (`submit_job` / `job_status` / `job_list` / `job_cancel`)
+
+- Jobs do **not** run in parallel. IDA's SDK is single-threaded; every `@idasync`
+  call serializes on the one main thread. The value of jobs is decoupling work
+  from the HTTP request + cheap polling + cooperative cancellation, not concurrency.
+- The execution model depends on how the server is served (see also
+  `memory/ida-mcp-threading-modes`):
+  - **GUI plugin** serves threaded; the Qt event loop pumps `execute_sync` from
+    the job worker thread → jobs run truly in the background.
+  - **Headless idalib** serves single-threaded on the main thread (no pump), so a
+    background `execute_sync` would deadlock. `submit_job` detects this and runs
+    the job **inline**, returning an already-terminal job. The submit→poll
+    contract holds in both modes.
+
+## Testing gotchas
+
+- `uv run ida-mcp-test <fixture>`; `-c <module>` selects `test_<module>.py`;
+  `-p "*pat*"` filters by test-name. `@test()` (no `binary=`) runs
+  binary-agnostically; `@test(binary="x.elf")` only on that fixture.
+- Pure stdlib modules (`jobs.py`, `inflight.py`) are deliberately `idaapi`-free
+  so their logic is unit-testable; their tests still run via the `@test` runner.
+- A live gateway worker holds an **exclusive lock** on an opened binary's IDA
+  database. Running the local suite against a fixture the gateway has open fails
+  with `Failed to open database` — `idalib_close` that session first, or run
+  against the other fixture.
+- Right after a gateway `hard` reload, an idalib worker respawn can transiently
+  fail with `WinError 10048` (a just-killed worker's port is still in TIME_WAIT).
+  It self-clears in ~1-2 min; retry rather than chasing it.
+
 ## Verifying changes live
 
 Always run the headless suite first (`uv run ida-mcp-test ...`, see `CLAUDE.md`),
