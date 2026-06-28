@@ -209,6 +209,84 @@ def test_rename_function_roundtrip():
 
 
 @test()
+def test_rename_address_keyed_batch_is_coerced():
+    """An address-keyed batch ({addr: name}) is coerced to func renames instead
+    of silently doing nothing -- the shape agents reach for first."""
+    fn_addr = get_any_function()
+    if not fn_addr:
+        skip_test("binary has no functions")
+    original_name = lookup_funcs(fn_addr)[0]["fn"]["name"]
+    new_name = "__test_addr_keyed__"
+    try:
+        result = rename({fn_addr: new_name})
+        assert result["summary"]["total"] == 1, result
+        assert result["summary"]["ok"] == 1, result
+        assert lookup_funcs(fn_addr)[0]["fn"]["name"] == new_name
+        # A breadcrumb teaches the canonical shape.
+        assert any("canonical" in n.lower() for n in result.get("notes", []))
+    finally:
+        rename({"func": [{"addr": fn_addr, "name": original_name}]})
+
+
+@test()
+def test_rename_address_keyed_dict_value_with_kind():
+    """{addr: {name, kind}} is coerced, honoring an explicit kind."""
+    fn_addr = get_any_function()
+    if not fn_addr:
+        skip_test("binary has no functions")
+    original_name = lookup_funcs(fn_addr)[0]["fn"]["name"]
+    new_name = "__test_addr_keyed_kind__"
+    try:
+        result = rename({fn_addr: {"name": new_name, "kind": "func"}})
+        assert result["summary"]["ok"] == 1, result
+        assert lookup_funcs(fn_addr)[0]["fn"]["name"] == new_name
+    finally:
+        rename({"func": [{"addr": fn_addr, "name": original_name}]})
+
+
+@test()
+def test_rename_category_alias_functions():
+    """The 'functions' alias maps to 'func'."""
+    fn_addr = get_any_function()
+    if not fn_addr:
+        skip_test("binary has no functions")
+    original_name = lookup_funcs(fn_addr)[0]["fn"]["name"]
+    new_name = "__test_alias_functions__"
+    try:
+        result = rename({"functions": [{"addr": fn_addr, "name": new_name}]})
+        assert result["summary"]["ok"] == 1, result
+        assert lookup_funcs(fn_addr)[0]["fn"]["name"] == new_name
+    finally:
+        rename({"func": [{"addr": fn_addr, "name": original_name}]})
+
+
+@test()
+def test_rename_old_new_form_resolves_by_name():
+    """{"old": <current name>, "new": <name>} resolves the lookup via the name."""
+    fn_addr = get_any_function()
+    if not fn_addr:
+        skip_test("binary has no functions")
+    original_name = lookup_funcs(fn_addr)[0]["fn"]["name"]
+    new_name = "__test_old_new__"
+    try:
+        result = rename({"func": [{"old": original_name, "new": new_name}]})
+        assert result["summary"]["ok"] == 1, result
+        assert lookup_funcs(fn_addr)[0]["fn"]["name"] == new_name
+    finally:
+        rename({"func": [{"addr": fn_addr, "name": original_name}]})
+
+
+@test()
+def test_rename_unrecognized_batch_errors_loudly():
+    """A batch with no usable entries returns a clear error, not a silent total:0."""
+    # Only control flags, no renames.
+    result = rename({"dry_run": True})
+    assert "error" in result, result
+    assert "category" in result["error"].lower()
+    assert result["summary"]["total"] == 0
+
+
+@test()
 def test_rename_output_schema_accepts_null_old():
     """Regression: renaming a previously-unnamed symbol yields old=None, which the
     tool's advertised outputSchema must accept.

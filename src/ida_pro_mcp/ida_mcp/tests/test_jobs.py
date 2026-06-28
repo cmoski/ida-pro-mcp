@@ -126,9 +126,6 @@ def test_jobs_list_and_filter():
     """list() returns most-recent-first and honors the status filter."""
     mgr = jobs.JobManager()
     a = mgr.submit("a", {}, lambda j: 1)
-    # Ensure distinct created timestamps so recency ordering is unambiguous
-    # (monotonic() can tie for two back-to-back submits).
-    time.sleep(0.01)
     b = mgr.submit("b", {}, lambda j: 2)
     _wait_status(mgr, a.job_id, jobs.COMPLETED)
     _wait_status(mgr, b.job_id, jobs.COMPLETED)

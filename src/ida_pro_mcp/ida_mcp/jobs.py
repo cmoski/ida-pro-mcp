@@ -65,6 +65,10 @@ class Job:
     created: float = field(default_factory=time.monotonic)
     started: Optional[float] = None
     completed: Optional[float] = None
+    # Monotonic submission sequence, assigned by JobManager. Used for stable
+    # most-recent-first ordering — `created` (a clock reading) can tie when two
+    # jobs are submitted within the timer's resolution (~15ms on Windows).
+    seq: int = 0
 
     def is_terminal(self) -> bool:
         return self.status in _TERMINAL
@@ -108,6 +112,11 @@ class JobManager:
         self._queue: "queue.Queue[str]" = queue.Queue()
         self._retention_sec = retention_sec
         self._worker: Optional[threading.Thread] = None
+        self._seq = 0  # monotonic submission counter for stable ordering
+
+    def _next_seq_locked(self) -> int:
+        self._seq += 1
+        return self._seq
 
     # -- submission ---------------------------------------------------------
 
@@ -128,6 +137,7 @@ class JobManager:
             timeout=timeout,
         )
         with self._lock:
+            job.seq = self._next_seq_locked()
             self._jobs[job.job_id] = job
             self._runners[job.job_id] = run
             self._ensure_worker_locked()
@@ -158,6 +168,7 @@ class JobManager:
             timeout=timeout,
         )
         with self._lock:
+            job.seq = self._next_seq_locked()
             self._jobs[job.job_id] = job
             self._runners[job.job_id] = run
             job.status = RUNNING
@@ -177,8 +188,10 @@ class JobManager:
             jobs = list(self._jobs.values())
         if status is not None:
             jobs = [j for j in jobs if j.status == status]
-        # Most recent first.
-        jobs.sort(key=lambda j: j.created, reverse=True)
+        # Most recent first. Order by submission sequence, not the wall clock:
+        # `created` can tie within the timer's resolution and produce a
+        # nondeterministic order for back-to-back submissions.
+        jobs.sort(key=lambda j: j.seq, reverse=True)
         return jobs
 
     # -- cancellation -------------------------------------------------------

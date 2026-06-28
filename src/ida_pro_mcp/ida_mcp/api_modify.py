@@ -83,6 +83,13 @@ class RenameResult(TypedDict, total=False):
     local: list[RenameItemResult]
     stack: list[RenameItemResult]
     summary: RenameSummaryResult
+    # Set when the batch contained no recognized rename entries (e.g. the caller
+    # keyed it by address instead of by category) so the failure is loud, not a
+    # silent total:0.
+    error: str
+    # Breadcrumbs, e.g. when an address-keyed batch was auto-coerced to the
+    # canonical category-keyed shape.
+    notes: list[str]
 
 
 class DefineResult(TypedDict, total=False):
@@ -304,28 +311,158 @@ def patch_asm(items: list[AsmPatchOp] | AsmPatchOp) -> list[PatchAsmResult]:
     return results
 
 
+# Recognized rename categories and the control flags that aren't categories.
+_RENAME_CATEGORIES = frozenset({"func", "data", "global", "globals", "local", "stack"})
+_RENAME_CONTROL_KEYS = frozenset({"stop_on_error", "dry_run", "allow_overwrite"})
+# Common synonyms agents reach for, mapped to the canonical category key.
+_RENAME_CATEGORY_ALIASES = {
+    "function": "func",
+    "functions": "func",
+    "funcs": "func",
+    "datas": "data",
+    "locals": "local",
+    "stacks": "stack",
+    "stackvars": "stack",
+}
+# Keys that mark a dict as a single rename *item* (vs. an address-keyed map).
+_RENAME_ITEM_FIELDS = frozenset({
+    "addr", "address", "ea", "func_addr", "func", "name", "new", "new_name",
+    "old", "from", "current", "offset", "kind", "scope", "var", "reg",
+})
+
+
+def _rename_spec_to_item(key: str, val) -> dict | None:
+    """Turn one entry of an address-keyed map into a rename item.
+
+    The key is the address (or current name); the value is either the new name
+    (string) or a dict that may already carry addr/name/kind.
+    """
+    if isinstance(val, str):
+        return {"addr": key, "name": val}
+    if isinstance(val, dict):
+        item = dict(val)
+        item.setdefault("addr", key)
+        return item
+    return None
+
+
+def _rename_expand_entries(value) -> list[dict]:
+    """Normalize one category's value into a list of item dicts.
+
+    Accepts a list of items, a single item dict, or an address-keyed map
+    ({"0x401F3C": "NewName"} / {"0x401F3C": {"name": ...}}). The address-keyed
+    form is what agents most often reach for first.
+    """
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return [item for item in value if isinstance(item, dict)]
+    if isinstance(value, dict):
+        if any(k in _RENAME_ITEM_FIELDS for k in value):
+            return [value]  # a single rename item
+        out: list[dict] = []
+        for k, v in value.items():
+            item = _rename_spec_to_item(k, v)
+            if item is not None:
+                out.append(item)
+        return out
+    return []
+
+
+def _coerce_rename_batch(batch: dict) -> dict | None:
+    """Coerce common batch shapes into the canonical category-keyed form.
+
+    Returns the canonical dict, or None when no rename entries can be recovered
+    (so the caller can fail loudly instead of silently doing nothing). Handles
+    category aliases (functions -> func) and a top-level address-keyed map keyed
+    by address with an optional per-entry ``kind``.
+    """
+    control = {k: batch[k] for k in batch if k in _RENAME_CONTROL_KEYS}
+
+    # Canonicalize category aliases first.
+    aliased: dict = {}
+    for k, v in batch.items():
+        if k in _RENAME_CONTROL_KEYS:
+            continue
+        canon = _RENAME_CATEGORY_ALIASES.get(k, k)
+        aliased[canon] = v
+
+    if any(k in _RENAME_CATEGORIES for k in aliased):
+        aliased.update(control)
+        return aliased
+
+    # No category keys: treat the whole batch as an address-keyed map, routing
+    # each entry by its `kind` (default func).
+    grouped: dict = {}
+    saw_entry = False
+    for k, v in batch.items():
+        if k in _RENAME_CONTROL_KEYS:
+            continue
+        item = _rename_spec_to_item(k, v)
+        if item is None:
+            continue
+        kind = item.pop("kind", None) or "func"
+        kind = _RENAME_CATEGORY_ALIASES.get(kind, kind)
+        if kind in ("global", "globals"):
+            kind = "data"
+        if kind not in ("func", "data", "local", "stack"):
+            kind = "func"
+        grouped.setdefault(kind, []).append(item)
+        saw_entry = True
+    if not saw_entry:
+        return None
+    grouped.update(control)
+    return grouped
+
+
 @tool
 @idasync
 def rename(
     batch: Annotated[
         RenameBatch,
-        "Rename batch with func/data/local/stack fields (at least one required)",
+        "Category-keyed rename batch: {\"func\"|\"data\"|\"local\"|\"stack\": "
+        "[{\"addr\": \"0x401F3C\", \"name\": \"NewName\"}]}. An address-keyed map "
+        "like {\"0x401F3C\": \"NewName\"} is also accepted.",
     ],
 ) -> RenameResult:
-    """Batch-rename funcs/globals/locals/stack vars with dry-run options."""
+    """Batch-rename funcs/globals/locals/stack vars with dry-run options.
+
+    `batch` is keyed by CATEGORY (func/data/local/stack), each a list of items
+    like {"addr": "0x401F3C", "name": "NewName"}. An address-keyed map
+    ({"0x401F3C": "NewName"}) is coerced automatically. Control flags
+    stop_on_error/dry_run/allow_overwrite may sit alongside the categories.
+    """
 
     stop_on_error = bool(batch.get("stop_on_error", False))
     dry_run = bool(batch.get("dry_run", False))
     allow_overwrite = bool(batch.get("allow_overwrite", False))
 
+    notes: list[str] = []
+    coerced = _coerce_rename_batch(batch)
+    if coerced is None:
+        non_control = sorted(k for k in batch if k not in _RENAME_CONTROL_KEYS)
+        return {
+            "summary": {"total": 0, "ok": 0, "failed": 0, "stopped": False},
+            "error": (
+                "No rename entries recognized. `batch` is keyed by category "
+                "(func/data/local/stack), each a list of "
+                '{"addr": "0x401F3C", "name": "NewName"}. '
+                'Example: {"func": [{"addr": "0x401F3C", "name": "ICSCheck"}]}. '
+                'An address-keyed map like {"0x401F3C": "NewName"} also works. '
+                f"Got keys: {non_control or '(none)'}."
+            ),
+        }
+    if not any(k in _RENAME_CATEGORIES for k in batch) and any(
+        k in _RENAME_CATEGORIES for k in coerced
+    ):
+        notes.append(
+            "Coerced batch to the canonical category-keyed form: "
+            '{"func": [{"addr": "0x401F3C", "name": "NewName"}]}.'
+        )
+    batch = coerced
+
     def _normalize_items(items):
-        if items is None:
-            return []
-        if isinstance(items, dict):
-            return [items]
-        if isinstance(items, list):
-            return [item for item in items if isinstance(item, dict)]
-        return []
+        return _rename_expand_entries(items)
 
     def _has_user_name(ea: int) -> bool:
         flags = idaapi.get_flags(ea)
@@ -398,7 +535,17 @@ def rename(
         halted = False
         for item in items:
             try:
-                addr_text = item.get("addr") or item.get("func_addr") or item.get("func")
+                # `old`/`from`/`current` are accepted as the lookup too: they're
+                # commonly the existing name, and parse_address() resolves names
+                # to addresses -- so {"old": "sub_401F3C", "new": "X"} works.
+                addr_text = (
+                    item.get("addr")
+                    or item.get("func_addr")
+                    or item.get("func")
+                    or item.get("old")
+                    or item.get("from")
+                    or item.get("current")
+                )
                 new_name = item.get("name") or item.get("new") or item.get("new_name")
                 if not addr_text or not new_name:
                     result = {
@@ -782,6 +929,8 @@ def rename(
     if stopped:
         summary["stopped_at"] = stopped_at
     result["summary"] = summary
+    if notes:
+        result["notes"] = notes
     return result
 
 
