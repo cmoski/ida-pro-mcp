@@ -125,12 +125,31 @@ class IdalibSessionListInfo(IdalibSessionInfo, total=False):
     worker_pid: int | None
 
 
+class IdalibOpenCandidate(TypedDict, total=False):
+    # A possible match returned when an open request is ambiguous (duplicate
+    # filenames). sha256/md5 let the caller verify which copy is which; pass a
+    # longer trailing path slice back to idalib_open to disambiguate.
+    path: str
+    filename: str
+    sha256: str
+    md5: str
+    error: str
+
+
 class IdalibOpenResult(IdalibContextFields, total=False):
     success: bool
     session: IdalibSessionInfo
     message: str
     error: str
     notes: list[str]
+    # SHA-256 + MD5 of the binary that was opened, for caller-side verification.
+    sha256: str
+    md5: str
+    # Populated on a failed resolve so the caller can self-correct in one step:
+    # `candidates` when the filename was ambiguous, `suggestions` (near filenames)
+    # when nothing matched.
+    candidates: list[IdalibOpenCandidate]
+    suggestions: list[str]
 
 
 class IdalibCloseResult(TypedDict, total=False):
@@ -480,6 +499,196 @@ class IdalibSupervisor:
             f"Ambiguous alias '{name_or_path}'; pass directory= to disambiguate. "
             f"Candidates: {sorted(paths)}"
         )
+
+    def _search_bases(
+        self, input_path: str, directory_hint: str | None
+    ) -> list[Path]:
+        """Existing directories to recurse when resolving a missing path.
+
+        Ordered most-specific first: the directory hint, the nearest existing
+        ancestor of the requested path, configured --search-roots, and the
+        parent directories of currently-open sessions. Deduplicated; only
+        absolute, existing directories are returned.
+        """
+        bases: list[Path] = []
+        seen: set[str] = set()
+
+        def add(d: str | None) -> None:
+            if not d:
+                return
+            try:
+                rp = Path(d)
+            except Exception:
+                return
+            if not rp.is_absolute():
+                return
+            key = os.path.normcase(str(rp))
+            if key in seen:
+                return
+            try:
+                if rp.exists() and rp.is_dir():
+                    seen.add(key)
+                    bases.append(rp)
+            except OSError:
+                return
+
+        add(directory_hint)
+        try:
+            for anc in Path(input_path).parents:
+                if anc.exists() and anc.is_dir():
+                    add(str(anc))
+                    break
+        except Exception:
+            pass
+        with self._lock:
+            roots = list(self.search_roots)
+            session_paths = [
+                s.input_path for s in self.sessions.values() if s.input_path
+            ]
+        for r in roots:
+            add(r)
+        for sp in session_paths:
+            try:
+                add(str(Path(sp).parent))
+            except Exception:
+                pass
+        return bases
+
+    def _search_for_basename(
+        self,
+        basename: str,
+        input_path: str,
+        directory_hint: str | None,
+        *,
+        max_files: int = 5000,
+        time_budget_sec: float = 8.0,
+    ) -> list[str]:
+        """Bounded recursive on-disk search for files named ``basename``.
+
+        Walks _search_bases() recursively until a match is found or the file/time
+        budget is hit, registering every hit in the alias registry so subsequent
+        opens resolve instantly. Matching is case-insensitive on the filename
+        only (no PE filter) so non-PE targets like 16-bit installers resolve too.
+        """
+        target = basename.lower()
+        found: list[str] = []
+        seen_paths: set[str] = set()
+        scanned = 0
+        deadline = time.monotonic() + time_budget_sec if time_budget_sec > 0 else None
+        for base in self._search_bases(input_path, directory_hint):
+            if deadline is not None and time.monotonic() >= deadline:
+                break
+            if scanned >= max_files:
+                break
+            for full_path, _st in _iter_candidate_files(base, True, lambda *_: None):
+                scanned += 1
+                if scanned > max_files:
+                    break
+                if deadline is not None and time.monotonic() >= deadline:
+                    break
+                if full_path.name.lower() == target:
+                    key = os.path.normcase(str(full_path))
+                    if key not in seen_paths:
+                        seen_paths.add(key)
+                        found.append(str(full_path))
+        if found:
+            self.record_aliases({Path(p).name: p for p in found})
+        return found
+
+    def resolve_open_target(
+        self,
+        input_path: str,
+        directory_hint: str | None = None,
+        *,
+        allow_search: bool = True,
+    ) -> dict:
+        """Resolve ``input_path`` to a concrete file to open, decisively.
+
+        Designed so a client passing an imperfect path gets opened in ONE call
+        rather than looping. Returns a dict with ``status``:
+
+        - ``open``: ``path`` is the absolute file to open; ``how`` explains the match.
+        - ``ambiguous``: ``candidates`` are equally-good matches (duplicate
+          filenames) — the caller should re-call with more path components.
+        - ``miss``: nothing matched; ``suggestions`` are near filenames.
+
+        Match order: an existing absolute path wins outright; otherwise a unique
+        registered filename opens; otherwise, among duplicates, the candidate
+        sharing the most trailing path components with the query opens when it is
+        a clear winner (>= 2 components, e.g. ``system/Mplayer.dll``). A bare
+        filename shared by multiple paths stays ambiguous. When the filename is
+        unknown to the registry and ``allow_search`` is set, a bounded recursive
+        on-disk search runs first.
+        """
+        cand = Path(input_path)
+        if cand.is_absolute():
+            try:
+                if cand.exists() and cand.is_file():
+                    return {"status": "open", "path": str(cand), "how": "exact path"}
+            except OSError:
+                pass
+
+        basename = cand.name or input_path
+        query_parts = _path_components(input_path)
+
+        with self._lock:
+            paths = set(self.alias_registry.get(basename) or ())
+            if not paths:
+                lower = basename.lower()
+                for name, regpaths in self.alias_registry.items():
+                    if name.lower() == lower:
+                        paths |= set(regpaths)
+
+        searched = False
+        if not paths and allow_search:
+            searched = True
+            paths = set(self._search_for_basename(basename, input_path, directory_hint))
+
+        if not paths:
+            return {
+                "status": "miss",
+                "suggestions": self.suggest_aliases(basename),
+                "searched": searched,
+            }
+
+        if directory_hint:
+            try:
+                hint_key = os.path.normcase(str(Path(directory_hint).resolve()))
+            except Exception:
+                hint_key = os.path.normcase(directory_hint)
+            narrowed = {p for p in paths if os.path.normcase(p).startswith(hint_key)}
+            if narrowed:
+                paths = narrowed
+
+        ordered = sorted(paths)
+        if len(ordered) == 1:
+            return {
+                "status": "open",
+                "path": ordered[0],
+                "how": "on-disk search" if searched else "unique filename",
+                "searched": searched,
+            }
+
+        # Duplicate filenames: rank by trailing-path-component overlap so a query
+        # like 'system/Mplayer.dll' beats 'Programs/Mplayer.dll'.
+        scored = sorted(
+            ordered, key=lambda p: _suffix_match_len(query_parts, p), reverse=True
+        )
+        top = _suffix_match_len(query_parts, scored[0])
+        top_paths = [p for p in scored if _suffix_match_len(query_parts, p) == top]
+        if len(top_paths) == 1 and top >= 2:
+            return {
+                "status": "open",
+                "path": top_paths[0],
+                "how": f"matched {top} trailing path components",
+                "searched": searched,
+            }
+        return {
+            "status": "ambiguous",
+            "candidates": scored,
+            "how": "duplicate filename; re-call with more path components to disambiguate",
+            "searched": searched,
+        }
 
     # ------------------------------------------------------------------
     # Worker process lifecycle
@@ -1215,64 +1424,67 @@ def idalib_open(
         }
     notes: list[str] = []
     try:
-        # Resolve bare filenames / non-existent paths via the alias registry
-        # before handing to open_session (which expects a real filesystem path).
-        # When the caller passes an absolute path that does not exist, also try
-        # the basename so list_pe_images-populated aliases match -- agents will
-        # frequently guess a path that resembles a real layout and miss.
-        candidate = Path(input_path)
+        # Resolve the requested path decisively (see resolve_open_target): an
+        # existing path opens as-is; a unique known filename opens; a duplicate
+        # filename is disambiguated by trailing path components (so a partial
+        # path like 'system/Mplayer.dll' is enough); an unknown filename triggers
+        # a bounded on-disk search. The goal is a one-call open so weak clients
+        # don't loop guessing paths.
         original_input = input_path
-        needs_lookup = (not candidate.is_absolute()) or (not candidate.exists())
-        if needs_lookup:
-            lookup_keys: list[str] = [input_path]
-            if candidate.name and candidate.name != input_path:
-                lookup_keys.append(candidate.name)
-            resolved: str | None = None
-            matched_key: str | None = None
-            for key in lookup_keys:
+        outcome = sup.resolve_open_target(input_path, directory_hint=directory)
+        status = outcome["status"]
+
+        if status == "miss":
+            suggestions = outcome.get("suggestions") or []
+            searched = " (after an on-disk search)" if outcome.get("searched") else ""
+            notes.append(
+                f"Could not resolve '{original_input}'{searched}: no matching file "
+                f"on disk or in the alias registry. Run list_pe_images on the "
+                f"containing folder, or call idalib_aliases() to see known names."
+            )
+            if suggestions:
+                notes.append(f"Did you mean: {', '.join(suggestions)}?")
+            err: IdalibOpenResult = {
+                "success": False,
+                **ctx,
+                "error": f"Could not resolve binary: {original_input}",
+                "notes": notes,
+            }
+            if suggestions:
+                err["suggestions"] = suggestions
+            return err
+
+        if status == "ambiguous":
+            cand_paths = outcome.get("candidates") or []
+            candidates: list[IdalibOpenCandidate] = []
+            for p in cand_paths[:8]:
+                info: IdalibOpenCandidate = {"path": p, "filename": Path(p).name}
                 try:
-                    r = sup.resolve_alias(key, directory_hint=directory)
-                except RuntimeError as e:
-                    return {"success": False, **ctx, "error": str(e)}
-                if r is not None:
-                    resolved = r
-                    matched_key = key
-                    break
-            if resolved is not None:
-                input_path = resolved
-                if matched_key == original_input:
-                    notes.append(
-                        f"Resolved '{original_input}' via alias registry to '{resolved}'."
-                    )
-                else:
-                    notes.append(
-                        f"Path '{original_input}' did not exist; resolved via alias "
-                        f"registry by basename '{matched_key}' to '{resolved}'."
-                    )
-            else:
-                # Alias resolution missed. Build a useful breadcrumb so the
-                # caller can self-correct: explain WHY we couldn't resolve,
-                # what they could try next, and any near-matches in the
-                # registry (catches typos and casing/format variants like
-                # SOLE_v_1.05_original.exe vs sole_v1.05.exe).
-                if candidate.is_absolute() and not candidate.exists():
-                    notes.append(
-                        f"Path '{original_input}' did not exist and the alias "
-                        f"registry has no entry for basename '{candidate.name}'. "
-                        f"Run list_pe_images on the parent folder first if you "
-                        f"want bare-filename resolution."
-                    )
-                elif not candidate.is_absolute():
-                    notes.append(
-                        f"'{original_input}' is not an absolute path and was not "
-                        f"found in the alias registry. Call idalib_aliases() to "
-                        f"see what is registered, or list_pe_images on the "
-                        f"directory containing this file."
-                    )
-                suggestion_key = candidate.name or original_input
-                suggestions = sup.suggest_aliases(suggestion_key)
-                if suggestions:
-                    notes.append(f"Did you mean: {', '.join(suggestions)}?")
+                    sha256, md5 = _hash_file_verify(Path(p))
+                    info["sha256"] = sha256
+                    info["md5"] = md5
+                except OSError as he:
+                    info["error"] = f"{type(he).__name__}: {he}"
+                candidates.append(info)
+            notes.append(outcome["how"])
+            return {
+                "success": False,
+                **ctx,
+                "error": (
+                    f"Ambiguous: {len(cand_paths)} files match '{original_input}'. "
+                    f"Re-call idalib_open with more path components to pick one."
+                ),
+                "candidates": candidates,
+                "notes": notes,
+            }
+
+        # status == "open"
+        resolved = outcome["path"]
+        if os.path.normcase(resolved) != os.path.normcase(original_input):
+            notes.append(
+                f"Resolved '{original_input}' -> '{resolved}' ({outcome['how']})."
+            )
+        input_path = resolved
 
         session = sup.open_session(
             input_path,
@@ -1286,6 +1498,13 @@ def idalib_open(
             "session": session.to_dict(),
             "message": f"Binary opened and bound to context: {session.filename} ({session.session_id})",
         }
+        # Always surface SHA-256 + MD5 of the opened binary for verification.
+        try:
+            sha256, md5 = _hash_file_verify(Path(input_path))
+            result["sha256"] = sha256
+            result["md5"] = md5
+        except OSError:
+            pass
         if notes:
             result["notes"] = notes
         return result
@@ -1714,11 +1933,14 @@ def _iter_candidate_files(
     root: Path,
     recursive: bool,
     on_dir_error,
+    on_subdir=None,
 ):
     """Yield regular files under ``root``, skipping IDA artifact files.
 
     Symlinks are not followed. Per-directory traversal errors are passed to
-    ``on_dir_error(path, exc)`` instead of aborting the walk.
+    ``on_dir_error(path, exc)`` instead of aborting the walk. In non-recursive
+    mode, ``on_subdir(path)`` (when given) is called once per immediate
+    subdirectory so callers can report what a shallow scan skipped.
     """
     if recursive:
         def _walk_error(err: OSError) -> None:
@@ -1758,6 +1980,10 @@ def _iter_candidate_files(
                 st = entry.stat(follow_symlinks=False)
             except OSError as e:
                 on_dir_error(entry.path, e)
+                continue
+            if _stat.S_ISDIR(st.st_mode):
+                if on_subdir is not None:
+                    on_subdir(entry.path)
                 continue
             if not _stat.S_ISREG(st.st_mode):
                 continue
@@ -1834,6 +2060,51 @@ def _hash_file(path: Path) -> tuple[str, str]:
             sha1.update(chunk)
             crc = zlib.crc32(chunk, crc)
     return sha1.hexdigest(), "0x%08x" % (crc & 0xFFFFFFFF)
+
+
+def _hash_file_verify(path: Path) -> tuple[str, str]:
+    """Stream ``path`` and return ``(sha256_hex, md5_hex)`` for caller verification."""
+    import hashlib
+
+    sha256 = hashlib.sha256()
+    md5 = hashlib.md5()
+    with open(path, "rb") as f:
+        while True:
+            chunk = f.read(_HASH_CHUNK_SIZE)
+            if not chunk:
+                break
+            sha256.update(chunk)
+            md5.update(chunk)
+    return sha256.hexdigest(), md5.hexdigest()
+
+
+def _path_components(p: str) -> list[str]:
+    """Split a path into lowercased components, tolerant of mixed / and \\.
+
+    A leading drive letter (``c:``) is dropped so ``c:/a/x.exe`` and ``/a/x.exe``
+    compare on their tails.
+    """
+    norm = (p or "").replace("\\", "/")
+    parts = [seg for seg in norm.split("/") if seg not in ("", ".")]
+    if parts and len(parts[0]) == 2 and parts[0][1] == ":":
+        parts = parts[1:]
+    return [seg.lower() for seg in parts]
+
+
+def _suffix_match_len(query_parts: list[str], candidate_path: str) -> int:
+    """Count trailing path components shared by query and candidate.
+
+    e.g. query ``system/Mplayer.dll`` vs candidate
+    ``F:/Reversing/mplayer/files/system/Mplayer.dll`` -> 2 (``system``,
+    ``mplayer.dll``). A bare filename matching the candidate's filename scores 1.
+    """
+    cand_parts = _path_components(candidate_path)
+    n = 0
+    for q, c in zip(reversed(query_parts), reversed(cand_parts)):
+        if q != c:
+            break
+        n += 1
+    return n
 
 
 def _loaded_index(sup: IdalibSupervisor) -> dict[str, str]:
@@ -1975,10 +2246,23 @@ def list_pe_images(
             return
         errors.append({"path": path, "error": f"{type(exc).__name__}: {exc}"})
 
+    # Count immediate subdirectories skipped by a non-recursive scan so we can
+    # tell the caller what they'd reach with recursive=True (the mplayer case:
+    # executables landed one level down in system/ and Programs/).
+    skipped_subdirs = 0
+
+    def _record_subdir(_path: str) -> None:
+        nonlocal skipped_subdirs
+        skipped_subdirs += 1
+
+    on_subdir = None if recursive else _record_subdir
+
     for scan_root, source_root in scan_targets:
         if truncated:
             break
-        for full_path, st in _iter_candidate_files(scan_root, bool(recursive), _record_error):
+        for full_path, st in _iter_candidate_files(
+            scan_root, bool(recursive), _record_error, on_subdir=on_subdir
+        ):
             if len(pending) >= max_files:
                 truncated = True
                 limit_hit = "max_files"
@@ -2061,6 +2345,12 @@ def list_pe_images(
     if fallback:
         result["fallback_to_search_roots"] = True
         result["searched_roots"] = searched_roots
+    if not recursive and skipped_subdirs and not truncated:
+        notes.append(
+            f"{skipped_subdirs} subdirector"
+            f"{'y' if skipped_subdirs == 1 else 'ies'} not scanned; "
+            f"pass recursive=True to descend into them."
+        )
     if notes:
         result["notes"] = notes
     return result
