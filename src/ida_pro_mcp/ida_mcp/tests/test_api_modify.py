@@ -277,6 +277,25 @@ def test_rename_old_new_form_resolves_by_name():
 
 
 @test()
+def test_rename_func_unresolvable_lookup_is_schema_valid():
+    """A func rename whose name lookup can't resolve returns a well-formed error
+    entry (addr may be None) and still validates against the published schema."""
+    try:
+        from jsonschema import Draft202012Validator
+    except Exception:
+        skip_test("jsonschema not installed")
+    from ..rpc import MCP_SERVER
+
+    result = rename({"func": [{"old": "__definitely_not_a_symbol__", "new": "x"}]})
+    assert result["func"][0].get("error"), result
+    schema = MCP_SERVER._generate_tool_schema(
+        "rename", MCP_SERVER.tools.methods["rename"]
+    ).get("outputSchema")
+    assert schema is not None
+    Draft202012Validator(schema).validate(result)
+
+
+@test()
 def test_rename_unrecognized_batch_errors_loudly():
     """A batch with no usable entries returns a clear error, not a silent total:0."""
     # Only control flags, no renames.

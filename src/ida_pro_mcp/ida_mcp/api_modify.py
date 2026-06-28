@@ -50,7 +50,9 @@ class PatchAsmResult(TypedDict):
 
 
 class RenameItemResult(TypedDict, total=False):
-    addr: str
+    # Nullable: on an error entry the address may be unresolvable (e.g. a name
+    # lookup that didn't resolve), so addr can be None. Same reason as old/new.
+    addr: str | None
     func_addr: str
     # Nullable: the previous name is None when the symbol was unnamed before the
     # rename. Declared str (non-null) before, which made the output-schema
@@ -601,7 +603,17 @@ def rename(
                     halted = True
                     break
             except Exception as e:
-                results.append({"addr": item.get("addr"), "error": str(e)})
+                # Report the actual lookup we used (addr/func/old/...), not just
+                # item["addr"], which is None when the caller keyed by name.
+                lookup = (
+                    item.get("addr")
+                    or item.get("func_addr")
+                    or item.get("func")
+                    or item.get("old")
+                    or item.get("from")
+                    or item.get("current")
+                )
+                results.append({"addr": lookup, "error": str(e)})
                 if stop_on_error:
                     halted = True
                     break
