@@ -505,9 +505,13 @@ class IdalibSupervisor:
     ) -> list[Path]:
         """Existing directories to recurse when resolving a missing path.
 
-        Ordered most-specific first: the directory hint, the nearest existing
-        ancestor of the requested path, configured --search-roots, and the
-        parent directories of currently-open sessions. Deduplicated; only
+        Ordered by how targeted (and cheap to scan) each base is likely to be:
+        the directory hint, the operator-curated --search-roots, the parent
+        directories of open sessions, and -- LAST -- the nearest existing
+        ancestor of the requested path. The ancestor goes last on purpose: a
+        guessed path like C:\\Users\\me\\Desktop\\proj\\x.exe can have a huge
+        existing ancestor (the whole Desktop tree), which would otherwise starve
+        the curated roots where the file usually lives. Deduplicated; only
         absolute, existing directories are returned.
         """
         bases: list[Path] = []
@@ -533,13 +537,6 @@ class IdalibSupervisor:
                 return
 
         add(directory_hint)
-        try:
-            for anc in Path(input_path).parents:
-                if anc.exists() and anc.is_dir():
-                    add(str(anc))
-                    break
-        except Exception:
-            pass
         with self._lock:
             roots = list(self.search_roots)
             session_paths = [
@@ -552,6 +549,13 @@ class IdalibSupervisor:
                 add(str(Path(sp).parent))
             except Exception:
                 pass
+        try:
+            for anc in Path(input_path).parents:
+                if anc.exists() and anc.is_dir():
+                    add(str(anc))
+                    break
+        except Exception:
+            pass
         return bases
 
     def _search_for_basename(
@@ -565,32 +569,61 @@ class IdalibSupervisor:
     ) -> list[str]:
         """Bounded recursive on-disk search for files named ``basename``.
 
-        Walks _search_bases() recursively until a match is found or the file/time
-        budget is hit, registering every hit in the alias registry so subsequent
-        opens resolve instantly. Matching is case-insensitive on the filename
-        only (no PE filter) so non-PE targets like 16-bit installers resolve too.
+        Walks _search_bases() recursively, registering every hit in the alias
+        registry so subsequent opens resolve instantly. Matching is
+        case-insensitive on the filename only (no PE filter) so non-PE targets
+        like 16-bit installers resolve too.
+
+        Each base gets its own slice of the file/time budget so a single huge
+        base can't starve the rest, and the search stops at the first base that
+        yields any match -- bases are ordered most-targeted-first, so this finds
+        the file in a curated --search-root without ever walking a giant ancestor
+        tree. Duplicate names within the winning base are all returned, leaving
+        disambiguation to resolve_open_target's suffix scoring.
         """
         target = basename.lower()
         found: list[str] = []
         seen_paths: set[str] = set()
-        scanned = 0
-        deadline = time.monotonic() + time_budget_sec if time_budget_sec > 0 else None
-        for base in self._search_bases(input_path, directory_hint):
-            if deadline is not None and time.monotonic() >= deadline:
+        bases = self._search_bases(input_path, directory_hint)
+        if not bases:
+            return found
+        global_deadline = (
+            time.monotonic() + time_budget_sec if time_budget_sec > 0 else None
+        )
+        # Fair share per base, with sensible floors so a small base still gets a
+        # real chance and a large one can't monopolize the whole budget.
+        per_base_files = max(1000, max_files // len(bases))
+        per_base_time = (
+            max(2.0, time_budget_sec / len(bases)) if time_budget_sec > 0 else 0.0
+        )
+        scanned_total = 0
+        for base in bases:
+            if global_deadline is not None and time.monotonic() >= global_deadline:
                 break
-            if scanned >= max_files:
+            if scanned_total >= max_files:
                 break
+            base_scanned = 0
+            base_deadline = (
+                time.monotonic() + per_base_time if per_base_time > 0 else None
+            )
             for full_path, _st in _iter_candidate_files(base, True, lambda *_: None):
-                scanned += 1
-                if scanned > max_files:
+                scanned_total += 1
+                base_scanned += 1
+                if base_scanned > per_base_files or scanned_total > max_files:
                     break
-                if deadline is not None and time.monotonic() >= deadline:
+                now = time.monotonic()
+                if base_deadline is not None and now >= base_deadline:
+                    break
+                if global_deadline is not None and now >= global_deadline:
                     break
                 if full_path.name.lower() == target:
                     key = os.path.normcase(str(full_path))
                     if key not in seen_paths:
                         seen_paths.add(key)
                         found.append(str(full_path))
+            # First base with a hit wins -- don't walk lower-priority (broader) bases.
+            if found:
+                break
         if found:
             self.record_aliases({Path(p).name: p for p in found})
         return found

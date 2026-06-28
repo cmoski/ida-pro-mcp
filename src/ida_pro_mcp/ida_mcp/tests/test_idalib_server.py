@@ -195,6 +195,50 @@ def test_resolve_open_target_on_disk_search_finds_and_registers():
 
 
 @test()
+def test_search_bases_orders_search_roots_before_ancestor():
+    """A curated --search-root is searched before the query's (possibly huge)
+    existing ancestor, so the ancestor can't starve the budget."""
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp) / "searchroot"
+        root.mkdir()
+        anc = Path(tmp) / "ancestor"
+        anc.mkdir()
+        sup = _make_supervisor()
+        sup.search_roots = [str(root)]
+        # Query lives under `anc` (which exists) but the file is missing there.
+        query = str(anc / "missing" / "x.bin")
+        bases = [os.path.normcase(str(b)) for b in sup._search_bases(query, None)]
+        assert os.path.normcase(str(root)) in bases
+        assert os.path.normcase(str(anc)) in bases
+        assert bases.index(os.path.normcase(str(root))) < bases.index(
+            os.path.normcase(str(anc))
+        )
+
+
+@test()
+def test_on_disk_search_prefers_search_root_over_ancestor():
+    """A wrong-prefix path resolves to the curated search-root copy even when the
+    query's existing ancestor is a different, noisier tree."""
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp) / "curated"
+        (root / "mplayer" / "Programs").mkdir(parents=True)
+        target = root / "mplayer" / "Programs" / "MpLaunch.exe"
+        target.write_bytes(b"MZ")
+        anc = Path(tmp) / "big"
+        (anc / "noise").mkdir(parents=True)
+        for i in range(20):
+            (anc / "noise" / f"f{i}.bin").write_bytes(b"x")
+
+        sup = _make_supervisor()
+        sup.search_roots = [str(root)]
+        # Wrong prefix (missing the 'curated' segment) under the existing ancestor.
+        query = str(anc / "mplayer" / "Programs" / "MpLaunch.exe")
+        out = sup.resolve_open_target(query, allow_search=True)
+        assert out["status"] == "open"
+        assert os.path.normcase(out["path"]) == os.path.normcase(str(target))
+
+
+@test()
 def test_iter_candidate_files_reports_skipped_subdirs():
     """Non-recursive iteration yields top-level files and reports subdirs."""
     with tempfile.TemporaryDirectory() as root:
