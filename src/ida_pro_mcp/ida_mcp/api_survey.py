@@ -11,7 +11,7 @@ from .rpc import tool
 from .sync import idasync, tool_timeout
 from . import compat
 from .api_core import _get_strings_cache
-from .utils import get_image_size
+from .utils import get_image_size, segment_bitness
 
 
 class SurveyMetadata(TypedDict):
@@ -176,6 +176,7 @@ def _build_segments() -> list[dict]:
             "end": hex(seg.end_ea),
             "size": hex(seg.size()),
             "permissions": "".join(perms) or "---",
+            "bitness": segment_bitness(seg),
         })
     return segments
 

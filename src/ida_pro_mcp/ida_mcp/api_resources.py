@@ -22,6 +22,7 @@ from .utils import (
     StructureMember,
     get_image_size,
     parse_address,
+    segment_bitness,
 )
 from . import compat
 
@@ -90,6 +91,7 @@ def idb_segments_resource() -> list[Segment]:
                     end=hex(seg.end_ea),
                     size=hex(seg.size()),
                     permissions="".join(perms) if perms else "---",
+                    bitness=segment_bitness(seg),
                 )
             )
     return segments

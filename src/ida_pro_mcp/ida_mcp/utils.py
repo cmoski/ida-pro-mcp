@@ -462,12 +462,24 @@ class String(TypedDict):
     string: str
 
 
+# ida_segment addressing codes; segment_t.bitness uses the same encoding.
+BITNESS_CODE = {16: 0, 32: 1, 64: 2}
+CODE_BITNESS = {code: bits for bits, code in BITNESS_CODE.items()}
+
+
+def segment_bitness(seg) -> int:
+    """Addressing width of a segment in bits (16/32/64)."""
+    return CODE_BITNESS.get(seg.bitness, seg.bitness)
+
+
 class Segment(TypedDict):
     name: str
     start: str
     end: str
     size: str
     permissions: str
+    # Addressing width (16/32/64). Load-time property, changeable via set_bitness.
+    bitness: int
 
 
 class Ref(TypedDict):

@@ -17,6 +17,7 @@ Important API modules:
 - `api_memory.py`: bytes/ints/strings, patching
 - `api_types.py`: structs, type inference, type application
 - `api_modify.py`: comments, renaming, asm patching
+- `api_load.py`: segment bitness/processor fixups, raw blob mapping, segment creation, rebasing
 - `api_stack.py`: stack frame operations
 - `api_sigmaker.py`: signature creation, scanning, xref signatures (uses sigmaker.py)
 - `api_debug.py`: debugger control, unsafe / low priority for tests
@@ -138,6 +139,7 @@ High priority:
 - `api_analysis.py`
 - `api_types.py`
 - `api_modify.py`
+- `api_load.py`
 - `api_stack.py`
 - `api_memory.py`
 - `api_core.py`

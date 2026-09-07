@@ -21,6 +21,7 @@ from ida_pro_mcp.ida_mcp.api_core import (
 from ida_pro_mcp.ida_mcp.profile import apply_profile, load_profile
 from ida_pro_mcp.ida_mcp.rpc import get_current_transport_session_id, set_download_base_url, tool
 from ida_pro_mcp.ida_mcp.http import IdaMcpHttpRequestHandler
+from ida_pro_mcp.ida_mcp.api_load import set_bitness
 from ida_pro_mcp.idalib_session_manager import get_session_manager
 
 class IdalibContextFields(TypedDict):
@@ -51,6 +52,9 @@ class IdalibOpenResult(IdalibContextFields, total=False):
     session: IdalibSessionInfo
     message: str
     error: str
+    # Present when bitness/processor were requested: the set_bitness report for
+    # the fixup applied right after the load.
+    load_fixup: dict[str, Any]
 
 
 class IdalibCloseResult(TypedDict, total=False):
@@ -209,8 +213,23 @@ def idalib_open(
     session_id: Annotated[
         Optional[str], "Custom session ID (auto-generated if not provided)"
     ] = None,
+    bitness: Annotated[
+        Optional[int],
+        "Force the addressing width after loading: 16, 32 or 64. Use for raw "
+        "blobs the binary loader mis-detects (it defaults to the host width).",
+    ] = None,
+    processor: Annotated[
+        Optional[str],
+        "Force the processor module after loading (metapc, arm, mips, ...).",
+    ] = None,
 ) -> IdalibOpenResult:
-    """Open a binary and bind it to the active idalib context policy."""
+    """Open a binary and bind it to the active idalib context policy.
+
+    ``bitness``/``processor`` are applied as a post-load fixup (see
+    ida_mcp.api_load): idalib cannot pass load options to IDA, so the database
+    is opened first and then corrected, undefining and re-analyzing the
+    affected segments.
+    """
 
     try:
         manager = get_session_manager()
@@ -219,7 +238,7 @@ def idalib_open(
             Path(input_path), run_auto_analysis=run_auto_analysis, session_id=session_id
         )
         session = manager.bind_context(context_id, opened_session_id, activate=True)
-        return {
+        result: IdalibOpenResult = {
             "success": True,
             **_context_response_fields(context_id),
             "session": session.to_dict(),
@@ -228,6 +247,9 @@ def idalib_open(
                 f"({opened_session_id})"
             ),
         }
+        if bitness is not None or processor:
+            result["load_fixup"] = set_bitness(bitness, processor=processor)
+        return result
     except (FileNotFoundError, RuntimeError, ValueError) as e:
         return {"error": str(e)}
     except Exception as e:

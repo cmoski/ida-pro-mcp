@@ -242,7 +242,7 @@ With `--isolated-contexts`, strict Streamable HTTP session semantics are enabled
 
 ### Context tools
 
-- `idalib_open(input_path, ...)`: Open binary in a worker and bind it to the active context policy.
+- `idalib_open(input_path, ..., bitness, processor)`: Open binary in a worker and bind it to the active context policy. `bitness` (16/32/64) and `processor` are applied as a post-load fixup and reported back as `load_fixup`; pair them with `run_auto_analysis=False` to avoid analyzing a large image at the wrong width first.
 - `idalib_switch(session_id)`: Rebind the active context policy to an existing session.
 - `idalib_current()`: Return the session bound to the active context policy.
 - `idalib_unbind()`: Remove the active context binding.
@@ -299,9 +299,26 @@ Worker controls:
 - `define_code(items)`: Convert bytes to code instruction(s) at address(es).
 - `undefine(items)`: Undefine item(s) at address(es), converting back to raw bytes. Optionally specify `end` or `size`.
 
+## Load & Segment Operations
+
+IDA fixes addressing width and processor module at load time, and idalib cannot
+pass load options to it (`open_database(args=...)` aborts with IDA internal
+error 30602), so these repair the database after it is open. They work on
+databases opened earlier too.
+
+- `set_bitness(bitness, segments, processor, undefine, reanalyze)`: Change segment addressing width to 16/32/64-bit, optionally switching processor module. Defaults to every segment plus the database-wide bitness, undefining and re-analyzing what it changed. Raw and extender images load at the host width, so a 32-bit image decodes as 64-bit code until this is called.
+- `load_raw_file(path, base, bitness, file_offset, size, segment_name, as_code, reanalyze)`: Map a headerless blob (extracted overlay, dumped image, extender payload) into the open database at a chosen address. Overlapping an existing segment is refused.
+- `create_segment(start, end|size, name, sclass, bitness, permissions)`: Create an empty segment -- a BSS range the input file doesn't contain, for instance -- instead of zero-padding the input to fake it.
+- `rebase(new_base|delta)`: Move the whole program to a different load address, letting the loader fix up stored addresses.
+
+After a width change the affected segments are left undefined, and a raw image
+has no entry points for auto-analysis to follow: seed it with `define_code` or
+`define_func` at a known anchor. Segment views (`ida://idb/segments`,
+`survey_binary`) report `bitness` so the current width is visible.
+
 ## Memory Reading Operations
 
-- `get_bytes(addrs)`: Read raw bytes at address(es).
+- `get_bytes(regions)`: Read raw bytes at address(es) as hex -- `{addr, size}` or a list of them. Nothing has to be defined first, so it is the first thing to reach for when disassembly looks wrong.
 - `get_int(queries)`: Read integer values using ty (i8/u64/i16le/i16be/etc).
 - `get_string(addrs)`: Read null-terminated string(s).
 - `get_global_value(queries)`: Read global variable value(s) by address or name (auto-detects, compile-time values).

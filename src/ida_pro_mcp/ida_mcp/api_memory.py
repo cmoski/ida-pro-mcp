@@ -70,7 +70,12 @@ class IntWriteResult(TypedDict):
 @tool
 @idasync
 def get_bytes(regions: list[MemoryRead] | MemoryRead) -> list[BytesReadResult]:
-    """Read bytes from memory addresses"""
+    """Read raw bytes at address(es) as hex, without defining anything.
+
+    Takes {"addr": "0x401000", "size": 16} or a list of them. Nothing needs to
+    be defined as code or data first, so this is also how you tell whether a
+    mis-detected width or load base is to blame when disassembly looks wrong.
+    """
     if isinstance(regions, dict):
         regions = [regions]
 

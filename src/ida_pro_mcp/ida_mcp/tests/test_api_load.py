@@ -1,0 +1,270 @@
+"""Tests for api_load: segment bitness, raw blob mapping, segment creation.
+
+These run against a shared database, so every test that mutates layout works on
+a scratch segment it creates high above the image and removes again -- the
+fixture's own segments are only ever read, or re-set to the width they already
+have.
+"""
+
+import os
+import tempfile
+
+import idaapi
+import ida_segment
+
+from ..framework import (
+    test,
+    assert_has_keys,
+    assert_is_list,
+    assert_valid_address,
+    get_first_segment,
+)
+from ..api_load import (
+    create_segment,
+    load_raw_file,
+    rebase,
+    set_bitness,
+    _parse_bitness,
+)
+from ..api_memory import get_bytes
+from ..sync import IDAError
+from ..utils import segment_bitness
+
+# Far above any fixture image, so scratch segments never collide with real ones.
+SCRATCH_BASE = 0x7A000000
+SCRATCH_BLOB = bytes((0x53, 0x66, 0x8B, 0x58, 0x2A)) + bytes(0x1B)
+
+
+def _drop_segment(start_ea: int) -> None:
+    seg = idaapi.getseg(start_ea)
+    if seg is not None:
+        ida_segment.del_segm(start_ea, ida_segment.SEGMOD_KILL)
+
+
+@test()
+def test_parse_bitness_accepts_loose_forms():
+    """Bitness parsing takes ints and loose strings, and rejects everything else."""
+    assert _parse_bitness(32) == 32
+    assert _parse_bitness("32") == 32
+    assert _parse_bitness("32-bit") == 32
+    assert _parse_bitness(16) == 16
+    assert _parse_bitness(64) == 64
+    for bad in ("", "abc", 8, 128, True):
+        try:
+            _parse_bitness(bad)
+            assert False, f"expected _parse_bitness({bad!r}) to fail"
+        except IDAError as e:
+            assert "bitness" in str(e).lower()
+
+
+@test()
+def test_set_bitness_requires_something_to_do():
+    """set_bitness with neither bitness nor processor is an error, not a no-op."""
+    try:
+        set_bitness()
+        assert False, "expected set_bitness() to fail"
+    except IDAError as e:
+        assert "bitness" in str(e).lower()
+
+
+@test()
+def test_set_bitness_to_current_width_is_a_no_op():
+    """Re-setting a segment to the width it already has changes and destroys nothing."""
+    seg_start, _ = get_first_segment()
+    seg = idaapi.getseg(int(seg_start, 16))
+    current = segment_bitness(seg)
+
+    result = set_bitness(current, segments=seg_start)
+    assert_has_keys(result, "bitness", "segments", "reanalyzed")
+    assert result["bitness"] == current
+    assert_is_list(result["segments"], min_length=1)
+    entry = result["segments"][0]
+    assert entry["changed"] is False
+    assert entry["bitness"] == current
+    assert entry["previous_bitness"] == current
+    # Nothing changed, so nothing may have been undefined or re-analyzed.
+    assert result["undefined_bytes"] == 0
+    assert result["reanalyzed"] is False
+    assert any("already" in note for note in result.get("notes", []))
+    # The segment really is untouched.
+    assert segment_bitness(idaapi.getseg(int(seg_start, 16))) == current
+
+
+@test()
+def test_set_bitness_reports_unresolved_segments():
+    """An unknown segment token is reported per-entry, not raised."""
+    result = set_bitness(32, segments="no_such_segment_xyz")
+    entries = result["segments"]
+    assert_is_list(entries, min_length=1)
+    assert entries[0]["name"] == "no_such_segment_xyz"
+    assert "No segment matches" in entries[0]["error"]
+    assert result["reanalyzed"] is False
+
+
+@test()
+def test_create_segment_round_trip():
+    """create_segment makes a BSS range with the requested width and permissions."""
+    _drop_segment(SCRATCH_BASE)
+    try:
+        result = create_segment(
+            start=hex(SCRATCH_BASE),
+            size=0x1000,
+            name="mcp_scratch_bss",
+            sclass="BSS",
+            bitness=32,
+            permissions="rw",
+        )
+        assert_valid_address(result["start"])
+        assert result["size"] == 0x1000
+        assert result["end"] == hex(SCRATCH_BASE + 0x1000)
+
+        seg = idaapi.getseg(SCRATCH_BASE)
+        assert seg is not None, "segment was not created"
+        assert ida_segment.get_segm_name(seg) == "mcp_scratch_bss"
+        assert segment_bitness(seg) == 32
+        assert seg.perm & idaapi.SEGPERM_READ
+        assert seg.perm & idaapi.SEGPERM_WRITE
+        assert not seg.perm & idaapi.SEGPERM_EXEC
+
+        # A second segment over the same range is refused rather than silently
+        # truncating the first (add_segm would happily do that).
+        try:
+            create_segment(start=hex(SCRATCH_BASE + 0x800), size=0x100)
+            assert False, "expected overlapping create_segment to fail"
+        except IDAError as e:
+            assert "overlap" in str(e).lower()
+    finally:
+        _drop_segment(SCRATCH_BASE)
+    assert idaapi.getseg(SCRATCH_BASE) is None
+
+
+@test()
+def test_set_bitness_flips_a_scratch_segment():
+    """Bitness really changes, both directions, on a segment we own."""
+    _drop_segment(SCRATCH_BASE)
+    try:
+        create_segment(
+            start=hex(SCRATCH_BASE), size=0x1000, name="mcp_scratch_bits", bitness=32
+        )
+        assert segment_bitness(idaapi.getseg(SCRATCH_BASE)) == 32
+
+        up = set_bitness(
+            64, segments="mcp_scratch_bits", undefine=False, reanalyze=False
+        )
+        entry = up["segments"][0]
+        assert entry["previous_bitness"] == 32
+        assert entry["bitness"] == 64
+        assert entry["changed"] is True
+        assert segment_bitness(idaapi.getseg(SCRATCH_BASE)) == 64
+
+        down = set_bitness(
+            16, segments=hex(SCRATCH_BASE), undefine=False, reanalyze=False
+        )
+        assert down["segments"][0]["bitness"] == 16
+        assert segment_bitness(idaapi.getseg(SCRATCH_BASE)) == 16
+        # A scoped call must not touch the database-wide bitness.
+        assert "app_bitness" not in down
+    finally:
+        _drop_segment(SCRATCH_BASE)
+
+
+@test()
+def test_load_raw_file_maps_bytes_at_base():
+    """A headerless blob maps at the requested base and reads back byte for byte."""
+    _drop_segment(SCRATCH_BASE)
+    fd, blob_path = tempfile.mkstemp(suffix=".bin")
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(SCRATCH_BLOB)
+
+        result = load_raw_file(
+            path=blob_path,
+            base=hex(SCRATCH_BASE),
+            bitness=32,
+            segment_name="mcp_scratch_raw",
+            reanalyze=False,
+        )
+        assert result["size"] == len(SCRATCH_BLOB)
+        assert result["base"] == hex(SCRATCH_BASE)
+        assert_is_list(result["segments"], min_length=1)
+        assert result["segments"][0]["name"] == "mcp_scratch_raw"
+        assert result["segments"][0]["bitness"] == 32
+
+        read = get_bytes({"addr": hex(SCRATCH_BASE), "size": 5})
+        assert read[0]["data"] == "0x53 0x66 0x8b 0x58 0x2a"
+
+        # Mapping over an existing segment is refused.
+        try:
+            load_raw_file(path=blob_path, base=hex(SCRATCH_BASE), reanalyze=False)
+            assert False, "expected overlapping load_raw_file to fail"
+        except IDAError as e:
+            assert "overlap" in str(e).lower()
+
+        # A file_offset past the end of the file is refused too.
+        try:
+            load_raw_file(
+                path=blob_path,
+                base=hex(SCRATCH_BASE + 0x10000),
+                file_offset=len(SCRATCH_BLOB) + 1,
+                reanalyze=False,
+            )
+            assert False, "expected out-of-range file_offset to fail"
+        except IDAError as e:
+            assert "file_offset" in str(e)
+    finally:
+        _drop_segment(SCRATCH_BASE)
+        os.unlink(blob_path)
+
+
+@test()
+def test_load_raw_file_rejects_missing_path():
+    """A path that isn't there fails before IDA is asked to do anything."""
+    try:
+        load_raw_file(path="no_such_blob_xyz.bin", base=hex(SCRATCH_BASE))
+        assert False, "expected load_raw_file to fail on a missing file"
+    except IDAError as e:
+        assert "not found" in str(e).lower()
+
+
+@test()
+def test_rebase_round_trip():
+    """rebase moves every segment by the delta and back again, bytes following."""
+    original = ida_segment.getnseg(0).start_ea
+    probe_offset = 0x40
+    before = get_bytes({"addr": hex(original + probe_offset), "size": 8})[0]["data"]
+
+    moved = rebase(delta=0x100000)
+    try:
+        assert moved["delta"] == 0x100000
+        assert moved["image_base"] == hex(original + 0x100000)
+        assert ida_segment.getnseg(0).start_ea == original + 0x100000
+        after = get_bytes(
+            {"addr": hex(original + 0x100000 + probe_offset), "size": 8}
+        )[0]["data"]
+        assert after == before, "bytes did not move with the segment"
+    finally:
+        back = rebase(new_base=hex(original))
+        assert back["image_base"] == hex(original)
+        assert ida_segment.getnseg(0).start_ea == original
+
+    noop = rebase(new_base=hex(original))
+    assert noop["delta"] == 0
+    assert any("Already at that base" in note for note in noop.get("notes", []))
+
+    try:
+        rebase()
+        assert False, "expected rebase() with no target to fail"
+    except IDAError as e:
+        assert "new_base" in str(e)
+
+
+@test()
+def test_segment_views_report_bitness():
+    """The segment resource and survey both expose the width set_bitness changes."""
+    from ..api_resources import idb_segments_resource
+    from ..api_survey import _build_segments
+
+    for entry in idb_segments_resource():
+        assert entry["bitness"] in (16, 32, 64)
+    for entry in _build_segments():
+        assert entry["bitness"] in (16, 32, 64)

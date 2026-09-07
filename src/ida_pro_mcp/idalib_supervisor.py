@@ -142,6 +142,8 @@ class IdalibOpenResult(IdalibContextFields, total=False):
     message: str
     error: str
     notes: list[str]
+    # set_bitness report, present when bitness/processor were requested.
+    load_fixup: dict[str, Any]
     # SHA-256 + MD5 of the binary that was opened, for caller-side verification.
     sha256: str
     md5: str
@@ -222,6 +224,9 @@ class PeImageInfo(TypedDict):
     filename: str
     size: int
     mtime: str
+    # Detected container format: PE, NE, LE, LX, MZ, ELF, MACHO or RAW. Only PE
+    # entries are listed unless the scan passes include_non_pe=True.
+    format: str
     sha1: str  # empty string when hash=False
     crc32: str  # empty string when hash=False
     machine: str
@@ -1430,6 +1435,16 @@ def idalib_open(
         "Optional directory hint that narrows alias resolution when the same "
         "filename has been seen in multiple folders.",
     ] = None,
+    bitness: Annotated[
+        Optional[int],
+        "Force the addressing width after loading: 16, 32 or 64. Needed for raw "
+        "and extender images, where the binary loader defaults to the host "
+        "width, so a 32-bit image decodes as 64-bit code.",
+    ] = None,
+    processor: Annotated[
+        Optional[str],
+        "Force the processor module after loading (metapc, arm, mips, ...).",
+    ] = None,
 ) -> IdalibOpenResult:
     """Open a binary in its own idalib worker process and bind it to this context.
 
@@ -1439,6 +1454,14 @@ def idalib_open(
     upstream safety layer strips absolute paths to still address discovered
     binaries by name. Use ``directory`` to disambiguate if the same filename has
     been seen in multiple folders.
+
+    ``bitness``/``processor`` are applied as a post-load fixup, because idalib
+    cannot pass load options to IDA: the database is opened, then the affected
+    segments are re-addressed, undefined and re-analyzed (the same work the
+    ``set_bitness`` tool does, which also repairs databases opened earlier).
+    They are honoured for an already-open session too. Pair them with
+    ``run_auto_analysis=False`` to avoid analyzing a large image at the wrong
+    width first.
     """
     sup = _require_supervisor()
     # Compute context fields up front so every return path (including errors)
@@ -1538,6 +1561,21 @@ def idalib_open(
             result["md5"] = md5
         except OSError:
             pass
+        if bitness is not None or processor:
+            fixup_args: dict[str, Any] = {}
+            if bitness is not None:
+                fixup_args["bitness"] = bitness
+            if processor:
+                fixup_args["processor"] = processor
+            try:
+                result["load_fixup"] = sup.call_worker_tool(
+                    session, "set_bitness", fixup_args
+                )
+            except Exception as e:
+                notes.append(
+                    f"Binary opened, but the load fixup failed: {e}. Call "
+                    f"set_bitness on this database to retry."
+                )
         if notes:
             result["notes"] = notes
         return result
@@ -2078,6 +2116,118 @@ def _parse_pe_header(fh, file_size: int) -> dict | None:
     }
 
 
+_ELF_MAGIC = bytes((0x7F, 0x45, 0x4C, 0x46))
+_MACHO_MAGICS_32 = (bytes((0xFE, 0xED, 0xFA, 0xCE)), bytes((0xCE, 0xFA, 0xED, 0xFE)))
+_MACHO_MAGICS_64 = (bytes((0xFE, 0xED, 0xFA, 0xCF)), bytes((0xCF, 0xFA, 0xED, 0xFE)))
+_ET_DYN = bytes((0x03, 0x00))
+
+_ELF_MACHINE_TABLE = {
+    0x03: ("x86", 32),
+    0x3E: ("x86_64", 64),
+    0x28: ("arm", 32),
+    0xB7: ("arm64", 64),
+    0x08: ("mips", 32),
+    0x14: ("ppc", 32),
+    0x15: ("ppc64", 64),
+    0xF3: ("riscv", None),
+}
+
+# MZ stub sub-formats keyed by the signature at e_lfanew. LE/LX are the DOS
+# extender / OS2 formats Watcom-era 386 tooling ships (DOS/4GW and friends) --
+# exactly the class of image a PE-only filter hides.
+_MZ_SUBFORMATS = {
+    b"NE": ("NE", "i386-16", 16),
+    b"LE": ("LE", "i386", 32),
+    b"LX": ("LX", "i386", 32),
+}
+
+
+def _sniff_binary_header(fh, file_size: int) -> dict:
+    """Classify any file the way ``_parse_pe_header`` classifies PE files.
+
+    Always returns a dict (``format`` "RAW" when nothing is recognized), so
+    non-PE images -- LE/LX extender images, ELF, headerless blobs -- can be
+    listed with the same entry shape as PE images.
+    """
+    import struct
+
+    unknown = {
+        "format": "RAW",
+        "machine": "",
+        "arch": "unknown",
+        "bitness": None,
+        "characteristics": "",
+        "is_executable_image": False,
+        "is_dll": False,
+        "is_system": False,
+    }
+
+    pe = _parse_pe_header(fh, file_size)
+    if pe is not None:
+        return {**pe, "format": "PE"}
+
+    fh.seek(0)
+    head = fh.read(0x40)
+    if len(head) < 4:
+        return unknown
+
+    if head[:4] == _ELF_MAGIC:
+        bitness = {1: 32, 2: 64}.get(head[4])
+        machine = None
+        if len(head) >= 0x14:
+            (machine,) = struct.unpack_from("<H", head, 0x12)
+        arch, arch_bits = _ELF_MACHINE_TABLE.get(machine, ("unknown", None))
+        return {
+            **unknown,
+            "format": "ELF",
+            "machine": "0x%04x" % machine if machine is not None else "",
+            "arch": arch,
+            "bitness": bitness or arch_bits,
+            "is_executable_image": True,
+            "is_dll": head[0x10:0x12] == _ET_DYN,
+        }
+
+    if head[:4] in _MACHO_MAGICS_32:
+        return {**unknown, "format": "MACHO", "bitness": 32, "is_executable_image": True}
+    if head[:4] in _MACHO_MAGICS_64:
+        return {**unknown, "format": "MACHO", "bitness": 64, "is_executable_image": True}
+
+    # A bare LE/LX image: an extender payload already carved out of its MZ stub.
+    if head[:2] in _MZ_SUBFORMATS:
+        fmt, arch, bitness = _MZ_SUBFORMATS[head[:2]]
+        return {
+            **unknown,
+            "format": fmt,
+            "arch": arch,
+            "bitness": bitness,
+            "is_executable_image": True,
+        }
+
+    if head[:2] in (b"MZ", b"ZM") and len(head) >= 0x40:
+        (e_lfanew,) = struct.unpack_from("<I", head, 0x3C)
+        if e_lfanew >= 0x40 and e_lfanew + 2 <= file_size:
+            fh.seek(e_lfanew)
+            sig = fh.read(2)
+            if sig in _MZ_SUBFORMATS:
+                fmt, arch, bitness = _MZ_SUBFORMATS[sig]
+                return {
+                    **unknown,
+                    "format": fmt,
+                    "arch": arch,
+                    "bitness": bitness,
+                    "is_executable_image": True,
+                }
+        return {
+            **unknown,
+            "format": "MZ",
+            "arch": "i386-16",
+            "bitness": 16,
+            "is_executable_image": True,
+        }
+
+    return unknown
+
+
 def _hash_file(path: Path) -> tuple[str, str]:
     """Stream ``path`` and return ``(sha1_hex, "0x%08x" % crc32)``."""
     import hashlib
@@ -2172,10 +2322,18 @@ def list_pe_images(
     hash: Annotated[
         bool, "Compute SHA1/CRC32 per file. Disable for a fast discovery pass."
     ] = True,
+    include_non_pe: Annotated[
+        bool,
+        "Also list non-PE files (LE/LX extender images, NE, plain MZ, ELF, "
+        "Mach-O and headerless blobs). Each entry's `format` says which.",
+    ] = False,
 ) -> ListPeImagesResult:
     """List PE images (EXE, DLL, SYS, OCX, ...) under a directory.
 
-    Filters to files with a valid MZ + PE\\0\\0 header. Each entry includes size, UTC
+    Filters to files with a valid MZ + PE\\0\\0 header, so LE/LX extender images,
+    16-bit NE binaries and headerless/raw blobs are invisible by default -- pass
+    ``include_non_pe=True`` to list every file with its detected ``format`` (PE, NE,
+    LE, LX, MZ, ELF, MACHO, RAW) instead. Each entry includes size, UTC
     mtime, machine/arch/bitness, and Characteristics flags (is_executable_image, is_dll,
     is_system). When ``hash=True`` (default) each entry also includes SHA1 and CRC32 over
     the full file contents; when ``hash=False`` sha1 and crc32 are returned as empty
@@ -2307,7 +2465,12 @@ def list_pe_images(
 
             try:
                 with open(full_path, "rb") as fh:
-                    header = _parse_pe_header(fh, st.st_size)
+                    if include_non_pe:
+                        header = _sniff_binary_header(fh, st.st_size)
+                    else:
+                        header = _parse_pe_header(fh, st.st_size)
+                        if header is not None:
+                            header = {**header, "format": "PE"}
             except OSError as e:
                 _record_error(str(full_path), e)
                 continue
@@ -2345,6 +2508,7 @@ def list_pe_images(
                 "filename": full_path.name,
                 "size": int(st.st_size),
                 "mtime": mtime,
+                "format": header["format"],
                 "sha1": sha1,
                 "crc32": crc32,
                 "machine": header["machine"],
