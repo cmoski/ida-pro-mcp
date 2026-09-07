@@ -2504,3 +2504,150 @@ def test_restart_worker_does_not_call_graceful_close(tmp_path):
     _bind_session(sup, "s1")
     sup.restart_worker("s1")
     assert sup.tool_calls == []
+# ---------------------------------------------------------------------------
+# error payloads must satisfy the published output schema
+# ---------------------------------------------------------------------------
+
+
+def test_context_field_result_types_have_no_required_keys():
+    """Context fields must be optional in every result type that carries them.
+
+    This module uses `from __future__ import annotations`, under which
+    TypedDict cannot see NotRequired[...] and counts those keys as *required*.
+    That made every error return which omits them fail output-schema
+    validation, so callers got a schema dump instead of the error message.
+    """
+    import typing
+
+    context_keys = set(supmod.IdalibContextFields.__annotations__)
+    checked = 0
+    for name, obj in vars(supmod).items():
+        if not (isinstance(obj, type) and typing.is_typeddict(obj)):
+            continue
+        if not context_keys.issubset(set(obj.__annotations__)):
+            continue
+        checked += 1
+        assert obj.__required_keys__ == frozenset(), (
+            f"{name} requires {sorted(obj.__required_keys__)}; error returns "
+            f"that omit context fields would fail schema validation"
+        )
+    assert checked >= 5, f"expected several context-carrying result types, saw {checked}"
+
+
+def test_idalib_save_unknown_session_returns_clean_error():
+    """A stale session_id yields a normal error payload, context fields included."""
+    old_supervisor = supmod.supervisor
+    sup = _FakeSupervisor()
+    supmod.supervisor = sup
+    sup.mcp = _TransportMcp(session_id="ctx-A")
+    try:
+        result = supmod.idalib_save(session_id="deadbeef")
+        assert result["ok"] is False
+        assert "deadbeef" in result["error"]
+        assert result["context_id"]
+        assert "transport_context_id" in result
+        assert "isolated_contexts" in result
+    finally:
+        supmod.supervisor = old_supervisor
+
+
+def test_context_tool_error_paths_carry_context_fields():
+    """idalib_list/current/unbind error and empty paths keep the context shape."""
+    old_supervisor = supmod.supervisor
+    sup = _FakeSupervisor()
+    supmod.supervisor = sup
+    sup.mcp = _TransportMcp(session_id="ctx-A")
+    try:
+        context_id = sup.resolve_context_id()
+
+        current = supmod.idalib_current()
+        assert "error" in current
+        assert current["context_id"] == context_id
+
+        unbound = supmod.idalib_unbind()
+        assert unbound["success"] is False
+        assert unbound["context_id"] == context_id
+
+        listed = supmod.idalib_list()
+        assert listed["count"] == 0
+        assert listed["context_id"] == context_id
+    finally:
+        supmod.supervisor = old_supervisor
+
+
+# ---------------------------------------------------------------------------
+# non-PE discovery
+# ---------------------------------------------------------------------------
+
+
+def _make_lx_blob(sig: bytes = b"LX") -> bytes:
+    """MZ stub whose e_lfanew points at an LE/LX signature (DOS extender image)."""
+    import struct
+
+    dos = bytearray(0x40)
+    dos[:2] = b"MZ"
+    struct.pack_into("<I", dos, 0x3C, 0x40)
+    return bytes(dos) + sig + b"\x00" * 32
+
+
+def test_list_pe_images_include_non_pe_surfaces_lx_and_raw(tmp_path):
+    """include_non_pe=True lists the image classes the PE filter hides."""
+    old_supervisor = supmod.supervisor
+    supmod.supervisor = _FakeSupervisor()
+    try:
+        (tmp_path / "hello.exe").write_bytes(_make_pe_blob(machine=0x14C, opt_magic=0x10B))
+        (tmp_path / "wpp386.exe").write_bytes(_make_lx_blob(b"LX"))
+        (tmp_path / "dos4gw.exe").write_bytes(_make_lx_blob(b"LE"))
+        (tmp_path / "payload.bin").write_bytes(bytes((0xEB, 0xFE)) + bytes(64))
+
+        # Default: PE only, and every entry says so.
+        default = supmod.list_pe_images(str(tmp_path))
+        assert [img["filename"] for img in default["images"]] == ["hello.exe"]
+        assert default["images"][0]["format"] == "PE"
+
+        wide = supmod.list_pe_images(str(tmp_path), include_non_pe=True)
+        by_name = {img["filename"]: img for img in wide["images"]}
+        assert set(by_name) == {"hello.exe", "wpp386.exe", "dos4gw.exe", "payload.bin"}
+        assert by_name["hello.exe"]["format"] == "PE"
+        assert by_name["wpp386.exe"]["format"] == "LX"
+        assert by_name["wpp386.exe"]["bitness"] == 32
+        assert by_name["dos4gw.exe"]["format"] == "LE"
+        assert by_name["payload.bin"]["format"] == "RAW"
+        assert by_name["payload.bin"]["bitness"] is None
+        # Non-PE entries are addressable by idalib_open afterwards.
+        assert "payload.bin" in supmod.supervisor.alias_registry
+    finally:
+        supmod.supervisor = old_supervisor
+
+
+def test_sniff_binary_header_classifies_formats(tmp_path):
+    """The sniffer recognizes ELF and bare LX images, not just MZ-wrapped ones."""
+    import io
+    import struct
+
+    elf = bytearray(0x40)
+    elf[:4] = bytes((0x7F, 0x45, 0x4C, 0x46))
+    elf[4] = 2  # ELFCLASS64
+    struct.pack_into("<H", elf, 0x10, 3)  # ET_DYN
+    struct.pack_into("<H", elf, 0x12, 0x3E)  # EM_X86_64
+    header = supmod._sniff_binary_header(io.BytesIO(bytes(elf)), len(elf))
+    assert header["format"] == "ELF"
+    assert header["bitness"] == 64
+    assert header["arch"] == "x86_64"
+    assert header["is_dll"] is True
+
+    bare_lx = b"LX" + bytes(0x40)
+    header = supmod._sniff_binary_header(io.BytesIO(bare_lx), len(bare_lx))
+    assert header["format"] == "LX"
+    assert header["bitness"] == 32
+
+    dos = bytearray(0x40)
+    dos[:2] = b"MZ"
+    struct.pack_into("<I", dos, 0x3C, 0x40)
+    header = supmod._sniff_binary_header(io.BytesIO(bytes(dos)), len(dos))
+    assert header["format"] == "MZ"
+    assert header["bitness"] == 16
+
+    header = supmod._sniff_binary_header(io.BytesIO(b"xx"), 2)
+    assert header["format"] == "RAW"
+    assert header["bitness"] is None

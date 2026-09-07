@@ -99,10 +99,15 @@ def _import_discovery():
 _discovery = _import_discovery()
 
 
-class IdalibContextFields(TypedDict):
-    context_id: NotRequired[str]
-    transport_context_id: NotRequired[str | None]
-    isolated_contexts: NotRequired[bool]
+class IdalibContextFields(TypedDict, total=False):
+    # total=False rather than NotRequired[...]: this module uses
+    # `from __future__ import annotations`, under which TypedDict sees these
+    # annotations as plain strings and counts NotRequired keys as required.
+    # That made every error return that omits them fail output-schema
+    # validation, replacing the actual error text with a validation dump.
+    context_id: str
+    transport_context_id: str | None
+    isolated_contexts: bool
 
 
 class IdalibSessionInfo(TypedDict):
@@ -1399,6 +1404,18 @@ def _require_supervisor() -> IdalibSupervisor:
     return supervisor
 
 
+def _context_fields_or_empty(sup: IdalibSupervisor) -> dict:
+    """Context fields for an error payload, or {} if the context won't resolve.
+
+    Error returns need these to satisfy the published output schema; resolving
+    a context can itself raise, and an error message must not be lost to that.
+    """
+    try:
+        return dict(sup.context_fields(sup.resolve_context_id()))
+    except Exception:
+        return {}
+
+
 def _call_tool_result(result: Any, *, is_error: bool = False) -> dict:
     response: dict[str, Any] = {
         "content": [{"type": "text", "text": json.dumps(result, separators=(",", ":"))}],
@@ -1453,7 +1470,10 @@ def idalib_open(
     registry built up by ``list_pe_images`` makes it safe for clients whose
     upstream safety layer strips absolute paths to still address discovered
     binaries by name. Use ``directory`` to disambiguate if the same filename has
-    been seen in multiple folders.
+    been seen in multiple folders. Note that ``list_pe_images`` only registers
+    PE images by default: to address a raw blob or an LE/LX extender image by
+    name, discover it with ``list_pe_images(..., include_non_pe=True)`` first,
+    or pass its absolute path here (which always works).
 
     ``bitness``/``processor`` are applied as a post-load fixup, because idalib
     cannot pass load options to IDA: the database is opened, then the affected
@@ -1706,13 +1726,14 @@ def idalib_switch(session_id: Annotated[str, "Session ID to bind to active conte
             "message": f"Bound context to session: {session.session_id} ({session.filename})",
         }
     except Exception as e:
-        return {"error": str(e)}
+        return {**_context_fields_or_empty(sup), "error": str(e)}
 
 
 @mcp.tool
 def idalib_unbind() -> IdalibUnbindResult:
     """Unbind the active idalib context from any database."""
     sup = _require_supervisor()
+    ctx = _context_fields_or_empty(sup)
     try:
         context_id = sup.resolve_context_id()
         if sup.unbind_context(context_id):
@@ -1727,13 +1748,14 @@ def idalib_unbind() -> IdalibUnbindResult:
             "error": "No bound session for this context.",
         }
     except Exception as e:
-        return {"error": f"Failed to unbind context: {e}"}
+        return {**ctx, "error": f"Failed to unbind context: {e}"}
 
 
 @mcp.tool
 def idalib_list() -> IdalibListResult:
     """List database workers with context-binding metadata."""
     sup = _require_supervisor()
+    ctx = _context_fields_or_empty(sup)
     try:
         context_id = sup.resolve_context_id()
         sessions = sup.list_sessions(context_id)
@@ -1744,13 +1766,14 @@ def idalib_list() -> IdalibListResult:
             "current_context_session_id": sup.context_bindings.get(context_id),
         }
     except Exception as e:
-        return {"error": f"Failed to list sessions: {e}"}
+        return {**ctx, "error": f"Failed to list sessions: {e}"}
 
 
 @mcp.tool
 def idalib_current() -> IdalibCurrentResult:
     """Return the database bound to the active idalib context."""
     sup = _require_supervisor()
+    ctx = _context_fields_or_empty(sup)
     try:
         context_id = sup.resolve_context_id()
         session_id = sup.context_bindings.get(context_id)
@@ -1762,7 +1785,7 @@ def idalib_current() -> IdalibCurrentResult:
         session = sup.resolve_session(session_id)
         return {**session.to_dict(), **sup.context_fields(context_id)}
     except Exception as e:
-        return {"error": f"Failed to get current session: {e}"}
+        return {**ctx, "error": f"Failed to get current session: {e}"}
 
 
 @mcp.tool
@@ -1772,6 +1795,7 @@ def idalib_save(
 ) -> IdalibSaveResult:
     """Save the selected database worker's IDB."""
     sup = _require_supervisor()
+    ctx = _context_fields_or_empty(sup)
     try:
         context_id = sup.resolve_context_id()
         session = sup.resolve_session(session_id)
@@ -1783,7 +1807,7 @@ def idalib_save(
             return {**result, **sup.context_fields(context_id)}
         return {"ok": False, **sup.context_fields(context_id), "error": "Unexpected save result"}
     except Exception as e:
-        return {"ok": False, "error": str(e)}
+        return {"ok": False, **ctx, "error": str(e)}
 
 
 @mcp.tool
