@@ -1133,6 +1133,29 @@ def decompile_checked(addr: int):
     return cfunc
 
 
+def decompile_failure_reason(ea: int) -> str:
+    """Explain why decompiling ``ea`` failed, for error payloads.
+
+    Hex-Rays has no 16-bit x86 decompiler, so real-mode code (DOS MZ, NE, raw
+    boot blobs) always fails; say so up front instead of a generic message.
+    """
+    seg = idaapi.getseg(ea)
+    if seg is not None and segment_bitness(seg) == 16:
+        return (
+            "Decompilation failed: Hex-Rays does not support 16-bit code "
+            f"(segment {idaapi.get_segm_name(seg) or hex(seg.start_ea)} is 16-bit). "
+            "Use disassemble_function / analyze_function(include_asm=true), or an "
+            "external decompiler for real-mode code."
+        )
+    try:
+        decompile_checked(ea)
+    except IDAError as e:
+        return str(e)
+    except Exception as e:
+        return f"Decompilation failed: {e}"
+    return "Decompilation failed"
+
+
 def decompile_function_safe(ea: int, include_addresses: bool = True) -> Optional[str]:
     """Safely decompile a function, returning None on failure (uses cache)"""
     import ida_lines

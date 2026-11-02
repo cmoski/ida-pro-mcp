@@ -25,6 +25,7 @@ from .utils import (
     paginate,
     pattern_filter,
     get_stack_frame_variables_internal,
+    decompile_failure_reason,
     decompile_function_safe,
     compact_whitespace,
     get_assembly_lines,
@@ -758,7 +759,7 @@ def decompile(
         start = parse_address(addr)
         code = decompile_function_safe(start, include_addresses=include_addresses)
         if code is None:
-            return {"addr": addr, "code": None, "error": "Decompilation failed"}
+            return {"addr": addr, "code": None, "error": decompile_failure_reason(start)}
         result: DecompileResult = {"addr": addr, "code": code}
         try:
             import ida_hexrays
@@ -1132,7 +1133,7 @@ def analyze_batch(
                 code = decompile_function_safe(fn.start_ea)
                 analysis["decompile"] = code
                 if code is None:
-                    analysis["decompile_error"] = "Decompilation failed"
+                    analysis["decompile_error"] = decompile_failure_reason(fn.start_ea)
 
             if include_disasm:
                 lines, disasm_truncated = _disasm_lines_limited(fn, max_disasm_insns)

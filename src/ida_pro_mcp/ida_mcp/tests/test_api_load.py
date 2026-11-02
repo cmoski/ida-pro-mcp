@@ -18,6 +18,7 @@ from ..framework import (
     assert_is_list,
     assert_valid_address,
     get_first_segment,
+    skip_test,
 )
 from ..api_load import (
     create_segment,
@@ -268,3 +269,46 @@ def test_segment_views_report_bitness():
         assert entry["bitness"] in (16, 32, 64)
     for entry in _build_segments():
         assert entry["bitness"] in (16, 32, 64)
+
+
+@test()
+def test_survey_binary_output_is_schema_valid():
+    """Regression: survey segments carry ``bitness``, so the published
+    outputSchema must allow it (it once rejected it as an additional property)."""
+    try:
+        from jsonschema import Draft202012Validator
+    except Exception:
+        skip_test("jsonschema not installed")
+    from ..rpc import MCP_SERVER
+    from ..api_survey import survey_binary
+
+    schema = MCP_SERVER._generate_tool_schema(
+        "survey_binary", MCP_SERVER.tools.methods["survey_binary"]
+    ).get("outputSchema")
+    assert schema is not None, "survey_binary has no outputSchema"
+    Draft202012Validator(schema).validate(survey_binary(detail_level="minimal"))
+
+
+@test()
+def test_decompile_explains_16bit_failure():
+    """Hex-Rays can't decompile real-mode code; the error must say why instead of
+    a bare 'Decompilation failed'."""
+    import ida_bytes
+    import ida_funcs
+    from ..api_analysis import decompile
+
+    _drop_segment(SCRATCH_BASE)
+    try:
+        create_segment(
+            start=hex(SCRATCH_BASE), size=0x100, name="mcp_scratch_16", bitness=16
+        )
+        ida_bytes.patch_bytes(SCRATCH_BASE, bytes((0x55, 0x8B, 0xEC, 0x5D, 0xC3)))
+        idaapi.create_insn(SCRATCH_BASE)
+        assert ida_funcs.add_func(SCRATCH_BASE), "could not create scratch function"
+
+        result = decompile(hex(SCRATCH_BASE))
+        assert result["code"] is None
+        assert "16-bit" in result["error"], result
+        assert "disassemble_function" in result["error"]
+    finally:
+        _drop_segment(SCRATCH_BASE)

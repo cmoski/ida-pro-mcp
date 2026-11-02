@@ -30,6 +30,7 @@ class SurveySegmentInfo(TypedDict):
     end: str
     size: str
     permissions: str
+    bitness: int
 
 
 class SurveyEntrypoint(TypedDict):
