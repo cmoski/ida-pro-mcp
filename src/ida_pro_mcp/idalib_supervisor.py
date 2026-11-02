@@ -14,6 +14,7 @@ import importlib.util
 import json
 import logging
 import os
+import shutil
 import signal
 import socket
 import subprocess
@@ -23,7 +24,7 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from threading import RLock
+from threading import RLock, Thread
 from typing import Annotated, Any, NotRequired, Optional, TypedDict
 
 
@@ -65,6 +66,8 @@ STDIO_PROXY_PROBE_SESSION_ID = "idalib-stdio-proxy-probe"
 # calls get short timeouts so the supervisor can always answer "is this worker
 # wedged?" quickly instead of hanging behind the wedge.
 _DEFAULT_WORKER_TOOL_TIMEOUT_SEC = 300.0
+# Total budget for workers to save their databases on supervisor shutdown.
+_SHUTDOWN_SAVE_TIMEOUT_SEC = 30.0
 _PROBE_WORKER_TIMEOUT_SEC = 5.0
 _WARMUP_WORKER_TIMEOUT_SEC = 180.0
 
@@ -817,8 +820,34 @@ class IdalibSupervisor:
             self.path_to_session.clear()
             self.context_bindings.clear()
             self._schema_worker = None
+        # Ask each worker to close (and so save) its database first: a bare
+        # terminate leaves unpacked .id0/.id1/... components behind and loses
+        # every change since the last explicit save.
+        closers = []
+        for worker in workers:
+            if worker.backend != "worker" or not worker.owned or not worker.is_alive():
+                continue
+            t = Thread(
+                target=self._close_worker_quietly, args=(worker,), daemon=True
+            )
+            t.start()
+            closers.append(t)
+        deadline = time.monotonic() + _SHUTDOWN_SAVE_TIMEOUT_SEC
+        for t in closers:
+            t.join(max(0.0, deadline - time.monotonic()))
         for worker in workers:
             self._terminate_worker(worker)
+
+    def _close_worker_quietly(self, worker: WorkerSession) -> None:
+        try:
+            self.call_worker_tool(
+                worker,
+                "idalib_close",
+                {"session_id": worker.session_id},
+                timeout=_SHUTDOWN_SAVE_TIMEOUT_SEC,
+            )
+        except Exception:
+            logger.debug("Graceful close failed for %s", worker.session_id, exc_info=True)
 
     def _schema_or_idle_worker(self) -> WorkerSession:
         with self._lock:
@@ -991,6 +1020,16 @@ class IdalibSupervisor:
                 resolved_path,
             )
         return matches[0] if matches else None
+
+    def is_path_owned(self, input_path: str) -> bool:
+        """True if a live worker or GUI instance already has this database open."""
+        resolved = self._normalize_input_path(input_path)
+        with self._lock:
+            existing = self.path_to_session.get(self._path_key(resolved))
+            session = self.sessions.get(existing) if existing is not None else None
+            if session is not None and session.is_alive():
+                return True
+        return self._find_gui_instance_for_path(resolved) is not None
 
     def _register_session_locked(self, session: WorkerSession, resolved_path: str, context_id: str | None) -> None:
         self.sessions[session.session_id] = session
@@ -1462,6 +1501,12 @@ def idalib_open(
         Optional[str],
         "Force the processor module after loading (metapc, arm, mips, ...).",
     ] = None,
+    keep_stale_components: Annotated[
+        bool,
+        "Open unsaved .id0/.id1/... components left by a worker that died "
+        "before saving, instead of moving them to .ida_stale/ and starting "
+        "from the last saved .i64 (default: false).",
+    ] = False,
 ) -> IdalibOpenResult:
     """Open a binary in its own idalib worker process and bind it to this context.
 
@@ -1482,6 +1527,10 @@ def idalib_open(
     They are honoured for an already-open session too. Pair them with
     ``run_auto_analysis=False`` to avoid analyzing a large image at the wrong
     width first.
+
+    Unsaved .id0/.id1/... components left by a worker that died before saving
+    are moved to ``.ida_stale/`` beside the binary (reported in ``notes``) so
+    the open starts from the last saved .i64, not half-written state.
     """
     sup = _require_supervisor()
     # Compute context fields up front so every return path (including errors)
@@ -1561,6 +1610,30 @@ def idalib_open(
                 f"Resolved '{original_input}' -> '{resolved}' ({outcome['how']})."
             )
         input_path = resolved
+
+        if not sup.is_path_owned(input_path):
+            stale = _stale_idb_components(input_path)
+            if stale and keep_stale_components:
+                notes.append(
+                    "Opening over unsaved components left by a worker that died "
+                    f"before saving ({', '.join(p.name for p in stale)}); the "
+                    "database may be partially analyzed. Verify function counts."
+                )
+            elif stale:
+                moved_to, failures = _quarantine_idb_components(input_path, stale)
+                if moved_to is not None:
+                    notes.append(
+                        "Found unsaved database components left by a worker that "
+                        "died before saving; moved them to "
+                        f"{moved_to} and opened from the last saved state "
+                        "(or a fresh analysis if none). Pass "
+                        "keep_stale_components=true to open them instead."
+                    )
+                if failures:
+                    notes.append(
+                        "Could not move some stale components (likely locked by "
+                        f"another IDA process): {'; '.join(failures)}"
+                    )
 
         session = sup.open_session(
             input_path,
@@ -2014,6 +2087,50 @@ _HASH_CHUNK_SIZE = 1024 * 1024
 _IDA_ARTIFACT_SUFFIXES = frozenset({
     ".id0", ".id1", ".id2", ".nam", ".til", ".i64", ".idb",
 })
+
+
+# Unpacked database components. IDA keeps a database in this form only while it
+# is open and packs it into .i64/.idb on a clean close, so finding them with no
+# live owner means a worker died (killed, recycled, supervisor restart) before
+# saving. Reopening silently attaches to that half-written state.
+_IDA_COMPONENT_SUFFIXES = (".id0", ".id1", ".id2", ".nam", ".til", ".$$$")
+
+
+def _stale_idb_components(input_path: str) -> list[Path]:
+    """Unpacked database components next to ``input_path`` (GAME.EXE.id0 or GAME.id0)."""
+    path = Path(input_path)
+    bases = {str(path), str(path.with_suffix(""))}
+    found: list[Path] = []
+    for base in sorted(bases):
+        for suffix in _IDA_COMPONENT_SUFFIXES:
+            candidate = Path(base + suffix)
+            if candidate.is_file() and candidate not in found:
+                found.append(candidate)
+    return found
+
+
+def _quarantine_idb_components(
+    input_path: str, components: list[Path]
+) -> tuple[Path | None, list[str]]:
+    """Move orphaned components to ``.ida_stale/<name>-<timestamp>/`` beside the binary.
+
+    Moved rather than deleted so a crashed session's work stays recoverable.
+    Returns the quarantine directory (None if nothing moved) and per-file
+    failures; a file that can't be moved is usually locked by a live IDA.
+    """
+    path = Path(input_path)
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    target = path.parent / ".ida_stale" / f"{path.name}-{stamp}"
+    moved = False
+    failures: list[str] = []
+    for component in components:
+        try:
+            target.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(component), str(target / component.name))
+            moved = True
+        except OSError as e:
+            failures.append(f"{component.name}: {e}")
+    return (target if moved else None), failures
 
 
 def _is_ida_artifact(name: str) -> bool:

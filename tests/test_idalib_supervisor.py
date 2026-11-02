@@ -2651,3 +2651,87 @@ def test_sniff_binary_header_classifies_formats(tmp_path):
     header = supmod._sniff_binary_header(io.BytesIO(b"xx"), 2)
     assert header["format"] == "RAW"
     assert header["bitness"] is None
+
+
+def _open_with_fake_supervisor(sample, **kwargs):
+    old_supervisor = supmod.supervisor
+    sup = _FakeSupervisor()
+    supmod.supervisor = sup
+    sup.mcp = _TransportMcp(session_id="ctx-stale")
+    restore = _patch_discovery(instances=[], probe=False)
+    try:
+        return sup, supmod.idalib_open(input_path=str(sample), **kwargs)
+    finally:
+        restore()
+        supmod.supervisor = old_supervisor
+
+
+def test_idalib_open_quarantines_orphaned_components(tmp_path):
+    """Unpacked components with no live owner (a worker killed before saving)
+    are moved aside so the reopen doesn't attach to half-written state."""
+    sample = tmp_path / "GAME.EXE"
+    sample.write_bytes(b"MZ")
+    for suffix in (".id0", ".id1", ".nam", ".til", ".$$$"):
+        (tmp_path / f"GAME.EXE{suffix}").write_bytes(b"x")
+    (tmp_path / "GAME.EXE.i64").write_bytes(b"saved")
+
+    sup, result = _open_with_fake_supervisor(sample)
+
+    assert result["success"] is True, result
+    assert not list(tmp_path.glob("GAME.EXE.id*")), "components left in place"
+    assert (tmp_path / "GAME.EXE.i64").exists(), "saved database must be kept"
+    moved = list((tmp_path / ".ida_stale").glob("GAME.EXE-*/*"))
+    assert sorted(p.name for p in moved) == sorted(
+        f"GAME.EXE{s}" for s in (".id0", ".id1", ".nam", ".til", ".$$$")
+    )
+    assert any(".ida_stale" in n for n in result["notes"]), result["notes"]
+    assert sup.opened, "binary was not opened after quarantine"
+
+
+def test_idalib_open_can_keep_orphaned_components(tmp_path):
+    sample = tmp_path / "GAME.EXE"
+    sample.write_bytes(b"MZ")
+    (tmp_path / "GAME.EXE.id0").write_bytes(b"x")
+
+    _sup, result = _open_with_fake_supervisor(sample, keep_stale_components=True)
+
+    assert result["success"] is True, result
+    assert (tmp_path / "GAME.EXE.id0").exists()
+    assert not (tmp_path / ".ida_stale").exists()
+    assert any("partially analyzed" in n for n in result["notes"]), result["notes"]
+
+
+def test_idalib_open_leaves_components_of_live_session_alone(tmp_path):
+    """Components belonging to a database that's open right now are not stale."""
+    sample = tmp_path / "GAME.EXE"
+    sample.write_bytes(b"MZ")
+    old_supervisor = supmod.supervisor
+    sup = _FakeSupervisor()
+    supmod.supervisor = sup
+    sup.mcp = _TransportMcp(session_id="ctx-live")
+    restore = _patch_discovery(instances=[], probe=False)
+    try:
+        first = supmod.idalib_open(input_path=str(sample), session_id="live")
+        assert first["success"] is True, first
+        (tmp_path / "GAME.EXE.id0").write_bytes(b"live")
+        again = supmod.idalib_open(input_path=str(sample), session_id="live")
+        assert again["success"] is True, again
+        assert (tmp_path / "GAME.EXE.id0").exists()
+        assert not (tmp_path / ".ida_stale").exists()
+    finally:
+        restore()
+        supmod.supervisor = old_supervisor
+
+
+def test_shutdown_asks_workers_to_save_before_terminating(tmp_path):
+    sample = tmp_path / "sample.bin"
+    sample.write_bytes(b"x")
+    sup = _FakeSupervisor()
+    restore = _patch_discovery(instances=[], probe=False)
+    try:
+        sup.open_session(str(sample), session_id="s1")
+    finally:
+        restore()
+    sup.tool_calls.clear()
+    sup.shutdown()
+    assert ("idalib_close", supmod._SHUTDOWN_SAVE_TIMEOUT_SEC) in sup.tool_calls
