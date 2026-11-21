@@ -1168,7 +1168,15 @@ def test_supervisor_uses_idb_prefixed_management_tools_only():
         "idalib_warmup",
         "idalib_health",
     }
-    assert supmod.IDB_MANAGEMENT_TOOLS == {"idb_open", "idb_list", "idb_close"}
+    assert supmod.IDB_MANAGEMENT_TOOLS == {
+        "idb_open",
+        "idb_list",
+        "idb_close",
+        "idb_aliases",
+        "idb_search_roots",
+        "list_pe_images",
+    }
+    assert not any(name.startswith("idalib_") for name in supmod.IDB_MANAGEMENT_TOOLS)
     for name in legacy:
         assert not hasattr(supmod, name), f"{name} should have been deleted"
     for typename in ("IdalibWarmupResult", "IdalibHealthResult"):
@@ -1506,3 +1514,1276 @@ def test_open_session_still_raises_when_no_concurrent_winner(tmp_path):
     sup = _FailingOpen()
     with pytest.raises(RuntimeError, match="Failed to open database"):
         sup.open_session(str(binary.resolve()))
+
+
+# ============================================================================
+# Ported fork features: path resolution, aliases, search roots, list_pe_images
+# ============================================================================
+
+
+def _make_pe_blob(
+    *,
+    machine: int = 0x8664,
+    characteristics: int = 0x0022,  # IMAGE_FILE_EXECUTABLE_IMAGE | LARGE_ADDRESS_AWARE
+    opt_magic: int = 0x20B,
+    body: bytes = b"PEDATA",
+) -> bytes:
+    """Build a minimal PE-shaped blob suitable for header parsing.
+
+    Layout: 64-byte DOS header with e_lfanew=0x40, then ``PE\\0\\0``, then a
+    20-byte IMAGE_FILE_HEADER with SizeOfOptionalHeader=2, then a 2-byte
+    Optional Header Magic, then ``body`` to make the file non-trivial.
+    """
+    import struct
+
+    dos = bytearray(0x40)
+    dos[:2] = b"MZ"
+    struct.pack_into("<I", dos, 0x3C, 0x40)
+    file_header = struct.pack(
+        "<HHIIIHH",
+        machine,          # Machine
+        0,                # NumberOfSections
+        0,                # TimeDateStamp
+        0,                # PointerToSymbolTable
+        0,                # NumberOfSymbols
+        2,                # SizeOfOptionalHeader
+        characteristics,  # Characteristics
+    )
+    opt = struct.pack("<H", opt_magic)
+    return bytes(dos) + b"PE\x00\x00" + file_header + opt + body
+
+
+def test_list_pe_images_in_management_set():
+    assert "list_pe_images" in supmod.IDB_MANAGEMENT_TOOLS
+
+
+def test_list_pe_images_tools_list_visibility():
+    old_supervisor = supmod.supervisor
+    supmod.supervisor = _FakeSupervisor()
+    try:
+        result = supmod._handle_tools_list({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
+        names = [t["name"] for t in result["result"]["tools"]]
+        assert "list_pe_images" in names
+    finally:
+        supmod.supervisor = old_supervisor
+
+
+def test_list_pe_images_routes_locally(tmp_path):
+    old_supervisor = supmod.supervisor
+    supmod.supervisor = _FakeSupervisor()
+    try:
+        result = supmod._handle_tools_call(
+            {
+                "jsonrpc": "2.0",
+                "id": 7,
+                "method": "tools/call",
+                "params": {
+                    "name": "list_pe_images",
+                    "arguments": {"directory": str(tmp_path)},
+                },
+            }
+        )
+        assert result is not None
+        assert not supmod.supervisor.forwarded
+        text = result["result"]["content"][0]["text"]
+        import json as _json
+
+        payload = _json.loads(text)
+        assert payload["directory"] == str(tmp_path)
+        assert payload["count"] == 0
+    finally:
+        supmod.supervisor = old_supervisor
+
+
+def test_list_pe_images_requires_absolute_path(tmp_path):
+    old_supervisor = supmod.supervisor
+    supmod.supervisor = _FakeSupervisor()
+    try:
+        result = supmod.list_pe_images("relative\\dir")
+        assert "error" in result
+        assert "absolute" in result["error"]
+        assert result["images"] == []
+        assert result["count"] == 0
+    finally:
+        supmod.supervisor = old_supervisor
+
+
+def test_list_pe_images_nonexistent_directory(tmp_path):
+    old_supervisor = supmod.supervisor
+    supmod.supervisor = _FakeSupervisor()
+    try:
+        missing = tmp_path / "missing"
+        result = supmod.list_pe_images(str(missing))
+        assert "error" in result
+        assert "not found" in result["error"]
+        assert result["images"] == []
+        assert result["count"] == 0
+    finally:
+        supmod.supervisor = old_supervisor
+
+
+def test_list_pe_images_omits_non_pe(tmp_path):
+    old_supervisor = supmod.supervisor
+    supmod.supervisor = _FakeSupervisor()
+    try:
+        (tmp_path / "notes.txt").write_bytes(b"hello world")
+        pe_blob = _make_pe_blob(machine=0x8664)
+        (tmp_path / "hello.exe").write_bytes(pe_blob)
+
+        # DLL with the DLL characteristics bit
+        dll_blob = _make_pe_blob(machine=0x8664, characteristics=0x2022)
+        (tmp_path / "lib.dll").write_bytes(dll_blob)
+
+        result = supmod.list_pe_images(str(tmp_path))
+        assert result["count"] == 2
+        by_name = {img["filename"]: img for img in result["images"]}
+        assert "notes.txt" not in by_name
+        assert by_name["hello.exe"]["arch"] == "x64"
+        assert by_name["hello.exe"]["bitness"] == 64
+        assert by_name["hello.exe"]["is_executable_image"] is True
+        assert by_name["hello.exe"]["is_dll"] is False
+        assert by_name["lib.dll"]["is_dll"] is True
+        assert by_name["lib.dll"]["is_executable_image"] is True
+    finally:
+        supmod.supervisor = old_supervisor
+
+
+def test_list_pe_images_hashes(tmp_path):
+    import hashlib
+    import zlib
+
+    old_supervisor = supmod.supervisor
+    supmod.supervisor = _FakeSupervisor()
+    try:
+        pe_blob = _make_pe_blob(body=b"abc123" * 100)
+        target = tmp_path / "sample.bin"
+        target.write_bytes(pe_blob)
+
+        result = supmod.list_pe_images(str(tmp_path))
+        assert result["count"] == 1
+        img = result["images"][0]
+        assert img["sha1"] == hashlib.sha1(pe_blob).hexdigest()
+        assert img["crc32"] == "0x%08x" % (zlib.crc32(pe_blob) & 0xFFFFFFFF)
+        assert img["size"] == len(pe_blob)
+    finally:
+        supmod.supervisor = old_supervisor
+
+
+def test_list_pe_images_loaded_session_marker(tmp_path):
+    old_supervisor = supmod.supervisor
+    sup = _FakeSupervisor()
+    supmod.supervisor = sup
+    try:
+        pe_one = tmp_path / "one.exe"
+        pe_two = tmp_path / "two.exe"
+        pe_one.write_bytes(_make_pe_blob(body=b"one"))
+        pe_two.write_bytes(_make_pe_blob(body=b"two"))
+
+        live_session = supmod.WorkerSession(
+            session_id="sess-one",
+            input_path=str(pe_one),
+            filename=pe_one.name,
+            host="127.0.0.1",
+            port=4242,
+            process=_FakeProcess(),
+        )
+        sup.sessions[live_session.session_id] = live_session
+        sup.path_to_session[sup._path_key(str(pe_one))] = live_session.session_id
+
+        result = supmod.list_pe_images(str(tmp_path))
+        by_name = {img["filename"]: img for img in result["images"]}
+        assert by_name["one.exe"]["loaded"] is True
+        assert by_name["one.exe"]["session_id"] == "sess-one"
+        assert by_name["two.exe"]["loaded"] is False
+        assert by_name["two.exe"]["session_id"] is None
+    finally:
+        supmod.supervisor = old_supervisor
+
+
+def test_list_pe_images_dead_sessions_are_not_marked_loaded(tmp_path):
+    old_supervisor = supmod.supervisor
+    sup = _FakeSupervisor()
+    supmod.supervisor = sup
+    try:
+        pe_path = tmp_path / "ghost.exe"
+        pe_path.write_bytes(_make_pe_blob())
+        dead_session = supmod.WorkerSession(
+            session_id="dead",
+            input_path=str(pe_path),
+            filename=pe_path.name,
+            host="127.0.0.1",
+            port=4243,
+            process=_DeadProcess(),
+        )
+        sup.sessions[dead_session.session_id] = dead_session
+
+        result = supmod.list_pe_images(str(tmp_path))
+        img = result["images"][0]
+        assert img["loaded"] is False
+        assert img["session_id"] is None
+    finally:
+        supmod.supervisor = old_supervisor
+
+
+def test_list_pe_images_truncation(tmp_path):
+    old_supervisor = supmod.supervisor
+    supmod.supervisor = _FakeSupervisor()
+    try:
+        for i in range(5):
+            (tmp_path / f"bin{i}.exe").write_bytes(_make_pe_blob(body=b"x" * (i + 1)))
+        result = supmod.list_pe_images(str(tmp_path), max_files=3)
+        assert result["count"] == 3
+        assert result.get("truncated") is True
+        assert result.get("limit_hit") == "max_files"
+    finally:
+        supmod.supervisor = old_supervisor
+
+
+def test_list_pe_images_recursive_dir_error(tmp_path, monkeypatch):
+    old_supervisor = supmod.supervisor
+    supmod.supervisor = _FakeSupervisor()
+    try:
+        readable = tmp_path / "ok"
+        readable.mkdir()
+        (readable / "a.exe").write_bytes(_make_pe_blob())
+        bad_dir_path = str(tmp_path / "denied")
+
+        real_walk = supmod.os.walk
+
+        def fake_walk(root, followlinks=False, onerror=None):
+            # First yield real contents, then synthesize an onerror call for a bad subdir
+            for triple in real_walk(root, followlinks=followlinks, onerror=onerror):
+                yield triple
+            if onerror is not None:
+                err = OSError(13, "Permission denied")
+                err.filename = bad_dir_path
+                onerror(err)
+
+        monkeypatch.setattr(supmod.os, "walk", fake_walk)
+
+        result = supmod.list_pe_images(str(tmp_path), recursive=True)
+        assert result["count"] == 1
+        assert "errors" in result
+        assert any(bad_dir_path in e["path"] for e in result["errors"])
+    finally:
+        supmod.supervisor = old_supervisor
+
+
+def test_list_pe_images_arch_variants(tmp_path):
+    old_supervisor = supmod.supervisor
+    supmod.supervisor = _FakeSupervisor()
+    try:
+        cases = [
+            ("x86.exe",   0x014C, 0x10B, "x86",   32),
+            ("x64.exe",   0x8664, 0x20B, "x64",   64),
+            ("arm64.dll", 0xAA64, 0x20B, "arm64", 64),
+            ("weird.bin", 0x9999, 0x20B, "unknown", 64),
+        ]
+        for name, machine, opt_magic, _arch, _bits in cases:
+            (tmp_path / name).write_bytes(
+                _make_pe_blob(machine=machine, opt_magic=opt_magic)
+            )
+        result = supmod.list_pe_images(str(tmp_path))
+        by_name = {img["filename"]: img for img in result["images"]}
+        for name, _machine, _magic, arch, bits in cases:
+            assert by_name[name]["arch"] == arch
+            assert by_name[name]["bitness"] == bits
+    finally:
+        supmod.supervisor = old_supervisor
+
+
+def test_list_pe_images_path_is_relative_non_recursive(tmp_path):
+    # Non-recursive: wire-format `path` must equal `filename`. Absolute server
+    # paths (drive letters, leading slashes, the tmp_path prefix) must NEVER
+    # appear in the response.
+    old_supervisor = supmod.supervisor
+    supmod.supervisor = _FakeSupervisor()
+    try:
+        (tmp_path / "thing.exe").write_bytes(_make_pe_blob())
+        result = supmod.list_pe_images(str(tmp_path))
+        assert result["count"] == 1
+        img = result["images"][0]
+        assert img["path"] == "thing.exe"
+        assert img["path"] == img["filename"]
+        # No leaked absolute prefix anywhere
+        assert str(tmp_path) not in img["path"]
+    finally:
+        supmod.supervisor = old_supervisor
+
+
+def test_list_pe_images_path_is_posix_relative_recursive(tmp_path):
+    # Recursive scan keeps locality info via forward-slash relative paths,
+    # but still doesn't leak the absolute root prefix.
+    old_supervisor = supmod.supervisor
+    supmod.supervisor = _FakeSupervisor()
+    try:
+        sub = tmp_path / "sub"
+        sub.mkdir()
+        nested = sub / "deeper"
+        nested.mkdir()
+        (tmp_path / "root.exe").write_bytes(_make_pe_blob(body=b"r"))
+        (sub / "child.exe").write_bytes(_make_pe_blob(body=b"c"))
+        (nested / "grand.exe").write_bytes(_make_pe_blob(body=b"g"))
+
+        result = supmod.list_pe_images(str(tmp_path), recursive=True)
+        assert result["count"] == 3
+        paths = {img["path"] for img in result["images"]}
+        assert paths == {"root.exe", "sub/child.exe", "sub/deeper/grand.exe"}
+        for img in result["images"]:
+            assert str(tmp_path) not in img["path"]
+            # Forward slashes only -- no Windows backslashes leak into wire format
+            assert "\\" not in img["path"]
+    finally:
+        supmod.supervisor = old_supervisor
+
+
+def test_list_pe_images_registers_absolute_path_internally(tmp_path):
+    # The wire response uses relative paths, but the alias registry must still
+    # hold the absolute path -- otherwise idalib_open could not actually open
+    # the file. This is the critical "leak nothing on the wire, keep absolute
+    # paths internal" guarantee.
+    old_supervisor = supmod.supervisor
+    sup = _FakeSupervisor()
+    supmod.supervisor = sup
+    try:
+        (tmp_path / "alpha.exe").write_bytes(_make_pe_blob(body=b"a"))
+        result = supmod.list_pe_images(str(tmp_path))
+        # Wire path is relative
+        assert result["images"][0]["path"] == "alpha.exe"
+        # But the registry has the absolute path
+        registered = sup.paths.alias_registry["alpha.exe"]
+        assert str(tmp_path / "alpha.exe") in registered
+    finally:
+        supmod.supervisor = old_supervisor
+
+
+def test_idb_open_accepts_wire_path_from_list_pe_images(tmp_path):
+    # End-to-end: take a `path` straight from a list_pe_images response and pass
+    # it back to idalib_open. The basename fallback should resolve it via the
+    # registry.
+    old_supervisor = supmod.supervisor
+    sup = _FakeSupervisor()
+    supmod.supervisor = sup
+    try:
+        (tmp_path / "beta.exe").write_bytes(_make_pe_blob(body=b"b"))
+        listing = supmod.list_pe_images(str(tmp_path))
+        wire_path = listing["images"][0]["path"]
+        assert wire_path == "beta.exe"  # sanity
+
+        result = supmod.idb_open(input_path=wire_path)
+        assert result.get("success") is True
+        # open_session received the absolute path the registry resolved to
+        assert sup.opened[0][1]["input_path"] == str(tmp_path / "beta.exe")
+    finally:
+        supmod.supervisor = old_supervisor
+
+
+def test_list_pe_images_falls_back_to_search_roots(tmp_path):
+    # Agent supplies a directory the server can't see; supervisor falls back
+    # to its configured --search-root directory and returns those PE images
+    # tagged with source_root so the agent knows what happened.
+    old_supervisor = supmod.supervisor
+    sup = _FakeSupervisor()
+    supmod.supervisor = sup
+    try:
+        real_root = tmp_path / "real"
+        real_root.mkdir()
+        (real_root / "alpha.exe").write_bytes(_make_pe_blob(body=b"a"))
+        (real_root / "beta.exe").write_bytes(_make_pe_blob(body=b"b"))
+        sup.paths.prepopulate_aliases([str(real_root)])
+
+        # Caller asks for a directory that doesn't exist on the server.
+        bogus = str(tmp_path / "this_is_only_on_my_machine")
+        result = supmod.list_pe_images(bogus)
+
+        assert result["count"] == 2
+        assert result.get("fallback_to_search_roots") is True
+        assert result.get("searched_roots") == [str(real_root)]
+        assert "notes" in result
+        assert any("not found on server" in n for n in result["notes"])
+
+        for img in result["images"]:
+            assert img["source_root"] == str(real_root)
+            # path stays relative to the source_root (no absolute leak)
+            assert img["path"] in ("alpha.exe", "beta.exe")
+    finally:
+        supmod.supervisor = old_supervisor
+
+
+def test_list_pe_images_no_fallback_when_no_search_roots(tmp_path):
+    # Caller's directory missing AND no --search-root configured -> error
+    # as before, with a hint pointing at idalib_search_roots so the operator
+    # can confirm nothing was configured.
+    old_supervisor = supmod.supervisor
+    supmod.supervisor = _FakeSupervisor()
+    try:
+        result = supmod.list_pe_images(str(tmp_path / "missing"))
+        assert "error" in result
+        assert "directory not found" in result["error"]
+        assert "search-root" in result["error"].lower() or "search_root" in result["error"]
+        assert "fallback_to_search_roots" not in result
+    finally:
+        supmod.supervisor = old_supervisor
+
+
+def test_list_pe_images_no_fallback_when_directory_exists(tmp_path):
+    # Happy path stays untouched -- when the requested directory IS reachable,
+    # we never fall back even with search_roots configured. source_root is the
+    # empty string in this mode.
+    old_supervisor = supmod.supervisor
+    sup = _FakeSupervisor()
+    supmod.supervisor = sup
+    try:
+        other_root = tmp_path / "other"
+        other_root.mkdir()
+        (other_root / "other.exe").write_bytes(_make_pe_blob(body=b"o"))
+        sup.paths.prepopulate_aliases([str(other_root)])
+
+        target = tmp_path / "target"
+        target.mkdir()
+        (target / "hit.exe").write_bytes(_make_pe_blob(body=b"h"))
+
+        result = supmod.list_pe_images(str(target))
+        assert result["count"] == 1
+        assert result["images"][0]["filename"] == "hit.exe"
+        assert result["images"][0]["source_root"] == ""
+        assert "fallback_to_search_roots" not in result
+        assert "notes" not in result
+    finally:
+        supmod.supervisor = old_supervisor
+
+
+def test_list_pe_images_fallback_aggregates_multiple_roots(tmp_path):
+    old_supervisor = supmod.supervisor
+    sup = _FakeSupervisor()
+    supmod.supervisor = sup
+    try:
+        root_a = tmp_path / "a"
+        root_b = tmp_path / "b"
+        root_a.mkdir()
+        root_b.mkdir()
+        (root_a / "from_a.exe").write_bytes(_make_pe_blob(body=b"a"))
+        (root_b / "from_b.exe").write_bytes(_make_pe_blob(body=b"b"))
+        sup.paths.prepopulate_aliases([str(root_a), str(root_b)])
+
+        result = supmod.list_pe_images(str(tmp_path / "nope"))
+        assert result.get("fallback_to_search_roots") is True
+        assert set(result["searched_roots"]) == {str(root_a), str(root_b)}
+
+        by_name = {img["filename"]: img for img in result["images"]}
+        assert by_name["from_a.exe"]["source_root"] == str(root_a)
+        assert by_name["from_b.exe"]["source_root"] == str(root_b)
+    finally:
+        supmod.supervisor = old_supervisor
+
+
+def test_list_pe_images_fallback_skips_unreachable_roots(tmp_path):
+    # If a search_root was recorded but is no longer reachable (e.g. unmounted
+    # volume), the fallback skips it gracefully and uses the others.
+    old_supervisor = supmod.supervisor
+    sup = _FakeSupervisor()
+    supmod.supervisor = sup
+    try:
+        real = tmp_path / "real"
+        real.mkdir()
+        (real / "x.exe").write_bytes(_make_pe_blob())
+        # Manually populate search_roots with one good + one nonexistent.
+        ghost = str(tmp_path / "this_was_unmounted")
+        sup.paths.search_roots = [ghost, str(real)]
+
+        result = supmod.list_pe_images(str(tmp_path / "missing"))
+        assert result.get("fallback_to_search_roots") is True
+        assert result["searched_roots"] == [str(real)]
+        assert result["count"] == 1
+    finally:
+        supmod.supervisor = old_supervisor
+
+
+def test_list_pe_images_fallback_errors_when_all_roots_unreachable(tmp_path):
+    old_supervisor = supmod.supervisor
+    sup = _FakeSupervisor()
+    supmod.supervisor = sup
+    try:
+        sup.paths.search_roots = [str(tmp_path / "gone"), str(tmp_path / "also_gone")]
+        result = supmod.list_pe_images(str(tmp_path / "missing"))
+        assert "error" in result
+        assert "all unreachable" in result["error"]
+    finally:
+        supmod.supervisor = old_supervisor
+
+
+def test_list_pe_images_fallback_honors_recursive(tmp_path):
+    old_supervisor = supmod.supervisor
+    sup = _FakeSupervisor()
+    supmod.supervisor = sup
+    try:
+        root = tmp_path / "root"
+        root.mkdir()
+        sub = root / "sub"
+        sub.mkdir()
+        (root / "top.exe").write_bytes(_make_pe_blob(body=b"t"))
+        (sub / "deep.exe").write_bytes(_make_pe_blob(body=b"d"))
+        sup.paths.search_roots = [str(root)]
+
+        result = supmod.list_pe_images(str(tmp_path / "nope"), recursive=True)
+        assert result.get("fallback_to_search_roots") is True
+        by_name = {img["filename"]: img for img in result["images"]}
+        assert "top.exe" in by_name
+        assert "deep.exe" in by_name
+        # Relative path in recursive mode preserves the subdirectory under the source_root
+        assert by_name["deep.exe"]["path"] == "sub/deep.exe"
+        assert by_name["top.exe"]["path"] == "top.exe"
+    finally:
+        supmod.supervisor = old_supervisor
+
+
+def test_list_pe_images_fallback_registers_aliases_too(tmp_path):
+    # End-to-end: agent's bogus directory triggers fallback, supervisor returns
+    # PE images from the search_root, and the alias registry is populated so
+    # the agent can immediately turn around and call idalib_open(filename).
+    old_supervisor = supmod.supervisor
+    sup = _FakeSupervisor()
+    supmod.supervisor = sup
+    try:
+        real = tmp_path / "real"
+        real.mkdir()
+        sample = real / "thing.exe"
+        sample.write_bytes(_make_pe_blob(body=b"x"))
+        sup.paths.search_roots = [str(real)]
+
+        # First call: bogus path, fallback fires, registry populated.
+        listing = supmod.list_pe_images(str(tmp_path / "elsewhere"))
+        assert listing.get("fallback_to_search_roots") is True
+        assert "thing.exe" in sup.paths.alias_registry
+
+        # Now an agent can open by bare filename.
+        opened = supmod.idb_open(input_path="thing.exe")
+        assert opened.get("success") is True
+        assert sup.opened[0][1]["input_path"] == str(sample)
+    finally:
+        supmod.supervisor = old_supervisor
+
+
+def test_list_pe_images_normal_path_has_empty_source_root(tmp_path):
+    # Verify the new source_root field is always present (schema stability)
+    # and is the empty string when no fallback happened.
+    old_supervisor = supmod.supervisor
+    supmod.supervisor = _FakeSupervisor()
+    try:
+        (tmp_path / "x.exe").write_bytes(_make_pe_blob())
+        result = supmod.list_pe_images(str(tmp_path))
+        for img in result["images"]:
+            assert "source_root" in img
+            assert img["source_root"] == ""
+    finally:
+        supmod.supervisor = old_supervisor
+
+
+def test_list_pe_images_skips_ida_artifacts(tmp_path):
+    old_supervisor = supmod.supervisor
+    supmod.supervisor = _FakeSupervisor()
+    try:
+        (tmp_path / "sole_v1.05.exe").write_bytes(_make_pe_blob())
+        # IDA artifacts that would otherwise either parse as non-PE (and be silently
+        # dropped) or hit PermissionError on a locked database. They must not appear
+        # in `images` and must not show up in `errors[]` either.
+        for suffix in (".id0", ".id1", ".id2", ".nam", ".til", ".i64", ".idb"):
+            (tmp_path / f"sole_v1.05.exe{suffix}").write_bytes(b"\x00" * 16)
+        # And the uppercase variant — Windows is case-insensitive.
+        (tmp_path / "OTHER.ID0").write_bytes(b"\x00" * 16)
+
+        result = supmod.list_pe_images(str(tmp_path))
+        names = {img["filename"] for img in result["images"]}
+        assert names == {"sole_v1.05.exe"}
+        assert "errors" not in result
+    finally:
+        supmod.supervisor = old_supervisor
+
+
+def test_list_pe_images_hash_false_returns_empty_hash_fields(tmp_path):
+    # sha1/crc32 stay in the schema (always present) but are empty strings when
+    # hash=False, so the gateway's structured-content validator stays happy and
+    # callers can branch on `if entry["sha1"]:` to detect the fast-discovery mode.
+    old_supervisor = supmod.supervisor
+    supmod.supervisor = _FakeSupervisor()
+    try:
+        (tmp_path / "a.exe").write_bytes(_make_pe_blob(body=b"abc"))
+        (tmp_path / "b.exe").write_bytes(_make_pe_blob(body=b"xyz"))
+        result = supmod.list_pe_images(str(tmp_path), hash=False)
+        assert result["count"] == 2
+        for img in result["images"]:
+            assert img["sha1"] == ""
+            assert img["crc32"] == ""
+            assert img["size"] > 0
+            assert img["arch"] == "x64"
+    finally:
+        supmod.supervisor = old_supervisor
+
+
+def test_list_pe_images_time_budget(tmp_path, monkeypatch):
+    old_supervisor = supmod.supervisor
+    supmod.supervisor = _FakeSupervisor()
+    try:
+        for i in range(5):
+            (tmp_path / f"bin{i}.exe").write_bytes(_make_pe_blob(body=bytes([i]) * 8))
+
+        # Fake clock: each call advances by 1.0s. Budget=2.5s -> loop should
+        # admit ~2 files then trip the deadline.
+        ticks = {"t": 0.0}
+
+        def fake_monotonic():
+            ticks["t"] += 1.0
+            return ticks["t"]
+
+        monkeypatch.setattr(supmod.time, "monotonic", fake_monotonic)
+        result = supmod.list_pe_images(str(tmp_path), time_budget_sec=2.5)
+        assert result.get("truncated") is True
+        assert result.get("limit_hit") == "time_budget"
+        assert result["count"] < 5
+    finally:
+        supmod.supervisor = old_supervisor
+
+
+def test_list_pe_images_time_budget_disabled(tmp_path, monkeypatch):
+    old_supervisor = supmod.supervisor
+    supmod.supervisor = _FakeSupervisor()
+    try:
+        for i in range(3):
+            (tmp_path / f"bin{i}.exe").write_bytes(_make_pe_blob(body=bytes([i])))
+
+        # Even if the clock claims big jumps, time_budget_sec=0 disables the check.
+        monkeypatch.setattr(supmod.time, "monotonic", lambda: 1e9)
+        result = supmod.list_pe_images(str(tmp_path), time_budget_sec=0)
+        assert result["count"] == 3
+        assert "truncated" not in result
+    finally:
+        supmod.supervisor = old_supervisor
+
+
+def test_list_pe_images_populates_alias_registry(tmp_path):
+    old_supervisor = supmod.supervisor
+    sup = _FakeSupervisor()
+    supmod.supervisor = sup
+    try:
+        (tmp_path / "alpha.exe").write_bytes(_make_pe_blob(body=b"a"))
+        (tmp_path / "beta.exe").write_bytes(_make_pe_blob(body=b"b"))
+        result = supmod.list_pe_images(str(tmp_path))
+        assert result["count"] == 2
+        assert "alpha.exe" in sup.paths.alias_registry
+        assert "beta.exe" in sup.paths.alias_registry
+        assert str(tmp_path / "alpha.exe") in sup.paths.alias_registry["alpha.exe"]
+    finally:
+        supmod.supervisor = old_supervisor
+
+
+def test_resolve_alias_unique_match(tmp_path):
+    sup = _FakeSupervisor()
+    p = str(tmp_path / "only.exe")
+    sup.paths.record_aliases({"only.exe": p})
+    assert sup.paths.resolve_alias("only.exe") == p
+
+
+def test_resolve_alias_missing_returns_none():
+    sup = _FakeSupervisor()
+    assert sup.paths.resolve_alias("never_seen.exe") is None
+
+
+def test_resolve_alias_ambiguous_raises(tmp_path):
+    sup = _FakeSupervisor()
+    a = tmp_path / "dir1"
+    b = tmp_path / "dir2"
+    a.mkdir()
+    b.mkdir()
+    sup.paths.record_aliases({"shared.exe": str(a / "shared.exe")})
+    sup.paths.record_aliases({"shared.exe": str(b / "shared.exe")})
+    try:
+        sup.paths.resolve_alias("shared.exe")
+    except RuntimeError as e:
+        assert "Ambiguous" in str(e)
+        assert "directory=" in str(e)
+    else:
+        raise AssertionError("expected RuntimeError on ambiguous alias")
+
+
+def test_resolve_alias_directory_hint_disambiguates(tmp_path):
+    sup = _FakeSupervisor()
+    a_dir = tmp_path / "dir1"
+    b_dir = tmp_path / "dir2"
+    a_dir.mkdir()
+    b_dir.mkdir()
+    pa = str(a_dir / "shared.exe")
+    pb = str(b_dir / "shared.exe")
+    sup.paths.record_aliases({"shared.exe": pa})
+    sup.paths.record_aliases({"shared.exe": pb})
+    assert sup.paths.resolve_alias("shared.exe", directory_hint=str(a_dir)) == pa
+    assert sup.paths.resolve_alias("shared.exe", directory_hint=str(b_dir)) == pb
+
+
+def test_resolve_alias_directory_hint_no_match_returns_none(tmp_path):
+    sup = _FakeSupervisor()
+    a_dir = tmp_path / "real"
+    a_dir.mkdir()
+    sup.paths.record_aliases({"x.exe": str(a_dir / "x.exe")})
+    assert sup.paths.resolve_alias("x.exe", directory_hint=str(tmp_path / "wrong")) is None
+
+
+def test_idb_open_resolves_bare_filename_via_registry(tmp_path):
+    old_supervisor = supmod.supervisor
+    sup = _FakeSupervisor()
+    supmod.supervisor = sup
+    try:
+        sample = tmp_path / "sole.exe"
+        sample.write_bytes(b"x")  # any contents fine; _FakeSupervisor stubs IDA.
+        sup.paths.record_aliases({"sole.exe": str(sample)})
+
+        result = supmod.idb_open(input_path="sole.exe")
+        assert result.get("success") is True
+        # open_session was invoked with the resolved absolute path, not the bare name.
+        assert sup.opened, "expected idalib_open to reach open_session"
+        assert sup.opened[0][1]["input_path"] == str(sample)
+    finally:
+        supmod.supervisor = old_supervisor
+
+
+def test_idb_open_ambiguous_alias_returns_error(tmp_path):
+    old_supervisor = supmod.supervisor
+    sup = _FakeSupervisor()
+    supmod.supervisor = sup
+    try:
+        d1 = tmp_path / "v1"
+        d2 = tmp_path / "v2"
+        d1.mkdir()
+        d2.mkdir()
+        sup.paths.record_aliases({"sole.exe": str(d1 / "sole.exe")})
+        sup.paths.record_aliases({"sole.exe": str(d2 / "sole.exe")})
+        result = supmod.idb_open(input_path="sole.exe")
+        assert "error" in result
+        assert "Ambiguous" in result["error"]
+    finally:
+        supmod.supervisor = old_supervisor
+
+
+def test_idb_open_ambiguous_alias_directory_hint_resolves(tmp_path):
+    old_supervisor = supmod.supervisor
+    sup = _FakeSupervisor()
+    supmod.supervisor = sup
+    try:
+        d1 = tmp_path / "v1"
+        d2 = tmp_path / "v2"
+        d1.mkdir()
+        d2.mkdir()
+        sole_v1 = d1 / "sole.exe"
+        sole_v2 = d2 / "sole.exe"
+        sole_v1.write_bytes(b"x")
+        sole_v2.write_bytes(b"x")
+        sup.paths.record_aliases({"sole.exe": str(sole_v1)})
+        sup.paths.record_aliases({"sole.exe": str(sole_v2)})
+
+        result = supmod.idb_open(input_path="sole.exe", directory=str(d1))
+        assert result.get("success") is True
+        assert sup.opened[0][1]["input_path"] == str(sole_v1)
+    finally:
+        supmod.supervisor = old_supervisor
+
+
+def test_idb_aliases_inspection_tool(tmp_path):
+    old_supervisor = supmod.supervisor
+    sup = _FakeSupervisor()
+    supmod.supervisor = sup
+    try:
+        p1 = str(tmp_path / "a.exe")
+        p2 = str(tmp_path / "b.exe")
+        sup.paths.record_aliases({"a.exe": p1, "b.exe": p2})
+
+        # Full listing
+        full = supmod.idb_aliases()
+        assert full["count"] == 2
+        assert full["aliases"]["a.exe"] == [p1]
+
+        # Filtered lookup
+        one = supmod.idb_aliases(filename="a.exe")
+        assert one["paths"] == [p1]
+        assert one["count"] == 1
+
+        # Unknown filename
+        miss = supmod.idb_aliases(filename="missing.exe")
+        assert miss["paths"] == []
+        assert miss["count"] == 0
+    finally:
+        supmod.supervisor = old_supervisor
+
+
+def test_idb_aliases_in_management_set():
+    assert "idb_aliases" in supmod.IDB_MANAGEMENT_TOOLS
+
+
+def test_idb_open_falls_back_to_basename_when_absolute_path_missing(tmp_path):
+    # An agent often guesses a plausible absolute layout for a file that actually
+    # lives somewhere else. When that absolute path doesn't exist, the alias
+    # registry should still match on basename so the open succeeds.
+    old_supervisor = supmod.supervisor
+    sup = _FakeSupervisor()
+    supmod.supervisor = sup
+    try:
+        real_dir = tmp_path / "actual_location"
+        real_dir.mkdir()
+        real_file = real_dir / "thing.exe"
+        real_file.write_bytes(b"x")
+        sup.paths.record_aliases({"thing.exe": str(real_file)})
+
+        guessed_path = str(tmp_path / "wrong" / "path" / "thing.exe")
+        result = supmod.idb_open(input_path=guessed_path)
+
+        assert result.get("success") is True, result
+        assert sup.opened[0][1]["input_path"] == str(real_file)
+        assert "notes" in result
+        assert any("Resolved" in n and "unique filename" in n for n in result["notes"])
+    finally:
+        supmod.supervisor = old_supervisor
+
+
+def test_idb_open_notes_when_absolute_missing_and_no_alias(tmp_path):
+    # Path doesn't exist, alias registry doesn't know the basename either.
+    # Should fail, but the error response should carry a note telling the agent
+    # what to try next (list_pe_images on the parent folder).
+    old_supervisor = supmod.supervisor
+    sup = _FakeSupervisor()
+    supmod.supervisor = sup
+    try:
+        guessed_path = str(tmp_path / "nowhere" / "missing.exe")
+        result = supmod.idb_open(input_path=guessed_path)
+        assert result.get("success") is False
+        assert "error" in result
+        assert "notes" in result
+        assert any("list_pe_images" in n for n in result["notes"])
+        assert any("missing.exe" in n for n in result["notes"])
+    finally:
+        supmod.supervisor = old_supervisor
+
+
+def test_suggest_aliases_empty_registry_returns_empty():
+    sup = _FakeSupervisor()
+    assert sup.paths.suggest_aliases("anything.exe") == []
+
+
+def test_suggest_aliases_close_match(tmp_path):
+    sup = _FakeSupervisor()
+    sup.paths.record_aliases({"sole_v1.05.exe": str(tmp_path / "sole_v1.05.exe")})
+    sup.paths.record_aliases({"sole_v1.04.exe": str(tmp_path / "sole_v1.04.exe")})
+    sup.paths.record_aliases({"unrelated.dll": str(tmp_path / "unrelated.dll")})
+
+    suggestions = sup.paths.suggest_aliases("sole_v1.05_typo.exe")
+    assert "sole_v1.05.exe" in suggestions
+    assert "unrelated.dll" not in suggestions
+
+
+def test_suggest_aliases_case_insensitive(tmp_path):
+    sup = _FakeSupervisor()
+    sup.paths.record_aliases({"sole_v1.05.exe": str(tmp_path / "sole_v1.05.exe")})
+    # User typed uppercase / different casing
+    suggestions = sup.paths.suggest_aliases("SOLE_V1.05.EXE")
+    assert "sole_v1.05.exe" in suggestions
+
+
+def test_suggest_aliases_substring_fallback(tmp_path):
+    # User's literal example: SOLE_v_1.05_original.exe vs sole_v1.05.exe.
+    # difflib ratio is borderline; the substring fallback must still surface it.
+    sup = _FakeSupervisor()
+    sup.paths.record_aliases({"sole_v1.05.exe": str(tmp_path / "sole_v1.05.exe")})
+    sup.paths.record_aliases({"sole_v1.04.exe": str(tmp_path / "sole_v1.04.exe")})
+
+    suggestions = sup.paths.suggest_aliases("SOLE_v_1.05_original.exe")
+    # Both share the "sole_v1" prefix on lowercase; at least sole_v1.05.exe
+    # must be suggested via either the difflib or substring pass.
+    assert "sole_v1.05.exe" in suggestions
+
+
+def test_suggest_aliases_respects_n_limit(tmp_path):
+    sup = _FakeSupervisor()
+    for i in range(10):
+        name = f"foo_v{i}.exe"
+        sup.paths.record_aliases({name: str(tmp_path / name)})
+    suggestions = sup.paths.suggest_aliases("foo_v3.exe", n=2)
+    assert len(suggestions) <= 2
+
+
+def test_suggest_aliases_no_match_returns_empty(tmp_path):
+    sup = _FakeSupervisor()
+    sup.paths.record_aliases({"alpha.exe": str(tmp_path / "alpha.exe")})
+    assert sup.paths.suggest_aliases("zzzzz_completely_different.dat") == []
+
+
+def test_suggest_aliases_handles_empty_query():
+    sup = _FakeSupervisor()
+    sup.paths.record_aliases({"x.exe": "/tmp/x.exe"})
+    assert sup.paths.suggest_aliases("") == []
+
+
+def test_prepopulate_aliases_registers_pe_images(tmp_path):
+    sup = _FakeSupervisor()
+    (tmp_path / "a.exe").write_bytes(_make_pe_blob(body=b"a"))
+    (tmp_path / "b.exe").write_bytes(_make_pe_blob(body=b"b"))
+    (tmp_path / "notes.txt").write_bytes(b"not a PE")
+
+    summary = sup.paths.prepopulate_aliases([str(tmp_path)])
+    assert summary[str(tmp_path)]["count"] == 2
+    assert summary[str(tmp_path)]["error"] is None
+    assert "a.exe" in sup.paths.alias_registry
+    assert "b.exe" in sup.paths.alias_registry
+    assert str(tmp_path / "a.exe") in sup.paths.alias_registry["a.exe"]
+    # search_roots is recorded for introspection regardless of outcome
+    assert str(tmp_path) in sup.paths.search_roots
+
+
+def test_prepopulate_aliases_recursive(tmp_path):
+    sup = _FakeSupervisor()
+    sub = tmp_path / "sub"
+    sub.mkdir()
+    (tmp_path / "top.exe").write_bytes(_make_pe_blob(body=b"t"))
+    (sub / "deep.exe").write_bytes(_make_pe_blob(body=b"d"))
+
+    # Default (non-recursive) only sees top.exe
+    summary = sup.paths.prepopulate_aliases([str(tmp_path)], recursive=False)
+    assert summary[str(tmp_path)]["count"] == 1
+    assert "top.exe" in sup.paths.alias_registry
+    assert "deep.exe" not in sup.paths.alias_registry
+
+    # Recursive sees both
+    sup2 = _FakeSupervisor()
+    summary2 = sup2.paths.prepopulate_aliases([str(tmp_path)], recursive=True)
+    assert summary2[str(tmp_path)]["count"] == 2
+    assert "top.exe" in sup2.paths.alias_registry
+    assert "deep.exe" in sup2.paths.alias_registry
+
+
+def test_prepopulate_aliases_missing_root(tmp_path):
+    sup = _FakeSupervisor()
+    missing = str(tmp_path / "does_not_exist")
+    summary = sup.paths.prepopulate_aliases([missing])
+    assert summary[missing]["count"] == 0
+    assert "not found" in summary[missing]["error"]
+    # Recorded even on failure so the operator sees what was requested
+    assert missing in sup.paths.search_roots
+
+
+def test_prepopulate_aliases_relative_root_rejected(tmp_path):
+    sup = _FakeSupervisor()
+    summary = sup.paths.prepopulate_aliases(["relative/path"])
+    assert summary["relative/path"]["count"] == 0
+    assert "absolute" in summary["relative/path"]["error"]
+
+
+def test_prepopulate_aliases_file_not_dir(tmp_path):
+    sup = _FakeSupervisor()
+    f = tmp_path / "im_a_file.exe"
+    f.write_bytes(_make_pe_blob())
+    summary = sup.paths.prepopulate_aliases([str(f)])
+    assert summary[str(f)]["count"] == 0
+    assert "not a directory" in summary[str(f)]["error"]
+
+
+def test_prepopulate_aliases_one_bad_root_does_not_abort_others(tmp_path):
+    sup = _FakeSupervisor()
+    good = tmp_path / "good"
+    good.mkdir()
+    (good / "x.exe").write_bytes(_make_pe_blob())
+    bad = str(tmp_path / "bad" / "missing")
+
+    summary = sup.paths.prepopulate_aliases([bad, str(good)])
+    assert summary[bad]["error"] is not None
+    assert summary[str(good)]["count"] == 1
+    assert "x.exe" in sup.paths.alias_registry
+
+
+def test_prepopulate_aliases_dedupes_repeat_call(tmp_path):
+    sup = _FakeSupervisor()
+    (tmp_path / "x.exe").write_bytes(_make_pe_blob())
+    sup.paths.prepopulate_aliases([str(tmp_path)])
+    sup.paths.prepopulate_aliases([str(tmp_path)])
+    # alias_registry uses a set so the second call is idempotent
+    assert len(sup.paths.alias_registry["x.exe"]) == 1
+    # search_roots also dedupes
+    assert sup.paths.search_roots.count(str(tmp_path)) == 1
+
+
+def test_idb_search_roots_in_management_set():
+    assert "idb_search_roots" in supmod.IDB_MANAGEMENT_TOOLS
+
+
+def test_idb_search_roots_returns_empty_when_unset():
+    old_supervisor = supmod.supervisor
+    supmod.supervisor = _FakeSupervisor()
+    try:
+        result = supmod.idb_search_roots()
+        assert result["roots"] == []
+        assert result["count"] == 0
+    finally:
+        supmod.supervisor = old_supervisor
+
+
+def test_idb_search_roots_returns_prepopulated(tmp_path):
+    old_supervisor = supmod.supervisor
+    sup = _FakeSupervisor()
+    supmod.supervisor = sup
+    try:
+        (tmp_path / "x.exe").write_bytes(_make_pe_blob())
+        sup.paths.prepopulate_aliases([str(tmp_path)])
+        result = supmod.idb_search_roots()
+        assert result["count"] == 1
+        assert result["roots"] == [str(tmp_path)]
+    finally:
+        supmod.supervisor = old_supervisor
+
+
+def test_idb_open_emits_did_you_mean_for_absolute_miss(tmp_path):
+    old_supervisor = supmod.supervisor
+    sup = _FakeSupervisor()
+    supmod.supervisor = sup
+    try:
+        real_dir = tmp_path / "real"
+        real_dir.mkdir()
+        sup.paths.record_aliases({"sole_v1.05.exe": str(real_dir / "sole_v1.05.exe")})
+        # Reproduces the literal failure: agent supplies absolute path with
+        # a casing/format mismatch on the filename.
+        bad = str(tmp_path / "fake" / "SOLE_v_1.05_original.exe")
+        result = supmod.idb_open(input_path=bad)
+        assert result.get("success") is False
+        assert "notes" in result
+        joined = " ".join(result["notes"])
+        assert "Did you mean" in joined
+        assert "sole_v1.05.exe" in joined
+    finally:
+        supmod.supervisor = old_supervisor
+
+
+def test_idb_open_emits_did_you_mean_for_bare_filename_miss(tmp_path):
+    old_supervisor = supmod.supervisor
+    sup = _FakeSupervisor()
+    supmod.supervisor = sup
+    try:
+        sup.paths.record_aliases({"sole_v1.05.exe": str(tmp_path / "sole_v1.05.exe")})
+        result = supmod.idb_open(input_path="sole_v1.05_TYPO.exe")
+        assert result.get("success") is False
+        assert "notes" in result
+        joined = " ".join(result["notes"])
+        assert "alias registry" in joined
+        assert "idalib_aliases" in joined or "list_pe_images" in joined
+        assert "Did you mean" in joined
+        assert "sole_v1.05.exe" in joined
+    finally:
+        supmod.supervisor = old_supervisor
+
+
+def test_idb_open_no_suggestion_when_registry_empty(tmp_path):
+    old_supervisor = supmod.supervisor
+    sup = _FakeSupervisor()
+    supmod.supervisor = sup
+    try:
+        # Empty registry -- no suggestions to make.
+        result = supmod.idb_open(input_path="anything.exe")
+        assert result.get("success") is False
+        # The breadcrumb about idalib_aliases / list_pe_images should still
+        # appear, but no "Did you mean" line since there's nothing to suggest.
+        joined = " ".join(result.get("notes", []))
+        assert "Did you mean" not in joined
+    finally:
+        supmod.supervisor = old_supervisor
+
+
+def test_cli_accepts_search_root_repeatable(monkeypatch, tmp_path):
+    # Exercise just the argparse layer: assert the parsed namespace has the
+    # repeated --search-root values and the recursive flag wired through.
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--search-root", action="append", default=[])
+    parser.add_argument("--search-root-recursive", action="store_true")
+    args = parser.parse_args([
+        "--search-root", str(tmp_path / "one"),
+        "--search-root", str(tmp_path / "two"),
+        "--search-root-recursive",
+    ])
+    assert args.search_root == [str(tmp_path / "one"), str(tmp_path / "two")]
+    assert args.search_root_recursive is True
+
+
+def test_search_root_not_forwarded_to_worker_args(monkeypatch, tmp_path):
+    # Regression: worker subprocesses don't accept --search-root and exit with
+    # code 2 if they receive it, which broke every worker spawn the first time
+    # the flag shipped. Verify the supervisor's main() never injects
+    # --search-root / --search-root-recursive into the worker_args sent down
+    # to idalib_server worker subprocesses.
+    captured: dict = {}
+
+    class _FakeSup(supmod.IdalibSupervisor):
+        def __init__(self, mcp, *, max_workers=4, worker_args=None):
+            super().__init__(
+                mcp,
+                max_workers=max_workers,
+                worker_args=worker_args,
+            )
+            captured["worker_args"] = list(worker_args or [])
+
+        def shutdown(self):
+            pass
+
+    monkeypatch.setattr(supmod, "IdalibSupervisor", _FakeSup)
+
+    # Prevent main() from actually serving / installing signal handlers.
+    class _StopServe(Exception):
+        pass
+
+    def _no_serve(*args, **kwargs):
+        raise _StopServe()
+
+    monkeypatch.setattr(supmod.mcp, "serve", _no_serve)
+    monkeypatch.setattr(supmod.signal, "signal", lambda *a, **k: None)
+
+    monkeypatch.setattr(supmod.sys, "argv", [
+        "idalib-mcp",
+        "--host", "127.0.0.1",
+        "--port", "0",
+        "--search-root", str(tmp_path),
+        "--search-root-recursive",
+    ])
+
+    try:
+        supmod.main()
+    except _StopServe:
+        pass
+
+    assert "--search-root" not in captured["worker_args"]
+    assert "--search-root-recursive" not in captured["worker_args"]
+    # Sanity: the supervisor itself did record + scan the root.
+    assert str(tmp_path) in supmod.supervisor.paths.search_roots
+
+
+def _make_lx_blob(sig: bytes = b"LX") -> bytes:
+    """MZ stub whose e_lfanew points at an LE/LX signature (DOS extender image)."""
+    import struct
+
+    dos = bytearray(0x40)
+    dos[:2] = b"MZ"
+    struct.pack_into("<I", dos, 0x3C, 0x40)
+    return bytes(dos) + sig + b"\x00" * 32
+
+
+def test_list_pe_images_include_non_pe_surfaces_lx_and_raw(tmp_path):
+    """include_non_pe=True lists the image classes the PE filter hides."""
+    old_supervisor = supmod.supervisor
+    supmod.supervisor = _FakeSupervisor()
+    try:
+        (tmp_path / "hello.exe").write_bytes(_make_pe_blob(machine=0x14C, opt_magic=0x10B))
+        (tmp_path / "wpp386.exe").write_bytes(_make_lx_blob(b"LX"))
+        (tmp_path / "dos4gw.exe").write_bytes(_make_lx_blob(b"LE"))
+        (tmp_path / "payload.bin").write_bytes(bytes((0xEB, 0xFE)) + bytes(64))
+
+        # Default: PE only, and every entry says so.
+        default = supmod.list_pe_images(str(tmp_path))
+        assert [img["filename"] for img in default["images"]] == ["hello.exe"]
+        assert default["images"][0]["format"] == "PE"
+
+        wide = supmod.list_pe_images(str(tmp_path), include_non_pe=True)
+        by_name = {img["filename"]: img for img in wide["images"]}
+        assert set(by_name) == {"hello.exe", "wpp386.exe", "dos4gw.exe", "payload.bin"}
+        assert by_name["hello.exe"]["format"] == "PE"
+        assert by_name["wpp386.exe"]["format"] == "LX"
+        assert by_name["wpp386.exe"]["bitness"] == 32
+        assert by_name["dos4gw.exe"]["format"] == "LE"
+        assert by_name["payload.bin"]["format"] == "RAW"
+        assert by_name["payload.bin"]["bitness"] is None
+        # Non-PE entries are addressable by idalib_open afterwards.
+        assert "payload.bin" in supmod.supervisor.paths.alias_registry
+    finally:
+        supmod.supervisor = old_supervisor
+
+
+def test_sniff_binary_header_classifies_formats(tmp_path):
+    """The sniffer recognizes ELF and bare LX images, not just MZ-wrapped ones."""
+    import io
+    import struct
+
+    elf = bytearray(0x40)
+    elf[:4] = bytes((0x7F, 0x45, 0x4C, 0x46))
+    elf[4] = 2  # ELFCLASS64
+    struct.pack_into("<H", elf, 0x10, 3)  # ET_DYN
+    struct.pack_into("<H", elf, 0x12, 0x3E)  # EM_X86_64
+    header = supmod._paths._sniff_binary_header(io.BytesIO(bytes(elf)), len(elf))
+    assert header["format"] == "ELF"
+    assert header["bitness"] == 64
+    assert header["arch"] == "x86_64"
+    assert header["is_dll"] is True
+
+    bare_lx = b"LX" + bytes(0x40)
+    header = supmod._paths._sniff_binary_header(io.BytesIO(bare_lx), len(bare_lx))
+    assert header["format"] == "LX"
+    assert header["bitness"] == 32
+
+    dos = bytearray(0x40)
+    dos[:2] = b"MZ"
+    struct.pack_into("<I", dos, 0x3C, 0x40)
+    header = supmod._paths._sniff_binary_header(io.BytesIO(bytes(dos)), len(dos))
+    assert header["format"] == "MZ"
+    assert header["bitness"] == 16
+
+    header = supmod._paths._sniff_binary_header(io.BytesIO(b"xx"), 2)
+    assert header["format"] == "RAW"
+    assert header["bitness"] is None
+
+
+def _open_with_fake_supervisor(sample, **kwargs):
+    old_supervisor = supmod.supervisor
+    sup = _FakeSupervisor()
+    supmod.supervisor = sup
+    restore = _patch_discovery(instances=[], probe=False)
+    try:
+        return sup, supmod.idb_open(input_path=str(sample), **kwargs)
+    finally:
+        restore()
+        supmod.supervisor = old_supervisor
+
+
+def test_idb_open_quarantines_orphaned_components(tmp_path):
+    """Unpacked components with no live owner (a worker killed before saving)
+    are moved aside so the reopen doesn't attach to half-written state."""
+    sample = tmp_path / "GAME.EXE"
+    sample.write_bytes(b"MZ")
+    for suffix in (".id0", ".id1", ".nam", ".til", ".$$$"):
+        (tmp_path / f"GAME.EXE{suffix}").write_bytes(b"x")
+    (tmp_path / "GAME.EXE.i64").write_bytes(b"saved")
+
+    sup, result = _open_with_fake_supervisor(sample)
+
+    assert result["success"] is True, result
+    assert not list(tmp_path.glob("GAME.EXE.id*")), "components left in place"
+    assert (tmp_path / "GAME.EXE.i64").exists(), "saved database must be kept"
+    moved = list((tmp_path / ".ida_stale").glob("GAME.EXE-*/*"))
+    assert sorted(p.name for p in moved) == sorted(
+        f"GAME.EXE{s}" for s in (".id0", ".id1", ".nam", ".til", ".$$$")
+    )
+    assert any(".ida_stale" in n for n in result["notes"]), result["notes"]
+    assert sup.opened, "binary was not opened after quarantine"
+
+
+def test_idb_open_never_quarantines_locked_components(tmp_path, monkeypatch):
+    """Components held open by an unregistered IDA must stay put."""
+    sample = tmp_path / "GAME.EXE"
+    sample.write_bytes(b"MZ")
+    (tmp_path / "GAME.EXE.id0").write_bytes(b"x")
+    monkeypatch.setattr(supmod._paths, "components_lock_state", lambda comps: "locked")
+
+    _sup, result = _open_with_fake_supervisor(sample)
+
+    assert (tmp_path / "GAME.EXE.id0").exists()
+    assert not (tmp_path / ".ida_stale").exists()
+
+
+def test_components_lock_state_classifies(tmp_path):
+    from ida_pro_mcp import idalib_paths as paths
+
+    assert paths.components_lock_state([]) == "none"
+    comp = tmp_path / "x.id0"
+    comp.write_bytes(b"x")
+    state = paths.components_lock_state([comp])
+    # Unlocked on Windows -> stale; on POSIX a just-written file is "possibly_open".
+    assert state in ("stale", "possibly_open")

@@ -24,7 +24,12 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from threading import RLock
-from typing import Annotated, Any, TypedDict
+from typing import Annotated, Any, Optional, TypedDict
+
+try:
+    from . import idalib_paths as _paths
+except ImportError:  # executed as a top-level script
+    import idalib_paths as _paths  # type: ignore[no-redef]
 
 
 logger = logging.getLogger(__name__)
@@ -53,6 +58,9 @@ IDB_MANAGEMENT_TOOLS = {
     "idb_open",
     "idb_list",
     "idb_close",
+    "idb_aliases",
+    "idb_search_roots",
+    "list_pe_images",
 }
 
 def _env_float(name: str, default: float) -> float:
@@ -154,12 +162,25 @@ class IdalibSessionListInfo(IdalibSessionInfo, total=False):
     worker_pid: int | None
 
 
+IdalibOpenCandidate = _paths.IdalibOpenCandidate
+PeImageInfo = _paths.PeImageInfo
+PeImageError = _paths.PeImageError
+ListPeImagesResult = _paths.ListPeImagesResult
+
+
 class IdalibOpenResult(TypedDict, total=False):
     success: bool
     session: IdalibSessionInfo
     warmup: dict[str, Any] | None
     message: str
     error: str
+    # Path resolution / verification extras.
+    sha256: str
+    md5: str
+    notes: list[str]
+    suggestions: list[str]
+    candidates: list[IdalibOpenCandidate]
+    load_fixup: dict[str, Any]
 
 
 class IdalibListResult(TypedDict, total=False):
@@ -241,6 +262,10 @@ class IdalibSupervisor:
         self.worker_args = worker_args or []
         self.sessions: dict[str, WorkerSession] = {}
         self.path_to_session: dict[str, str] = {}
+        # Bare-filename aliases, --search-root roots, decisive path resolution.
+        self.paths = _paths.PathResolver(
+            lambda: [s.input_path for s in list(self.sessions.values()) if s.input_path]
+        )
         self._schema_worker: WorkerSession | None = None
         self._tools_cache: dict[tuple[str, ...], list[dict]] = {}
         self._resources_cache: dict[str, list[dict]] = {}
@@ -1285,9 +1310,50 @@ def _jsonrpc_error(request_id: Any, code: int, message: str) -> dict | None:
     return {"jsonrpc": "2.0", "error": {"code": code, "message": message}, "id": request_id}
 
 
+def _handle_stale_components(
+    sup: IdalibSupervisor, resolved: str, keep_stale_components: bool, notes: list[str]
+) -> None:
+    """Move unpacked components left by a dead worker out of the way.
+
+    Only runs when nothing live owns the path: no session in this supervisor,
+    no registered GUI/worker instance, and the components are not held open by
+    another process (an unregistered IDA). Live components are never touched.
+    """
+    with sup._lock:
+        if sup._path_key(resolved) in sup.path_to_session:
+            return
+    if sup._find_instance_for_path(resolved) is not None:
+        return
+    components = _paths.database_component_paths(resolved)
+    state = _paths.components_lock_state(components)
+    if state != "stale":
+        return
+    if keep_stale_components:
+        notes.append(
+            "Opening over unsaved components left by a worker that died before "
+            f"saving ({', '.join(c.name for c in components)}); the database may "
+            "be partially analyzed. Verify function counts."
+        )
+        return
+    moved_to, failures = _paths.quarantine_components(resolved, components)
+    if moved_to is not None:
+        notes.append(
+            "Found unsaved database components left by a worker that died before "
+            f"saving; moved them to {moved_to} and opened from the last saved state "
+            "(or a fresh analysis if none). Pass keep_stale_components=true to open "
+            "them instead."
+        )
+    if failures:
+        notes.append(f"Could not move some stale components: {'; '.join(failures)}")
+
+
 @mcp.tool
 def idb_open(
-    input_path: Annotated[str, "Path to the binary file to analyze"],
+    input_path: Annotated[
+        str,
+        "Path to the binary. Absolute, partial (e.g. 'system/foo.dll') or a bare "
+        "filename known from list_pe_images / --search-root.",
+    ],
     mode: Annotated[
         str,
         "How to open: prefer_headless (default; idalib worker, ignore GUI), "
@@ -1305,12 +1371,80 @@ def idb_open(
     preferred_session_id: Annotated[
         str, "Preferred session ID (auto-generated if empty). Ignored if the file is already open in a GUI or worker session."
     ] = "",
+    directory: Annotated[
+        Optional[str], "Directory hint narrowing filename resolution when names repeat."
+    ] = None,
+    bitness: Annotated[
+        Optional[int],
+        "Force addressing width after load (16/32/64), applied via set_bitness. "
+        "Needed for raw/extender images that load at the host width.",
+    ] = None,
+    processor: Annotated[
+        Optional[str], "Force processor module after load (metapc, arm, ...)."
+    ] = None,
+    keep_stale_components: Annotated[
+        bool,
+        "Open unsaved .id0/.id1/... left by a dead worker instead of moving them "
+        "to .ida_stale/ (default false).",
+    ] = False,
 ) -> IdalibOpenResult:
-    """Open a binary and warm it up. Returns the existing session if the file is already open under the supervisor; otherwise creates one according to `mode`."""
+    """Open a binary and warm it up; returns its session (reused if already open).
+
+    Imperfect paths resolve in one call: exact path, unique known filename,
+    best trailing-path match, or a bounded on-disk search; misses return
+    suggestions, duplicates return candidates with hashes. Result carries the
+    file's sha256/md5.
+    """
     sup = _require_supervisor()
+    notes: list[str] = []
     try:
+        outcome = sup.paths.resolve_open_target(input_path, directory_hint=directory)
+        status = outcome["status"]
+        if status == "miss":
+            suggestions = outcome.get("suggestions") or []
+            searched = " (after an on-disk search)" if outcome.get("searched") else ""
+            notes.append(
+                f"Could not resolve '{input_path}'{searched}. Run list_pe_images on "
+                "the containing folder, or idb_aliases() to list the alias registry."
+            )
+            err: IdalibOpenResult = {
+                "success": False,
+                "error": f"Could not resolve binary: {input_path}",
+                "notes": notes,
+            }
+            if suggestions:
+                notes.append(f"Did you mean: {', '.join(suggestions)}?")
+                err["suggestions"] = suggestions
+            return err
+        if status == "ambiguous":
+            cand_paths = outcome.get("candidates") or []
+            candidates: list[IdalibOpenCandidate] = []
+            for cp in cand_paths[:8]:
+                info: IdalibOpenCandidate = {"path": cp, "filename": Path(cp).name}
+                try:
+                    info["sha256"], info["md5"] = _paths.hash_file_verify(Path(cp))
+                except OSError as he:
+                    info["error"] = f"{type(he).__name__}: {he}"
+                candidates.append(info)
+            notes.append(outcome["how"])
+            return {
+                "success": False,
+                "error": (
+                    f"Ambiguous: {len(cand_paths)} files match '{input_path}'. "
+                    "Re-call idb_open with more path components to pick one."
+                ),
+                "candidates": candidates,
+                "notes": notes,
+            }
+
+        resolved = outcome["path"]
+        if os.path.normcase(resolved) != os.path.normcase(input_path):
+            notes.append(f"Resolved '{input_path}' -> '{resolved}' ({outcome['how']}).")
+
+        _handle_stale_components(sup, resolved, keep_stale_components, notes)
+
         session = sup.open_session(
-            input_path,
+            resolved,
             mode=mode,
             run_auto_analysis=run_auto_analysis,
             build_caches=build_caches,
@@ -1318,14 +1452,37 @@ def idb_open(
             idle_ttl_sec=idle_ttl_sec,
             session_id=preferred_session_id or None,
         )
-        return {
+        result: IdalibOpenResult = {
             "success": True,
             "session": session.to_dict(),
             "warmup": session.last_warmup,
             "message": f"Binary opened: {session.filename} ({session.session_id})",
         }
+        try:
+            result["sha256"], result["md5"] = _paths.hash_file_verify(Path(resolved))
+        except OSError:
+            pass
+        if bitness is not None or processor:
+            fixup_args: dict[str, Any] = {}
+            if bitness is not None:
+                fixup_args["bitness"] = bitness
+            if processor:
+                fixup_args["processor"] = processor
+            try:
+                result["load_fixup"] = sup.call_worker_tool(session, "set_bitness", fixup_args)
+            except Exception as e:
+                notes.append(
+                    f"Binary opened, but the load fixup failed: {e}. Call set_bitness "
+                    "on this database to retry."
+                )
+        if notes:
+            result["notes"] = notes
+        return result
     except Exception as e:
-        return {"error": str(e)}
+        err = {"success": False, "error": str(e)}
+        if notes:
+            err["notes"] = notes
+        return err
 
 
 @mcp.tool
@@ -1354,6 +1511,309 @@ def idb_close(
         return sup.close_session(database, save=save)
     except Exception as e:
         return {"error": str(e)}
+
+
+@mcp.tool
+def idb_aliases(
+    filename: Annotated[
+        Optional[str],
+        "If set, return only paths matching this filename (or empty if unknown).",
+    ] = None,
+) -> dict:
+    """Show filenames known to the supervisor alias registry.
+
+    The registry is populated by ``list_pe_images`` and lets ``idb_open``
+    resolve bare filenames to absolute paths — useful when an upstream safety
+    layer strips absolute paths from tool arguments.
+    """
+    sup = _require_supervisor()
+    with sup.paths._lock:
+        if filename is not None:
+            paths = sorted(sup.paths.alias_registry.get(filename, ()))
+            return {"filename": filename, "paths": paths, "count": len(paths)}
+        snapshot = {
+            name: sorted(paths) for name, paths in sup.paths.alias_registry.items()
+        }
+    return {"count": len(snapshot), "aliases": snapshot}
+
+
+@mcp.tool
+def idb_search_roots() -> dict:
+    """Show directories the supervisor pre-scanned at startup via --search-root.
+
+    Each --search-root directory is walked once at supervisor startup and every
+    PE image found is registered in the alias registry. This means a freshly
+    connected client can call ``idb_aliases()`` immediately to see what
+    binaries are available -- no need to know any server-side absolute path or
+    call ``list_pe_images`` first.
+    """
+    sup = _require_supervisor()
+    with sup.paths._lock:
+        roots = list(sup.paths.search_roots)
+    return {"roots": roots, "count": len(roots)}
+
+
+def _loaded_index(sup: IdalibSupervisor) -> dict[str, str]:
+    """Snapshot ``path_key -> session_id`` for live sessions, taken under the supervisor lock."""
+    snapshot: list[tuple[str, str]] = []
+    with sup._lock:
+        for session in sup.sessions.values():
+            if not session.input_path:
+                continue
+            try:
+                if not session.is_alive():
+                    continue
+            except Exception:
+                continue
+            try:
+                key = sup._path_key(session.input_path)
+            except Exception:
+                key = os.path.normcase(session.input_path)
+            snapshot.append((key, session.session_id))
+    return dict(snapshot)
+
+
+@mcp.tool
+def list_pe_images(
+    directory: Annotated[str, "Absolute path to the directory to scan"],
+    recursive: Annotated[bool, "Recurse into subdirectories"] = False,
+    max_files: Annotated[int, "Max files to include before truncating (soft cap)"] = 2000,
+    max_errors: Annotated[int, "Max per-file/dir errors to record before truncating"] = 100,
+    time_budget_sec: Annotated[
+        float, "Wall-clock budget for the scan; 0 disables. Truncates when exceeded."
+    ] = 60.0,
+    hash: Annotated[
+        bool, "Compute SHA1/CRC32 per file. Disable for a fast discovery pass."
+    ] = True,
+    include_non_pe: Annotated[
+        bool,
+        "Also list non-PE files (LE/LX extender images, NE, plain MZ, ELF, "
+        "Mach-O and headerless blobs). Each entry's `format` says which.",
+    ] = False,
+) -> ListPeImagesResult:
+    """List PE images (EXE, DLL, SYS, OCX, ...) under a directory.
+
+    Filters to files with a valid MZ + PE\\0\\0 header, so LE/LX extender images,
+    16-bit NE binaries and headerless/raw blobs are invisible by default -- pass
+    ``include_non_pe=True`` to list every file with its detected ``format`` (PE, NE,
+    LE, LX, MZ, ELF, MACHO, RAW) instead. Each entry includes size, UTC
+    mtime, machine/arch/bitness, and Characteristics flags (is_executable_image, is_dll,
+    is_system). When ``hash=True`` (default) each entry also includes SHA1 and CRC32 over
+    the full file contents; when ``hash=False`` sha1 and crc32 are returned as empty
+    strings (the fields are always present so the published schema stays consistent),
+    which is much faster on large trees. Entries already opened in this supervisor are
+    flagged (loaded + session_id).
+
+    The ``path`` field is relative to the queried ``directory`` (forward-slash
+    separated) -- non-recursive scans return paths equal to the filename, recursive
+    scans return ``subdir/file.exe`` style relatives. Absolute paths stay strictly
+    server-internal: the alias registry built by this call uses absolute paths under
+    the hood so callers can pass either ``path`` or ``filename`` to ``idb_open``.
+
+    Intended for shared/supervisor mode so clients can pick a binary for idb_open and
+    compare against on-disk copies. ``directory`` must be an absolute path. For recursive
+    scans of very large trees: use ``hash=False`` for discovery, then call again with
+    ``hash=True`` on a narrowed directory. Scans truncate when any of ``max_files``,
+    ``max_errors``, or ``time_budget_sec`` is hit; the result reports ``limit_hit``.
+
+    Fallback: if ``directory`` does not exist on the server but ``--search-root``
+    was configured at startup, the supervisor scans the configured roots instead
+    and tags each entry with its ``source_root``. This lets agents that don't
+    know which paths the server has reachable -- e.g. a Linux-mounted view that
+    differs from the Windows-side mount -- still get a useful response.
+    """
+    from datetime import timezone
+
+    sup = _require_supervisor()
+    result: ListPeImagesResult = {
+        "directory": directory,
+        "recursive": bool(recursive),
+        "count": 0,
+        "images": [],
+    }
+
+    dir_path = Path(directory)
+    if not dir_path.is_absolute():
+        result["error"] = "directory must be an absolute path"
+        return result
+
+    # Decide which directories to scan. Normal path: just the requested one.
+    # Fallback path: the requested directory doesn't exist on the server, but
+    # --search-root directories were configured -- scan those and tag entries
+    # with source_root so the caller knows.
+    notes: list[str] = []
+    scan_targets: list[tuple[Path, str]] = []  # (scan_root, source_root_str or "")
+    fallback = False
+    searched_roots: list[str] = []
+
+    if dir_path.exists():
+        if not dir_path.is_dir():
+            result["error"] = f"not a directory: {directory}"
+            return result
+        scan_targets.append((dir_path, ""))
+    elif sup.paths.search_roots:
+        fallback = True
+        with sup.paths._lock:
+            configured_roots = list(sup.paths.search_roots)
+        for raw_root in configured_roots:
+            root_path = Path(raw_root)
+            if root_path.exists() and root_path.is_dir():
+                scan_targets.append((root_path, raw_root))
+                searched_roots.append(raw_root)
+        if not scan_targets:
+            result["error"] = (
+                f"directory not found: {directory}; configured search roots are "
+                f"all unreachable: {configured_roots}"
+            )
+            return result
+        notes.append(
+            f"Directory '{directory}' not found on server; falling back to "
+            f"{len(searched_roots)} configured --search-root director"
+            f"{'y' if len(searched_roots) == 1 else 'ies'}."
+        )
+    else:
+        result["error"] = (
+            f"directory not found: {directory}. No --search-root configured "
+            f"so no fallback is available; call idb_search_roots() to see "
+            f"what was configured."
+        )
+        return result
+
+    loaded = _loaded_index(sup)
+
+    # Each pending entry pairs the wire-format PeImageInfo (relative `path`) with the
+    # absolute filesystem path used for internal cross-referencing and registry
+    # population. Absolute paths never escape this function except inside `notes`
+    # (intentional debug aid) and aggregated via record_aliases (server-internal).
+    pending: list[tuple[PeImageInfo, str]] = []
+    errors: list[PeImageError] = []
+    truncated = False
+    limit_hit: str | None = None
+    deadline = time.monotonic() + time_budget_sec if time_budget_sec > 0 else None
+
+    def _record_error(path: str, exc: BaseException) -> None:
+        nonlocal truncated, limit_hit
+        if len(errors) >= max_errors:
+            if not truncated:
+                truncated = True
+                limit_hit = "max_errors"
+            return
+        errors.append({"path": path, "error": f"{type(exc).__name__}: {exc}"})
+
+    # Count immediate subdirectories skipped by a non-recursive scan so we can
+    # tell the caller what they'd reach with recursive=True (the mplayer case:
+    # executables landed one level down in system/ and Programs/).
+    skipped_subdirs = 0
+
+    def _record_subdir(_path: str) -> None:
+        nonlocal skipped_subdirs
+        skipped_subdirs += 1
+
+    on_subdir = None if recursive else _record_subdir
+
+    for scan_root, source_root in scan_targets:
+        if truncated:
+            break
+        for full_path, st in _paths._iter_candidate_files(
+            scan_root, bool(recursive), _record_error, on_subdir=on_subdir
+        ):
+            if len(pending) >= max_files:
+                truncated = True
+                limit_hit = "max_files"
+                break
+            if deadline is not None and time.monotonic() >= deadline:
+                truncated = True
+                limit_hit = "time_budget"
+                break
+
+            try:
+                with open(full_path, "rb") as fh:
+                    if include_non_pe:
+                        header = _paths._sniff_binary_header(fh, st.st_size)
+                    else:
+                        header = _paths._parse_pe_header(fh, st.st_size)
+                        if header is not None:
+                            header = {**header, "format": "PE"}
+            except OSError as e:
+                _record_error(str(full_path), e)
+                continue
+            if header is None:
+                continue
+
+            sha1 = ""
+            crc32 = ""
+            if hash:
+                try:
+                    sha1, crc32 = _paths._hash_file(full_path)
+                except OSError as e:
+                    _record_error(str(full_path), e)
+                    continue
+
+            abs_path = str(full_path)
+            try:
+                key = sup._path_key(abs_path)
+            except Exception:
+                key = os.path.normcase(abs_path)
+            session_id = loaded.get(key)
+
+            try:
+                rel_path = full_path.relative_to(scan_root).as_posix()
+            except ValueError:
+                # Walker promised a file under scan_root; if relative_to ever
+                # fails, fall back to the basename so we still emit something
+                # non-absolute on the wire.
+                rel_path = full_path.name
+
+            mtime = datetime.fromtimestamp(st.st_mtime, tz=timezone.utc).isoformat()
+
+            entry: PeImageInfo = {
+                "path": rel_path,
+                "filename": full_path.name,
+                "size": int(st.st_size),
+                "mtime": mtime,
+                "format": header["format"],
+                "sha1": sha1,
+                "crc32": crc32,
+                "machine": header["machine"],
+                "arch": header["arch"],
+                "bitness": header["bitness"],
+                "characteristics": header["characteristics"],
+                "is_executable_image": header["is_executable_image"],
+                "is_dll": header["is_dll"],
+                "is_system": header["is_system"],
+                "loaded": session_id is not None,
+                "session_id": session_id,
+                "source_root": source_root,
+            }
+            pending.append((entry, abs_path))
+
+    pending.sort(key=lambda pair: (pair[0].get("source_root", ""), pair[0]["path"].lower()))
+    # Record (filename -> absolute path) so callers can later open these binaries
+    # by bare filename (or by the relative `path` we just returned, which the
+    # idb_open basename fallback handles). The registry keeps absolute paths
+    # internally; only the wire response uses relative paths.
+    sup.paths.record_aliases({entry["filename"]: abs_p for entry, abs_p in pending})
+    images = [entry for entry, _ in pending]
+    result["images"] = images
+    result["count"] = len(images)
+    if errors:
+        result["errors"] = errors
+    if truncated:
+        result["truncated"] = True
+        if limit_hit is not None:
+            result["limit_hit"] = limit_hit
+    if fallback:
+        result["fallback_to_search_roots"] = True
+        result["searched_roots"] = searched_roots
+    if not recursive and skipped_subdirs and not truncated:
+        notes.append(
+            f"{skipped_subdirs} subdirector"
+            f"{'y' if skipped_subdirs == 1 else 'ies'} not scanned; "
+            f"pass recursive=True to descend into them."
+        )
+    if notes:
+        result["notes"] = notes
+    return result
 
 
 @mcp.resource("ida://databases")
@@ -1492,6 +1952,22 @@ def main() -> None:
         default=_env_int("IDA_MCP_MAX_WORKERS", 4),
         help="Maximum simultaneous idalib worker databases (0 = unlimited, default: 4).",
     )
+    parser.add_argument(
+        "--search-root",
+        action="append",
+        default=[],
+        metavar="DIR",
+        help=(
+            "Absolute directory to pre-scan at startup. Every PE image found is "
+            "registered in the alias registry so clients can call idb_open(filename) "
+            "without knowing the server-side absolute path. Repeatable."
+        ),
+    )
+    parser.add_argument(
+        "--search-root-recursive",
+        action="store_true",
+        help="Walk --search-root directories recursively. Off by default.",
+    )
     parser.add_argument("input_path", type=Path, nargs="?", help="Optional binary to open on startup.")
     args = parser.parse_args()
 
@@ -1512,6 +1988,17 @@ def main() -> None:
         worker_args=worker_args,
     )
     mcp.registry.dispatch = dispatch_supervisor
+
+    if args.search_root:
+        summary = supervisor.paths.prepopulate_aliases(
+            [str(r) for r in args.search_root],
+            recursive=args.search_root_recursive,
+        )
+        for root, info in summary.items():
+            if info.get("error"):
+                logger.warning("--search-root %s skipped: %s", root, info["error"])
+            else:
+                logger.info("--search-root %s: registered %d PE image(s)", root, info["count"])
 
     if args.input_path is not None:
         try:
