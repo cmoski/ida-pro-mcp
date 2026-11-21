@@ -29,6 +29,7 @@ from ..api_types import (
 TEST_STRUCT_NAME = "__TestStruct__"
 NAME_RESOLUTION_STRUCT = "__NameResolutionTest__"
 CRACKME_DSO_HANDLE = "0x4008"
+CRACKME_CHECK_PW = "0x11a9"
 TYPE_APPLY_SIGNATURE = "int"
 TYPED_FIXTURE_SUM_POINT = "0x1013c10"
 TYPED_FIXTURE_USE_WRAPPER = "0x1013dc0"
@@ -88,6 +89,32 @@ def test_declare_type_invalid_declaration():
     result = declare_type("struct broken { int x }")
     assert_is_list(result, min_length=1)
     assert_error(result[0], contains="Failed to parse")
+
+
+@test()
+def test_declare_type_uses_default_struct_packing():
+    """declare_type does not force #pragma pack(2) onto parsed structs."""
+    import ida_typeinf
+
+    decl = "struct __DefaultPackTest__ { char a; int b; };"
+    expected = ida_typeinf.tinfo_t()
+    assert (
+        ida_typeinf.parse_decl(
+            expected, None, decl, ida_typeinf.PT_SIL | ida_typeinf.PT_TYP
+        )
+        is not None
+    )
+
+    result = declare_type(decl)
+    assert_is_list(result, min_length=1)
+    assert_ok(result[0])
+
+    actual = ida_typeinf.tinfo_t()
+    assert actual.get_named_type(None, "__DefaultPackTest__")
+    udt = ida_typeinf.udt_type_data_t()
+    assert actual.get_udt_details(udt)
+    assert udt.pack == 0
+    assert actual.get_size() == expected.get_size()
 
 
 @test()
@@ -302,6 +329,15 @@ def test_type_query():
         assert "kind" in page["data"][0]
 
 
+@test(binary="typed_fixture.elf")
+def test_type_query_count_zero_returns_all():
+    """count=0 returns every type, as the schema documents."""
+    page = type_query({"count": 0, "include_decl": False})[0]
+    assert page["total"] > 100
+    assert len(page["data"]) == page["total"]
+    assert page["next_offset"] is None
+
+
 @test()
 def test_type_inspect():
     """type_inspect returns metadata for declared struct"""
@@ -455,6 +491,29 @@ def test_set_type_function_not_found_branch():
 
 
 @test(binary="crackme03.elf")
+def test_set_type_function_undefined_referenced_type():
+    """set_type(kind=function) explains apply failures for undeclared referenced types."""
+    result = set_type(
+        {
+            "addr": CRACKME_CHECK_PW,
+            "kind": "function",
+            "signature": "UndefinedStruct __fastcall check_pw(const char *s)",
+        }
+    )
+    assert_is_list(result, min_length=1)
+    entry = result[0]
+    if entry.get("ok"):
+        skip_test("IDA accepted an undefined referenced type in this environment")
+    assert_error(entry)
+    assert entry["error"] != "Failed to apply function type"
+    assert (
+        "declared" in entry["error"].lower()
+        or "parse" in entry["error"].lower()
+        or "function type" in entry["error"].lower()
+    )
+
+
+@test(binary="crackme03.elf")
 def test_set_type_stack_missing_member():
     """set_type(kind=stack) reports a missing frame member explicitly."""
     fn_addr = get_named_address("main")
@@ -533,7 +592,8 @@ def test_set_type_local_branch():
     assert_is_list(result, min_length=1)
     assert (
         "error" not in result[0]
-        or result[0].get("error") == "Failed to apply local variable type"
+        or result[0].get("ok") is True
+        or "Failed to apply type" in (result[0].get("error") or "")
     )
 
 

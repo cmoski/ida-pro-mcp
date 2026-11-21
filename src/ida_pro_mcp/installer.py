@@ -103,6 +103,14 @@ def copy_python_env(env: dict[str, str]):
     return result
 
 
+def _transport_authority(host: str, port: int) -> str:
+    # urlparse() strips the brackets from an IPv6 literal, and an unbracketed
+    # IPv6 address is not a valid URL authority: "http://::1:13337/mcp".
+    if ":" in host:
+        return f"[{host}]:{port}"
+    return f"{host}:{port}"
+
+
 def normalize_transport_url(transport: str) -> str:
     url = urlparse(transport)
     if url.hostname is None or url.port is None:
@@ -110,12 +118,16 @@ def normalize_transport_url(transport: str) -> str:
     path = url.path or "/mcp"
     if path == "/":
         path = "/mcp"
-    return urlunparse((url.scheme, f"{url.hostname}:{url.port}", path, "", "", ""))
+    return urlunparse(
+        (url.scheme, _transport_authority(url.hostname, url.port), path, "", "", "")
+    )
 
 
 def force_mcp_path(transport_url: str) -> str:
     url = urlparse(transport_url)
-    return urlunparse((url.scheme, f"{url.hostname}:{url.port}", "/mcp", "", "", ""))
+    return urlunparse(
+        (url.scheme, _transport_authority(url.hostname, url.port), "/mcp", "", "", "")
+    )
 
 
 def infer_http_transport_type(transport_url: str) -> str:
@@ -147,9 +159,9 @@ def generate_mcp_config(*, client_name: str, transport: str = "stdio"):
         return mcp_config
 
     if transport == "streamable-http":
-        transport = f"http://{IDA_HOST}:{IDA_PORT}/mcp"
+        transport = f"http://{_transport_authority(IDA_HOST, IDA_PORT)}/mcp"
     elif transport == "sse":
-        transport = f"http://{IDA_HOST}:{IDA_PORT}/sse"
+        transport = f"http://{_transport_authority(IDA_HOST, IDA_PORT)}/sse"
 
     transport_url = normalize_transport_url(transport)
     if client_name == "Opencode":
@@ -184,7 +196,9 @@ def print_mcp_config():
                 "mcpServers": {
                     MCP_SERVER_NAME: generate_mcp_config(
                         client_name="Generic",
-                        transport=f"http://{IDA_HOST}:{IDA_PORT}/mcp",
+                        transport=(
+                            f"http://{_transport_authority(IDA_HOST, IDA_PORT)}/mcp"
+                        ),
                     )
                 }
             },
@@ -198,7 +212,9 @@ def print_mcp_config():
                 "mcpServers": {
                     MCP_SERVER_NAME: generate_mcp_config(
                         client_name="Generic",
-                        transport=f"http://{IDA_HOST}:{IDA_PORT}/sse",
+                        transport=(
+                            f"http://{_transport_authority(IDA_HOST, IDA_PORT)}/sse"
+                        ),
                     )
                 }
             },
@@ -269,19 +285,36 @@ def _get_mcp_servers_view(
 
 
 def _resolve_client_targets(
-    configs: dict[str, tuple[str, str]], only: list[str] | None
+    configs: dict[str, tuple[str, str]],
+    only: list[str] | None,
+    *,
+    project: bool,
 ) -> dict[str, tuple[str, str]]:
     if only is None:
         return configs
 
     available = list(configs.keys())
+    other_scope_configs = (
+        get_global_configs() if project else get_project_configs(os.getcwd())
+    )
+    other_scope_name = "global" if project else "project"
     filtered: dict[str, tuple[str, str]] = {}
     for target_name in only:
         resolved = resolve_client_name(target_name, available)
         if resolved is None:
-            print(
-                f"Unknown client: '{target_name}'. Use --list-clients to see available targets."
+            other_scope_match = resolve_client_name(
+                target_name, list(other_scope_configs.keys())
             )
+            if other_scope_match is not None:
+                print(
+                    f"Client '{other_scope_match}' is not supported for "
+                    f"--scope {'project' if project else 'global'}. "
+                    f"Use --scope {other_scope_name} for this target."
+                )
+            else:
+                print(
+                    f"Unknown client: '{target_name}'. Use --list-clients to see available targets."
+                )
         elif resolved not in filtered:
             filtered[resolved] = configs[resolved]
     return filtered
@@ -345,7 +378,7 @@ def install_mcp_servers(
         print(f"Unsupported platform: {sys.platform}")
         return
 
-    configs = _resolve_client_targets(configs, only)
+    configs = _resolve_client_targets(configs, only, project=project)
     if not configs:
         return
 
@@ -459,7 +492,7 @@ def install_ida_plugin(
     *, uninstall: bool = False, quiet: bool = False, allow_ida_free: bool = False
 ):
     ida_folder = _get_ida_user_dir()
-    if not allow_ida_free:
+    if not allow_ida_free and not uninstall:
         free_licenses = glob.glob(os.path.join(ida_folder, "idafree_*.hexlic"))
         if free_licenses:
             print(

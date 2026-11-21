@@ -6,7 +6,9 @@ import sys
 import threading
 import time
 import idaapi
+import ida_kernwin
 import idc
+from .mainthread import PumpBusyError, get_pump
 from .rpc import McpToolError
 from .inflight import inflight_enter, inflight_exit, inflight_snapshot  # noqa: F401
 from .zeromcp.jsonrpc import get_current_cancel_event, RequestCancelledError
@@ -44,6 +46,26 @@ _TOOL_TIMEOUT_ENV = "IDA_MCP_TOOL_TIMEOUT_SEC"
 # fast. A 30s ceiling surfaces a clean server-side timeout before a typical
 # ~30s MCP-client request timeout HTTP-hangs the caller.
 _DEFAULT_TOOL_TIMEOUT_SEC = 30.0
+# Waiters allow a bit more than the tool's own timeout, so a tool that times
+# out reports its own error rather than a generic busy one.
+_PUMP_WAIT_SLACK_SEC = 30.0
+
+
+# Thread-local: while a synchronized tool body is running, holds the monotonic
+# deadline (or None if no timeout). Tools can read this to self-monitor and
+# return partial results gracefully — useful when sync.py's Timer-fired
+# set_cancelled mechanism races with GIL contention on tight loops.
+_deadline_state = threading.local()
+
+
+def get_tool_deadline() -> float | None:
+    """Return the monotonic deadline for the current tool call, or None.
+
+    Only meaningful inside an @idasync function body. Tools that walk
+    large structures can check `time.monotonic() >= get_tool_deadline()`
+    to bail cleanly without depending on the global cancel flag.
+    """
+    return getattr(_deadline_state, "deadline", None)
 
 
 def _get_tool_timeout_seconds() -> float:
@@ -120,8 +142,15 @@ def _sync_wrapper(ff, keep_batch=False):
                 last_func_name = call_stack.get_nowait()
             except queue.Empty:
                 last_func_name = "<empty>"
-            error_str = f"Call stack is not empty while calling the function {ff.__name__} from {last_func_name}"
-            raise IDASyncError(error_str)
+            # Hand the error back through res_container rather than raising.
+            # execute_sync() discards exceptions escaping the callback, so a
+            # raise here leaves res_container empty and the requesting thread
+            # blocked forever on the res_container.get() below (issue #217).
+            res_container.put(IDASyncError(
+                f"Call stack is not empty while calling the function "
+                f"{ff.__name__} from {last_func_name}"
+            ))
+            return
 
         call_stack.put((ff.__name__))
         # Enable batch mode for all synchronized operations
@@ -164,16 +193,22 @@ def _normalize_timeout(value: object) -> float | None:
 
 
 def sync_wrapper(
-    ff, timeout_override: float | None = None, keep_batch: bool = False
+    ff,
+    timeout_override: float | None = None,
+    keep_batch: bool = False,
+    cancel_event: "threading.Event | None" = None,
 ):
     """Wrapper to enable timeout and cancellation during IDA synchronization.
 
     Note: Batch mode is now handled in _sync_wrapper to ensure it's always
     applied consistently for all synchronized operations. Pass keep_batch=True
     to opt out of the post-call batch restore (see _sync_wrapper docstring).
+
+    `cancel_event` is passed explicitly when the body runs on the main-thread
+    pump rather than the requesting thread, where the thread-local is absent.
     """
-    # Capture cancel event from thread-local before execute_sync
-    cancel_event = get_current_cancel_event()
+    if cancel_event is None:
+        cancel_event = get_current_cancel_event()
 
     # Precedence: per-thread override (async job) > @tool_timeout attr > env default.
     thread_override = get_thread_timeout_override()
@@ -194,19 +229,56 @@ def sync_wrapper(
                 # not when the request was queued (avoids stale deadlines)
                 deadline = time.monotonic() + timeout if timeout > 0 else None
 
+                # Native cancellation: clear any stale flag and schedule a
+                # set_cancelled() at the deadline. Many IDA SDK calls
+                # (ida_search.find_*, ida_bytes.find_bytes/bin_search,
+                # ida_hexrays.decompile*, ida_strlist.build_strlist,
+                # ida_auto.auto_wait) poll user_cancelled() and bail with
+                # BADADDR / MERR_CANCELED within one poll cycle, freeing the
+                # main thread instead of running to natural completion.
+                # set_cancelled() is THREAD_SAFE so firing it from a Timer
+                # thread is safe.
+                ida_kernwin.clr_cancelled()
+                cancel_fired_at: list[float | None] = [None]
+                native_timer: threading.Timer | None = None
+                if deadline is not None:
+                    def _fire_native_cancel():
+                        cancel_fired_at[0] = time.monotonic()
+                        ida_kernwin.set_cancelled()
+                    native_timer = threading.Timer(timeout, _fire_native_cancel)
+                    native_timer.daemon = True
+                    native_timer.start()
+
                 def profilefunc(frame, event, arg):
-                    # Check cancellation first (higher priority)
+                    # Check request-level cancellation first (higher priority)
                     if cancel_event is not None and cancel_event.is_set():
                         raise CancelledError("Request was cancelled")
+                    # If native cancel just fired, give the tool a short grace
+                    # period to format a partial response rather than racing the
+                    # IDASyncError. Beyond that we still raise to bound the
+                    # response time.
+                    fired_at = cancel_fired_at[0]
+                    if fired_at is not None and time.monotonic() < fired_at + 5.0:
+                        return
                     if deadline is not None and time.monotonic() >= deadline:
                         raise IDASyncError(f"Tool timed out after {timeout:.2f}s")
 
+                # Expose the deadline so tool bodies can self-monitor and
+                # return partial results gracefully (independent of the Timer).
+                _deadline_state.deadline = deadline
                 old_profile = sys.getprofile()
                 sys.setprofile(profilefunc)
                 try:
                     return ff()
                 finally:
                     sys.setprofile(old_profile)
+                    if native_timer is not None:
+                        native_timer.cancel()
+                    # Sticky flag: clear unconditionally so the next tool starts
+                    # with a clean state. Without this, every subsequent
+                    # user_cancelled() returns True forever.
+                    ida_kernwin.clr_cancelled()
+                    _deadline_state.deadline = None
 
             timed_ff.__name__ = ff.__name__
             return _sync_wrapper(timed_ff, keep_batch=keep_batch)
@@ -232,7 +304,41 @@ def idasync(f):
             getattr(f, "__ida_mcp_timeout_sec__", None)
         )
         keep_batch = bool(getattr(f, "__ida_mcp_keep_batch__", False))
-        return sync_wrapper(ff, timeout_override, keep_batch=keep_batch)
+
+        pump = get_pump()
+        if not pump.active or pump.on_main_thread():
+            return sync_wrapper(ff, timeout_override, keep_batch=keep_batch)
+
+        # Headless: IDA only runs on the pump thread, so hand the whole
+        # synchronized body over and wait for it there.
+        cancel_event = get_current_cancel_event()
+        # An async job's per-thread override lives on *this* thread; carry it
+        # over to the pump thread explicitly.
+        thread_override = get_thread_timeout_override()
+        effective_override = (
+            thread_override if thread_override is not None else timeout_override
+        )
+        timeout = effective_override
+        if timeout is None:
+            timeout = _get_tool_timeout_seconds()
+
+        def _run_on_pump():
+            set_thread_timeout_override(thread_override)
+            try:
+                return sync_wrapper(
+                    ff, timeout_override, keep_batch=keep_batch, cancel_event=cancel_event
+                )
+            finally:
+                set_thread_timeout_override(None)
+
+        try:
+            return pump.submit(
+                _run_on_pump,
+                label=f.__name__,
+                timeout=(timeout + _PUMP_WAIT_SLACK_SEC) if timeout > 0 else None,
+            )
+        except PumpBusyError as e:
+            raise IDAError(str(e)) from None
 
     return wrapper
 

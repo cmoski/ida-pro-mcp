@@ -49,9 +49,25 @@ def test_decompile_valid_function():
         skip_test("binary has no functions")
 
     result = decompile(fn_addr)
-    assert_shape(result, {"addr": str, "code": optional(str), "error": optional(str)})
+    assert_shape(
+        result,
+        {
+            "addr": str,
+            "code": optional(str),
+            "line_count": optional(int),
+            "total_lines": optional(int),
+            "truncated": optional(bool),
+            "cursor": optional(dict),
+            "refs": optional(list),
+            "refs_truncated": optional(bool),
+            "error": optional(str),
+        },
+    )
     assert_ok(result, "code")
     assert_non_empty(result["code"])
+    assert result["line_count"] == len(result["code"].split("\n"))
+    assert result["total_lines"] >= result["line_count"]
+    assert "done" in result["cursor"] or "next" in result["cursor"]
 
 
 @test(binary="crackme03.elf")
@@ -70,7 +86,7 @@ def test_decompile_invalid_address():
     """decompile reports an error for an unmapped address."""
     result = decompile(get_unmapped_address())
     assert result["code"] is None
-    assert_error(result)
+    assert_error(result, contains="Decompilation failed")
 
 
 @test()
@@ -119,6 +135,50 @@ def test_decompile_include_addresses_false_strips_markers():
     result = decompile("main", include_addresses=False)
     assert_ok(result, "code")
     assert "/*0x" not in result["code"]
+
+
+@test()
+def test_decompile_pagination():
+    """decompile enforces max_lines and advances the cursor across pages."""
+    fn_addr = get_any_function()
+    if not fn_addr:
+        skip_test("binary has no functions")
+
+    full = decompile(fn_addr, max_lines=5000)
+    assert_ok(full, "code")
+    total = full["total_lines"]
+    if total < 6:
+        skip_test("function has fewer than 6 pseudocode lines")
+
+    page1 = decompile(fn_addr, max_lines=3)
+    assert_ok(page1, "code")
+    assert page1["line_count"] == 3
+    assert page1["total_lines"] == total
+    assert page1["truncated"] is True
+    assert "next" in page1["cursor"]
+    assert page1["code"] == "\n".join(full["code"].split("\n")[:3])
+
+    page2 = decompile(fn_addr, max_lines=3, offset=page1["cursor"]["next"])
+    assert_ok(page2, "code")
+    assert page2["line_count"] <= 3
+    assert page2["code"] != page1["code"]
+    assert page2["code"] == "\n".join(full["code"].split("\n")[3 : 3 + page2["line_count"]])
+
+
+@test(binary="crackme03.elf")
+def test_decompile_refs_only_on_first_page():
+    """Refs are attached on offset=0 and omitted on later pages."""
+    first = decompile(CRACKME_MAIN, max_lines=2, offset=0)
+    assert_ok(first, "code")
+    assert first.get("refs"), "expected refs on first page"
+
+    nxt = first["cursor"].get("next")
+    if nxt is None:
+        skip_test("main has fewer than 3 pseudocode lines")
+
+    later = decompile(CRACKME_MAIN, max_lines=2, offset=nxt)
+    assert_ok(later, "code")
+    assert "refs" not in later
 
 
 @test()
@@ -438,12 +498,47 @@ def test_xrefs_to_by_name():
 
 @test()
 def test_xrefs_to_invalid():
-    """xrefs_to reports an error or empty xrefs for an invalid address."""
+    """xrefs_to reports an error for an unmapped address."""
     result = xrefs_to(get_unmapped_address())
     assert_is_list(result, min_length=1)
     assert result[0]["addr"] == get_unmapped_address()
-    if result[0].get("xrefs") is None:
-        assert_error(result[0])
+    assert result[0].get("xrefs") is None
+    assert_error(result[0], contains="Address not mapped")
+
+
+def _find_address_without_xrefs() -> str | None:
+    """Return a mapped address with no incoming xrefs, if one exists."""
+    import ida_bytes
+    import idaapi
+    import idautils
+
+    for seg_ea in idautils.Segments():
+        seg = idaapi.getseg(seg_ea)
+        if seg is None:
+            continue
+        for head in idautils.Heads(seg.start_ea, min(seg.end_ea, seg.start_ea + 0x4000)):
+            if not ida_bytes.is_mapped(head):
+                continue
+            if not any(True for _ in idautils.XrefsTo(head)):
+                return hex(head)
+    return None
+
+
+@test()
+def test_xrefs_to_zero_xrefs_message():
+    """xrefs_to explains when a mapped address has no incoming xrefs."""
+    addr = _find_address_without_xrefs()
+    if addr is None:
+        skip_test("binary has no mapped address without incoming xrefs")
+
+    result = xrefs_to(addr)
+    assert_is_list(result, min_length=1)
+    entry = result[0]
+    assert entry["addr"] == addr
+    assert entry.get("error") in (None, "")
+    assert entry.get("xref_count") == 0
+    assert entry.get("xrefs") == []
+    assert "No cross-references" in (entry.get("message") or "")
 
 
 @test()
@@ -492,6 +587,16 @@ def test_insn_query_requires_scope_by_default():
     result = insn_query({"mnem": "call"})
     assert_is_list(result, min_length=1)
     assert result[0].get("error") is not None
+
+
+@test(binary="crackme03.elf")
+def test_insn_query_sign_extended_dword_operand():
+    """insn_query matches a dword immediate by its 32-bit or signed value."""
+    for op1 in ("0xffffffff", "-1", "0xffffffffffffffff"):
+        result = insn_query({"func": CRACKME_MAIN, "mnem": "mov", "op1": op1})
+        assert_is_list(result, min_length=1)
+        addrs = [m["addr"] for m in result[0]["matches"]]
+        assert "0x1275" in addrs, (op1, addrs)
 
 
 # ============================================================================
@@ -635,6 +740,29 @@ def test_find_immediate_out_of_range():
     result = find("immediate", str(1 << 80))
     assert_is_list(result, min_length=1)
     assert_error(result[0], contains="Immediate out of range")
+
+
+@test(binary="crackme03.elf")
+def test_find_immediate_sign_extended_dword():
+    """find(immediate, ...) matches `mov eax, 0FFFFFFFFh` however the value is spelled."""
+    for target in ("0xffffffff", "-1", "0xffffffffffffffff"):
+        result = find("immediate", target)
+        assert_is_list(result, min_length=1)
+        assert result[0]["error"] is None, target
+        assert result[0]["matches"] == ["0x1275"], (target, result[0]["matches"])
+
+
+@test(binary="typed_fixture.elf")
+def test_find_immediate_reports_instruction_start():
+    """find(immediate, ...) reports where the instruction starts, not a byte inside it."""
+    import ida_bytes
+
+    for target in ("0x100", "-0xb0"):
+        matches = find("immediate", target)[0]["matches"]
+        assert_non_empty(matches)
+        for addr in matches:
+            ea = int(addr, 16)
+            assert ida_bytes.get_item_head(ea) == ea, (target, addr)
 
 
 @test()

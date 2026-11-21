@@ -14,7 +14,6 @@ import importlib.util
 import json
 import logging
 import os
-import shutil
 import signal
 import socket
 import subprocess
@@ -24,52 +23,76 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from threading import RLock, Thread
-from typing import Annotated, Any, NotRequired, Optional, TypedDict
+from threading import RLock
+from typing import Annotated, Any, TypedDict
 
 
 logger = logging.getLogger(__name__)
 
-STDIO_DEFAULT_CONTEXT_ID = "stdio:default"
-SHARED_FALLBACK_CONTEXT_ID = "shared:fallback"
 _DATABASE_ARG = "database"
 _DATABASE_ARG_SCHEMA = {
     "type": "string",
     "description": (
-        "Database/session to route this call to. Accepts a session_id, filename, "
-        "or input path. If omitted, uses the database bound to the current MCP context."
+        "Session ID returned by idb_open. Use idb_list to enumerate "
+        "open sessions."
     ),
 }
+_DATABASE_REQUIRED_ERROR = (
+    "database is required. Pass database=<session_id> with every tool call. "
+    "Open a session with idb_open or enumerate with idb_list."
+)
 
-IDALIB_MANAGEMENT_TOOLS = {
-    "idalib_open",
-    "idalib_close",
-    "idalib_switch",
-    "idalib_unbind",
-    "idalib_list",
-    "idalib_current",
-    "idalib_save",
-    "idalib_health",
-    "idalib_warmup",
-    "idalib_aliases",
-    "idalib_search_roots",
-    "idalib_restart_worker",
-    "list_pe_images",
+IDB_OPEN_MODES = {
+    "prefer_headless",
+    "force_headless",
+    "prefer_gui",
+    "force_gui",
 }
-IDALIB_HIDDEN_PLUGIN_TOOLS = {"list_instances", "select_instance"}
-STDIO_PROXY_START_TIMEOUT_SEC = 120.0
-STDIO_PROXY_PROBE_SESSION_ID = "idalib-stdio-proxy-probe"
 
-# Bounded supervisor -> worker HTTP timeouts. Without these, a wedged worker
-# blocks the supervisor request thread forever. Ordinary tool calls get a
-# generous cap (they may legitimately run minutes of analysis); probe-style
-# calls get short timeouts so the supervisor can always answer "is this worker
-# wedged?" quickly instead of hanging behind the wedge.
-_DEFAULT_WORKER_TOOL_TIMEOUT_SEC = 300.0
-# Total budget for workers to save their databases on supervisor shutdown.
-_SHUTDOWN_SAVE_TIMEOUT_SEC = 30.0
-_PROBE_WORKER_TIMEOUT_SEC = 5.0
-_WARMUP_WORKER_TIMEOUT_SEC = 180.0
+IDB_MANAGEMENT_TOOLS = {
+    "idb_open",
+    "idb_list",
+    "idb_close",
+}
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, "").strip() or default)
+    except ValueError:
+        return default
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, "").strip() or default)
+    except ValueError:
+        return default
+
+
+# A worker cannot answer a ping while a tool occupies its IDA main thread, so
+# probing must separate "process gone" (reap) from "alive but busy" (wait).
+WORKER_TCP_HEALTH_TIMEOUT_SEC = _env_float("IDA_MCP_HEALTH_TCP_TIMEOUT", 2.0)
+WORKER_RPC_HEALTH_TIMEOUT_SEC = _env_float("IDA_MCP_HEALTH_RPC_TIMEOUT", 10.0)
+WORKER_QUICK_TCP_TIMEOUT_SEC = 0.5
+WORKER_QUICK_RPC_TIMEOUT_SEC = 2.0
+WORKER_HEALTH_RETRIES = int(_env_float("IDA_MCP_HEALTH_RETRIES", 3))
+WORKER_HEALTH_RETRY_BACKOFF_SEC = _env_float("IDA_MCP_HEALTH_RETRY_BACKOFF", 1.0)
+# How long a live-but-silent worker is tolerated before counting as wedged.
+# Generous: analysing a large database legitimately takes a while. 0 disables.
+WORKER_WEDGED_GRACE_SEC = _env_float("IDA_MCP_WEDGED_GRACE_SEC", 1800.0)
+# Backstop on a forwarded tools/call; the worker has its own per-tool
+# timeouts. 0 waits indefinitely.
+WORKER_CALL_TIMEOUT_SEC = _env_float("IDA_MCP_WORKER_CALL_TIMEOUT", 900.0)
+
+PARTIAL_DATABASE_EXTENSIONS = (".id0", ".id1", ".id2", ".nam", ".til")
+
+# Upper bound (seconds) on how long a worker may take to open and auto-analyze a
+# binary before it is reaped and an error is returned. A malformed or hostile
+# binary can drive IDA's auto-analysis into an effectively unbounded loop; with
+# no limit this silently wedges the worker process (and the blocking supervisor
+# RPC waiting on it) forever, with no progress feedback and no recovery.
+# Set IDA_MCP_OPEN_TIMEOUT=0 to wait indefinitely (previous behavior).
+WORKER_OPEN_TIMEOUT_SEC = _env_float("IDA_MCP_OPEN_TIMEOUT", 1800.0)
 
 
 def _import_zeromcp():
@@ -102,15 +125,13 @@ def _import_discovery():
 _discovery = _import_discovery()
 
 
-class IdalibContextFields(TypedDict, total=False):
-    # total=False rather than NotRequired[...]: this module uses
-    # `from __future__ import annotations`, under which TypedDict sees these
-    # annotations as plain strings and counts NotRequired keys as required.
-    # That made every error return that omits them fail output-schema
-    # validation, replacing the actual error text with a validation dump.
-    context_id: str
-    transport_context_id: str | None
-    isolated_contexts: bool
+def _discovered_instance_backend(instance: dict[str, Any]) -> str:
+    backend = instance.get("backend")
+    if backend == "worker":
+        return "worker"
+    if backend == "gui":
+        return "gui"
+    return "gui"
 
 
 class IdalibSessionInfo(TypedDict):
@@ -125,152 +146,37 @@ class IdalibSessionInfo(TypedDict):
 
 class IdalibSessionListInfo(IdalibSessionInfo, total=False):
     is_active: bool
-    is_current_context: bool
-    bound_contexts: int
+    busy: bool
     backend: str
     owned: bool
+    adopted: bool
     pid: int | None
     worker_pid: int | None
 
 
-class IdalibOpenCandidate(TypedDict, total=False):
-    # A possible match returned when an open request is ambiguous (duplicate
-    # filenames). sha256/md5 let the caller verify which copy is which; pass a
-    # longer trailing path slice back to idalib_open to disambiguate.
-    path: str
-    filename: str
-    sha256: str
-    md5: str
-    error: str
-
-
-class IdalibOpenResult(IdalibContextFields, total=False):
+class IdalibOpenResult(TypedDict, total=False):
     success: bool
     session: IdalibSessionInfo
+    warmup: dict[str, Any] | None
     message: str
     error: str
-    notes: list[str]
-    # set_bitness report, present when bitness/processor were requested.
-    load_fixup: dict[str, Any]
-    # SHA-256 + MD5 of the binary that was opened, for caller-side verification.
-    sha256: str
-    md5: str
-    # Populated on a failed resolve so the caller can self-correct in one step:
-    # `candidates` when the filename was ambiguous, `suggestions` (near filenames)
-    # when nothing matched.
-    candidates: list[IdalibOpenCandidate]
-    suggestions: list[str]
+
+
+class IdalibListResult(TypedDict, total=False):
+    sessions: list[IdalibSessionListInfo]
+    count: int
+    error: str
 
 
 class IdalibCloseResult(TypedDict, total=False):
     success: bool
-    message: str
-    error: str
-
-
-class IdalibSwitchResult(IdalibContextFields, total=False):
-    success: bool
-    session: IdalibSessionInfo
-    message: str
-    error: str
-
-
-class IdalibUnbindResult(IdalibContextFields, total=False):
-    success: bool
-    message: str
-    error: str
-
-
-class IdalibListResult(IdalibContextFields, total=False):
-    sessions: list[IdalibSessionListInfo]
-    count: int
-    current_context_session_id: str | None
-    error: str
-
-
-class IdalibCurrentResult(IdalibContextFields, total=False):
     session_id: str
-    input_path: str
-    filename: str
-    created_at: str
-    last_accessed: str
-    is_analyzing: bool
-    metadata: dict[str, Any]
+    backend: str
+    owned: bool
+    saved: bool | None
+    save_error: str
+    message: str
     error: str
-
-
-class IdalibSaveResult(IdalibContextFields, total=False):
-    ok: bool
-    path: str
-    error: str | None
-
-
-class IdalibHealthResult(IdalibContextFields, total=False):
-    ready: bool
-    session: IdalibSessionInfo | None
-    health: dict[str, Any] | None
-    error: str | None
-    # Liveness fields from the non-blocking server_liveness probe. These answer
-    # even when the worker is busy, distinguishing "alive but busy" (alive=True,
-    # busy=True, inflight_*) from "wedged/dead" (alive=False).
-    alive: bool
-    busy: bool
-    inflight_tool: str | None
-    inflight_seconds: float
-    inflight_depth: int
-
-
-class IdalibWarmupResult(IdalibContextFields, total=False):
-    ready: bool
-    session: IdalibSessionInfo | None
-    warmup: dict[str, Any] | None
-    error: str | None
-
-
-class PeImageInfo(TypedDict):
-    path: str
-    filename: str
-    size: int
-    mtime: str
-    # Detected container format: PE, NE, LE, LX, MZ, ELF, MACHO or RAW. Only PE
-    # entries are listed unless the scan passes include_non_pe=True.
-    format: str
-    sha1: str  # empty string when hash=False
-    crc32: str  # empty string when hash=False
-    machine: str
-    arch: str
-    bitness: int | None
-    characteristics: str
-    is_executable_image: bool
-    is_dll: bool
-    is_system: bool
-    loaded: bool
-    session_id: str | None
-    # Empty string for normal scans; set to the configured --search-root path
-    # this entry came from when list_pe_images fell back because the caller's
-    # requested directory wasn't reachable from the server.
-    source_root: str
-
-
-class PeImageError(TypedDict):
-    path: str
-    error: str
-
-
-class ListPeImagesResult(TypedDict, total=False):
-    directory: str
-    recursive: bool
-    count: int
-    images: list[PeImageInfo]
-    errors: list[PeImageError]
-    truncated: bool
-    limit_hit: str
-    error: str
-    # Populated when the requested directory was not reachable but the
-    # supervisor served the call from --search-root pre-configured directories.
-    fallback_to_search_roots: bool
-    searched_roots: list[str]
-    notes: list[str]
 
 
 @dataclass
@@ -288,6 +194,8 @@ class WorkerSession:
     backend: str = "worker"
     owned: bool = True
     pid: int | None = None
+    last_warmup: dict[str, Any] | None = None
+    unresponsive_since: float | None = None
 
     def to_dict(self) -> IdalibSessionInfo:
         return {
@@ -300,15 +208,14 @@ class WorkerSession:
             "metadata": self.metadata,
         }
 
-    def to_list_dict(self, *, current: bool, bound_contexts: int) -> IdalibSessionListInfo:
+    def to_list_dict(self, *, active: bool | None = None) -> IdalibSessionListInfo:
         return {
             **self.to_dict(),
-            "is_active": self.is_alive(),
-            "is_current_context": current,
-            "bound_contexts": bound_contexts,
+            "is_active": self.is_alive() if active is None else active,
             "backend": self.backend,
             "owned": self.owned,
-            "pid": self.pid if self.pid is not None else (self.process.pid if self.process is not None else None),
+            "adopted": True,
+            "pid": self.pid,
             "worker_pid": self.process.pid if self.process is not None else None,
         }
 
@@ -326,415 +233,18 @@ class IdalibSupervisor:
         self,
         mcp: Any,
         *,
-        isolated_contexts: bool = False,
         max_workers: int = 4,
         worker_args: list[str] | None = None,
     ):
         self.mcp = mcp
-        self.isolated_contexts = isolated_contexts
         self.max_workers = max_workers
         self.worker_args = worker_args or []
         self.sessions: dict[str, WorkerSession] = {}
         self.path_to_session: dict[str, str] = {}
-        self.context_bindings: dict[str, str] = {}
-        # Filename -> absolute paths seen via list_pe_images. Lets callers open
-        # binaries by bare filename when their upstream safety layer rejects
-        # absolute paths, or when they don't know what paths the server uses.
-        self.alias_registry: dict[str, set[str]] = {}
-        # Directories pre-scanned at startup via --search-root (see main()).
-        # Recorded purely for introspection by idalib_search_roots(); the
-        # actual filename -> absolute path mappings live in alias_registry.
-        self.search_roots: list[str] = []
         self._schema_worker: WorkerSession | None = None
         self._tools_cache: dict[tuple[str, ...], list[dict]] = {}
         self._resources_cache: dict[str, list[dict]] = {}
         self._lock = RLock()
-
-    # ------------------------------------------------------------------
-    # Context helpers
-    # ------------------------------------------------------------------
-
-    def resolve_context_id(self) -> str:
-        transport_context_id = self.mcp.get_current_transport_session_id()
-        if self.isolated_contexts:
-            if transport_context_id is None:
-                raise RuntimeError(
-                    "No MCP transport context is active for this request. "
-                    "Use MCP initialize and send Mcp-Session-Id on /mcp requests."
-                )
-            return transport_context_id
-        return SHARED_FALLBACK_CONTEXT_ID
-
-    def context_fields(self, context_id: str) -> IdalibContextFields:
-        return {
-            "context_id": context_id,
-            "transport_context_id": self.mcp.get_current_transport_session_id(),
-            "isolated_contexts": self.isolated_contexts,
-        }
-
-    def bind_context(self, context_id: str, session_id: str) -> None:
-        self.context_bindings[context_id] = session_id
-
-    def unbind_context(self, context_id: str) -> bool:
-        return self.context_bindings.pop(context_id, None) is not None
-
-    # ------------------------------------------------------------------
-    # Alias registry — filename -> absolute paths seen via discovery
-    # ------------------------------------------------------------------
-
-    def record_aliases(self, filename_to_paths: dict[str, str]) -> None:
-        """Add (filename, absolute_path) pairs to the registry. Idempotent."""
-        with self._lock:
-            for name, path in filename_to_paths.items():
-                self.alias_registry.setdefault(name, set()).add(path)
-
-    def suggest_aliases(self, name: str, n: int = 3) -> list[str]:
-        """Return up to ``n`` registered filenames similar to ``name``.
-
-        Matching is case-insensitive and combines difflib ratio similarity with
-        a substring fallback so common casing/format variants surface even when
-        difflib's ratio is borderline. Order is best-match first, no duplicates.
-        """
-        import difflib
-
-        with self._lock:
-            registry_names = list(self.alias_registry.keys())
-        if not registry_names:
-            return []
-        norm = (name or "").lower()
-        if not norm:
-            return []
-        lower_to_orig: dict[str, str] = {}
-        for orig in registry_names:
-            lower_to_orig.setdefault(orig.lower(), orig)
-        result: list[str] = []
-        seen: set[str] = set()
-        for low in difflib.get_close_matches(
-            norm, list(lower_to_orig.keys()), n=n, cutoff=0.5
-        ):
-            orig = lower_to_orig[low]
-            if orig in seen:
-                continue
-            seen.add(orig)
-            result.append(orig)
-        if len(result) < n:
-            for orig in registry_names:
-                if orig in seen:
-                    continue
-                low = orig.lower()
-                if norm in low or low in norm:
-                    seen.add(orig)
-                    result.append(orig)
-                    if len(result) >= n:
-                        break
-        return result[:n]
-
-    def prepopulate_aliases(
-        self, roots: list[str], *, recursive: bool = False
-    ) -> dict[str, dict[str, Any]]:
-        """Scan each root for PE images and register them in alias_registry.
-
-        Used by ``main()`` to honor ``--search-root`` flags at startup so that
-        ``idalib_aliases()`` returns useful data before any client call. Each
-        root is summarized as ``{"count": int, "error": str | None}``. A failing
-        root does not abort the scan of others. Recorded roots are surfaced via
-        ``idalib_search_roots()`` for caller introspection.
-        """
-        summary: dict[str, dict[str, Any]] = {}
-        for raw_root in roots:
-            # Record every attempted root for introspection regardless of
-            # outcome -- operators want to see "you asked for this, here's
-            # what happened" via idalib_search_roots().
-            with self._lock:
-                if raw_root not in self.search_roots:
-                    self.search_roots.append(raw_root)
-            entry: dict[str, Any] = {"count": 0, "error": None}
-            root_path = Path(raw_root)
-            if not root_path.is_absolute():
-                entry["error"] = "not an absolute path"
-                summary[raw_root] = entry
-                continue
-            if not root_path.exists():
-                entry["error"] = "not found"
-                summary[raw_root] = entry
-                continue
-            if not root_path.is_dir():
-                entry["error"] = "not a directory"
-                summary[raw_root] = entry
-                continue
-            count = 0
-            try:
-                for full_path, st in _iter_candidate_files(
-                    root_path, recursive, lambda *_: None
-                ):
-                    try:
-                        with open(full_path, "rb") as fh:
-                            header = _parse_pe_header(fh, st.st_size)
-                    except OSError:
-                        continue
-                    if header is None:
-                        continue
-                    self.record_aliases({full_path.name: str(full_path)})
-                    count += 1
-            except Exception as e:
-                entry["error"] = f"{type(e).__name__}: {e}"
-            entry["count"] = count
-            summary[raw_root] = entry
-        return summary
-
-    def resolve_alias(
-        self, name_or_path: str, directory_hint: str | None = None
-    ) -> str | None:
-        """Resolve a bare filename to an absolute path via the alias registry.
-
-        - Returns the matching path on unique resolution.
-        - Returns None when no match is registered (caller falls back to its own logic).
-        - Raises RuntimeError when multiple paths share the filename and the caller
-          did not narrow with ``directory_hint``.
-        """
-        with self._lock:
-            paths = set(self.alias_registry.get(name_or_path) or ())
-        if not paths:
-            return None
-        if directory_hint:
-            try:
-                hint_key = os.path.normcase(str(Path(directory_hint).resolve()))
-            except Exception:
-                hint_key = os.path.normcase(directory_hint)
-            paths = {
-                p for p in paths if os.path.normcase(p).startswith(hint_key)
-            }
-            if not paths:
-                return None
-        if len(paths) == 1:
-            return next(iter(paths))
-        raise RuntimeError(
-            f"Ambiguous alias '{name_or_path}'; pass directory= to disambiguate. "
-            f"Candidates: {sorted(paths)}"
-        )
-
-    def _search_bases(
-        self, input_path: str, directory_hint: str | None
-    ) -> list[Path]:
-        """Existing directories to recurse when resolving a missing path.
-
-        Ordered by how targeted (and cheap to scan) each base is likely to be:
-        the directory hint, the operator-curated --search-roots, the parent
-        directories of open sessions, and -- LAST -- the nearest existing
-        ancestor of the requested path. The ancestor goes last on purpose: a
-        guessed path like C:\\Users\\me\\Desktop\\proj\\x.exe can have a huge
-        existing ancestor (the whole Desktop tree), which would otherwise starve
-        the curated roots where the file usually lives. Deduplicated; only
-        absolute, existing directories are returned.
-        """
-        bases: list[Path] = []
-        seen: set[str] = set()
-
-        def add(d: str | None) -> None:
-            if not d:
-                return
-            try:
-                rp = Path(d)
-            except Exception:
-                return
-            if not rp.is_absolute():
-                return
-            key = os.path.normcase(str(rp))
-            if key in seen:
-                return
-            try:
-                if rp.exists() and rp.is_dir():
-                    seen.add(key)
-                    bases.append(rp)
-            except OSError:
-                return
-
-        add(directory_hint)
-        with self._lock:
-            roots = list(self.search_roots)
-            session_paths = [
-                s.input_path for s in self.sessions.values() if s.input_path
-            ]
-        for r in roots:
-            add(r)
-        for sp in session_paths:
-            try:
-                add(str(Path(sp).parent))
-            except Exception:
-                pass
-        try:
-            for anc in Path(input_path).parents:
-                if anc.exists() and anc.is_dir():
-                    add(str(anc))
-                    break
-        except Exception:
-            pass
-        return bases
-
-    def _search_for_basename(
-        self,
-        basename: str,
-        input_path: str,
-        directory_hint: str | None,
-        *,
-        max_files: int = 5000,
-        time_budget_sec: float = 8.0,
-    ) -> list[str]:
-        """Bounded recursive on-disk search for files named ``basename``.
-
-        Walks _search_bases() recursively, registering every hit in the alias
-        registry so subsequent opens resolve instantly. Matching is
-        case-insensitive on the filename only (no PE filter) so non-PE targets
-        like 16-bit installers resolve too.
-
-        Each base gets its own slice of the file/time budget so a single huge
-        base can't starve the rest, and the search stops at the first base that
-        yields any match -- bases are ordered most-targeted-first, so this finds
-        the file in a curated --search-root without ever walking a giant ancestor
-        tree. Duplicate names within the winning base are all returned, leaving
-        disambiguation to resolve_open_target's suffix scoring.
-        """
-        target = basename.lower()
-        found: list[str] = []
-        seen_paths: set[str] = set()
-        bases = self._search_bases(input_path, directory_hint)
-        if not bases:
-            return found
-        global_deadline = (
-            time.monotonic() + time_budget_sec if time_budget_sec > 0 else None
-        )
-        # Fair share per base, with sensible floors so a small base still gets a
-        # real chance and a large one can't monopolize the whole budget.
-        per_base_files = max(1000, max_files // len(bases))
-        per_base_time = (
-            max(2.0, time_budget_sec / len(bases)) if time_budget_sec > 0 else 0.0
-        )
-        scanned_total = 0
-        for base in bases:
-            if global_deadline is not None and time.monotonic() >= global_deadline:
-                break
-            if scanned_total >= max_files:
-                break
-            base_scanned = 0
-            base_deadline = (
-                time.monotonic() + per_base_time if per_base_time > 0 else None
-            )
-            for full_path, _st in _iter_candidate_files(base, True, lambda *_: None):
-                scanned_total += 1
-                base_scanned += 1
-                if base_scanned > per_base_files or scanned_total > max_files:
-                    break
-                now = time.monotonic()
-                if base_deadline is not None and now >= base_deadline:
-                    break
-                if global_deadline is not None and now >= global_deadline:
-                    break
-                if full_path.name.lower() == target:
-                    key = os.path.normcase(str(full_path))
-                    if key not in seen_paths:
-                        seen_paths.add(key)
-                        found.append(str(full_path))
-            # First base with a hit wins -- don't walk lower-priority (broader) bases.
-            if found:
-                break
-        if found:
-            self.record_aliases({Path(p).name: p for p in found})
-        return found
-
-    def resolve_open_target(
-        self,
-        input_path: str,
-        directory_hint: str | None = None,
-        *,
-        allow_search: bool = True,
-    ) -> dict:
-        """Resolve ``input_path`` to a concrete file to open, decisively.
-
-        Designed so a client passing an imperfect path gets opened in ONE call
-        rather than looping. Returns a dict with ``status``:
-
-        - ``open``: ``path`` is the absolute file to open; ``how`` explains the match.
-        - ``ambiguous``: ``candidates`` are equally-good matches (duplicate
-          filenames) — the caller should re-call with more path components.
-        - ``miss``: nothing matched; ``suggestions`` are near filenames.
-
-        Match order: an existing absolute path wins outright; otherwise a unique
-        registered filename opens; otherwise, among duplicates, the candidate
-        sharing the most trailing path components with the query opens when it is
-        a clear winner (>= 2 components, e.g. ``system/Mplayer.dll``). A bare
-        filename shared by multiple paths stays ambiguous. When the filename is
-        unknown to the registry and ``allow_search`` is set, a bounded recursive
-        on-disk search runs first.
-        """
-        cand = Path(input_path)
-        if cand.is_absolute():
-            try:
-                if cand.exists() and cand.is_file():
-                    return {"status": "open", "path": str(cand), "how": "exact path"}
-            except OSError:
-                pass
-
-        basename = cand.name or input_path
-        query_parts = _path_components(input_path)
-
-        with self._lock:
-            paths = set(self.alias_registry.get(basename) or ())
-            if not paths:
-                lower = basename.lower()
-                for name, regpaths in self.alias_registry.items():
-                    if name.lower() == lower:
-                        paths |= set(regpaths)
-
-        searched = False
-        if not paths and allow_search:
-            searched = True
-            paths = set(self._search_for_basename(basename, input_path, directory_hint))
-
-        if not paths:
-            return {
-                "status": "miss",
-                "suggestions": self.suggest_aliases(basename),
-                "searched": searched,
-            }
-
-        if directory_hint:
-            try:
-                hint_key = os.path.normcase(str(Path(directory_hint).resolve()))
-            except Exception:
-                hint_key = os.path.normcase(directory_hint)
-            narrowed = {p for p in paths if os.path.normcase(p).startswith(hint_key)}
-            if narrowed:
-                paths = narrowed
-
-        ordered = sorted(paths)
-        if len(ordered) == 1:
-            return {
-                "status": "open",
-                "path": ordered[0],
-                "how": "on-disk search" if searched else "unique filename",
-                "searched": searched,
-            }
-
-        # Duplicate filenames: rank by trailing-path-component overlap so a query
-        # like 'system/Mplayer.dll' beats 'Programs/Mplayer.dll'.
-        scored = sorted(
-            ordered, key=lambda p: _suffix_match_len(query_parts, p), reverse=True
-        )
-        top = _suffix_match_len(query_parts, scored[0])
-        top_paths = [p for p in scored if _suffix_match_len(query_parts, p) == top]
-        if len(top_paths) == 1 and top >= 2:
-            return {
-                "status": "open",
-                "path": top_paths[0],
-                "how": f"matched {top} trailing path components",
-                "searched": searched,
-            }
-        return {
-            "status": "ambiguous",
-            "candidates": scored,
-            "how": "duplicate filename; re-call with more path components to disambiguate",
-            "searched": searched,
-        }
 
     # ------------------------------------------------------------------
     # Worker process lifecycle
@@ -758,11 +268,21 @@ class IdalibSupervisor:
             *self.worker_args,
         ]
         logger.info("Spawning idalib worker on 127.0.0.1:%d", port)
+        # Detach so the worker survives this supervisor's exit: on Windows
+        # spawn in a new process group; on Unix put it in its own session.
+        creationflags = 0
+        start_new_session = False
+        if os.name == "nt":
+            creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        else:
+            start_new_session = True
         process = subprocess.Popen(
             cmd,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
+            creationflags=creationflags,
+            start_new_session=start_new_session,
         )
         worker = WorkerSession(
             session_id=f"__worker_schema_{uuid.uuid4().hex[:8]}",
@@ -811,43 +331,62 @@ class IdalibSupervisor:
             proc.kill()
             proc.wait(timeout=5)
 
+    @staticmethod
+    def _partial_database_paths(input_path: str) -> tuple[Path, ...]:
+        base = Path(input_path)
+        return tuple(
+            base.with_name(base.name + ext)
+            for ext in PARTIAL_DATABASE_EXTENSIONS
+        )
+
+    @classmethod
+    def _existing_partial_database_parts(cls, input_path: str) -> set[Path]:
+        return {
+            part
+            for part in cls._partial_database_paths(input_path)
+            if part.exists()
+        }
+
+    @classmethod
+    def _cleanup_partial_database(
+        cls,
+        input_path: str,
+        *,
+        preserve: set[Path] | None = None,
+    ) -> None:
+        """Remove leftover unpacked IDA database parts after a failed/aborted open.
+
+        When a worker is reaped mid-open (for example on an analysis timeout), the
+        partially written .id0/.id1/.id2/.nam/.til files are left next to the input.
+        IDA then rejects every subsequent open of that path with
+        "database is corrupted beyond repair", turning a one-off failure into a
+        permanent one. The packed .i64/.idb (a complete saved database) and any
+        unpacked parts that predated this open attempt are kept.
+        """
+        preserved = preserve or set()
+        for part in cls._partial_database_paths(input_path):
+            if part in preserved:
+                continue
+            try:
+                if part.exists():
+                    part.unlink()
+            except OSError:
+                pass
+
     def shutdown(self) -> None:
+        """Forget local session state without killing persistent workers.
+
+        Spawned workers self-exit after their idle TTL. The only process the
+        supervisor is responsible for is the schema worker, which is
+        supervisor-private and has no DB; terminate it explicitly.
+        """
         with self._lock:
-            workers = list(self.sessions.values())
-            if self._schema_worker is not None:
-                workers.append(self._schema_worker)
+            schema = self._schema_worker
             self.sessions.clear()
             self.path_to_session.clear()
-            self.context_bindings.clear()
             self._schema_worker = None
-        # Ask each worker to close (and so save) its database first: a bare
-        # terminate leaves unpacked .id0/.id1/... components behind and loses
-        # every change since the last explicit save.
-        closers = []
-        for worker in workers:
-            if worker.backend != "worker" or not worker.owned or not worker.is_alive():
-                continue
-            t = Thread(
-                target=self._close_worker_quietly, args=(worker,), daemon=True
-            )
-            t.start()
-            closers.append(t)
-        deadline = time.monotonic() + _SHUTDOWN_SAVE_TIMEOUT_SEC
-        for t in closers:
-            t.join(max(0.0, deadline - time.monotonic()))
-        for worker in workers:
-            self._terminate_worker(worker)
-
-    def _close_worker_quietly(self, worker: WorkerSession) -> None:
-        try:
-            self.call_worker_tool(
-                worker,
-                "idalib_close",
-                {"session_id": worker.session_id},
-                timeout=_SHUTDOWN_SAVE_TIMEOUT_SEC,
-            )
-        except Exception:
-            logger.debug("Graceful close failed for %s", worker.session_id, exc_info=True)
+        if schema is not None:
+            self._terminate_worker(schema)
 
     def _schema_or_idle_worker(self) -> WorkerSession:
         with self._lock:
@@ -871,10 +410,12 @@ class IdalibSupervisor:
         stale_session_ids = [
             session.session_id
             for session in self.sessions.values()
-            if session.backend == "worker" and session.owned and not session.is_alive()
+            if session.backend == "worker" and session.owned and self._process_exited(session)
         ]
         for session_id in stale_session_ids:
-            self._unregister_session_locked(session_id)
+            stale = self._unregister_session_locked(session_id)
+            if stale is not None:
+                self._terminate_worker(stale)
 
     def _allocate_worker_locked(self) -> WorkerSession:
         worker = self._take_schema_worker_for_session()
@@ -892,7 +433,7 @@ class IdalibSupervisor:
 
         raise RuntimeError(
             f"Maximum idalib worker count reached ({self.max_workers}). "
-            "Close a database with idalib_close or increase --max-workers."
+            "Wait for an existing worker to be released or increase --max-workers."
         )
 
     # ------------------------------------------------------------------
@@ -932,26 +473,13 @@ class IdalibSupervisor:
         finally:
             conn.close()
 
-    def forward_raw(
-        self,
-        worker: WorkerSession,
-        request_obj: dict[str, Any],
-        *,
-        timeout: float | None = _DEFAULT_WORKER_TOOL_TIMEOUT_SEC,
-    ) -> dict[str, Any]:
-        # Bounded backstop: the worker's own @tool_timeout normally fires first
-        # and returns a clean error. This cap protects against the case where
-        # the worker is wedged in a C-level call that the setprofile timeout
-        # hook can't interrupt, so the supervisor thread isn't lost forever.
-        return self._worker_rpc(worker, request_obj, timeout=timeout)
-
     def call_worker_tool(
         self,
         worker: WorkerSession,
         name: str,
         arguments: dict[str, Any] | None = None,
         *,
-        timeout: float | None = _DEFAULT_WORKER_TOOL_TIMEOUT_SEC,
+        timeout: float | None = None,
     ) -> Any:
         response = self._worker_rpc(
             worker,
@@ -994,16 +522,24 @@ class IdalibSupervisor:
             candidates.add(self._path_key(str(path) + ".idb"))
         return candidates
 
-    def _find_gui_instance_for_path(self, resolved_path: str) -> dict[str, Any] | None:
+    def _find_instance_for_path(
+        self, resolved_path: str, *, backend: str | None = None
+    ) -> dict[str, Any] | None:
+        """Find a registered IDA instance (GUI or persistent worker) that has
+        `resolved_path` open. If `backend` is given, only return instances of
+        that backend type."""
         candidates = self._candidate_idb_paths(resolved_path)
         try:
             instances = _discovery.discover_instances()
         except Exception:
-            logger.debug("GUI instance discovery failed", exc_info=True)
+            logger.debug("Instance discovery failed", exc_info=True)
             return None
 
         matches = []
         for instance in instances:
+            instance_backend = _discovered_instance_backend(instance)
+            if backend is not None and instance_backend != backend:
+                continue
             idb_path = str(instance.get("idb_path") or "")
             if not idb_path:
                 continue
@@ -1016,27 +552,173 @@ class IdalibSupervisor:
 
         if len(matches) > 1:
             logger.warning(
-                "Multiple GUI IDA instances matched %s; using the first registered instance",
+                "Multiple IDA instances matched %s; using the first registered instance",
                 resolved_path,
             )
         return matches[0] if matches else None
 
-    def is_path_owned(self, input_path: str) -> bool:
-        """True if a live worker or GUI instance already has this database open."""
-        resolved = self._normalize_input_path(input_path)
-        with self._lock:
-            existing = self.path_to_session.get(self._path_key(resolved))
-            session = self.sessions.get(existing) if existing is not None else None
-            if session is not None and session.is_alive():
-                return True
-        return self._find_gui_instance_for_path(resolved) is not None
-
-    def _register_session_locked(self, session: WorkerSession, resolved_path: str, context_id: str | None) -> None:
+    def _register_session_locked(self, session: WorkerSession, resolved_path: str) -> None:
         self.sessions[session.session_id] = session
         for candidate in self._candidate_idb_paths(resolved_path):
             self.path_to_session[candidate] = session.session_id
-        if context_id is not None:
-            self.bind_context(context_id, session.session_id)
+
+    def _session_is_reachable(self, session: WorkerSession) -> bool:
+        return bool(self._probe_session_health(session)["reachable"])
+
+    def _session_is_usable(self, session: WorkerSession) -> bool:
+        """True unless the session is provably gone; a busy worker stays usable.
+
+        Quick timeouts: callers hold the lock and a dead worker refuses the
+        connection at once, so waiting longer only pins the lock.
+        """
+        health = self._probe_session_health(
+            session,
+            tcp_timeout=WORKER_QUICK_TCP_TIMEOUT_SEC,
+            rpc_timeout=WORKER_QUICK_RPC_TIMEOUT_SEC,
+        )
+        return self._health_state(health) != "dead"
+
+    def _concurrent_session_for_path(self, resolved: str) -> WorkerSession | None:
+        """Session another thread registered for `resolved` while we opened.
+
+        Two clients can now open the same binary at once; the loser's idb_open
+        fails on the database lock. Return the winner rather than erroring —
+        and never clean up working files that are now the winner's.
+        """
+        with self._lock:
+            existing = self.path_to_session.get(self._path_key(resolved))
+            if existing is None:
+                return None
+            session = self.sessions.get(existing)
+            if session is None or not self._session_is_usable(session):
+                return None
+            session.last_accessed = datetime.now()
+            return session
+
+    def _process_exited(self, session: WorkerSession) -> bool:
+        process = session.process
+        return process is not None and process.poll() is not None
+
+    def _probe_session_health(
+        self,
+        session: WorkerSession,
+        *,
+        tcp_timeout: float | None = None,
+        rpc_timeout: float | None = None,
+    ) -> dict[str, Any]:
+        """Classify a session as ok / busy / dead.
+
+        `busy` is alive but not answering, i.e. mid tool call. Only `dead`
+        justifies reaping.
+        """
+        result: dict[str, Any] = {
+            "backend": session.backend,
+            "process_alive": None,
+            "tcp_connect": None,
+            "rpc_ping": None,
+            "reachable": False,
+            "state": "dead",
+            "failed_probe": None,
+            "error": None,
+        }
+
+        if session.backend != "worker":
+            alive = session.is_alive()
+            result["process_alive"] = alive
+            result["reachable"] = alive
+            result["state"] = "ok" if alive else "dead"
+            if not alive:
+                result["failed_probe"] = "process"
+                result["error"] = "instance is not responding"
+            return result
+
+        if self._process_exited(session):
+            result["process_alive"] = False
+            result["failed_probe"] = "process"
+            result["error"] = "worker process is not running"
+            return result
+        # Adopted workers have no Popen handle, so liveness is unknown here.
+        result["process_alive"] = True if session.process is not None else None
+
+        def busy(probe: str, error: str) -> dict[str, Any]:
+            result["failed_probe"] = probe
+            result["error"] = error
+            # A completed TCP handshake proves the listener is up, which is
+            # all we have for adopted workers we hold no process handle for.
+            alive = result["process_alive"] is True or result["tcp_connect"] is True
+            result["state"] = "busy" if alive else "dead"
+            return result
+
+        try:
+            with socket.create_connection(
+                (session.host, session.port),
+                timeout=tcp_timeout or WORKER_TCP_HEALTH_TIMEOUT_SEC,
+            ):
+                pass
+        except Exception as e:
+            logger.debug(
+                "Worker session %s failed TCP health probe",
+                session.session_id,
+                exc_info=True,
+            )
+            result["tcp_connect"] = False
+            return busy("tcp_connect", str(e))
+        result["tcp_connect"] = True
+
+        try:
+            response = self._worker_rpc(
+                session,
+                {"jsonrpc": "2.0", "id": 1, "method": "ping"},
+                timeout=rpc_timeout or WORKER_RPC_HEALTH_TIMEOUT_SEC,
+            )
+        except Exception as e:
+            logger.debug(
+                "Worker session %s failed JSON-RPC ping health probe",
+                session.session_id,
+                exc_info=True,
+            )
+            result["rpc_ping"] = False
+            return busy("rpc_ping", str(e))
+
+        if "error" in response:
+            result["rpc_ping"] = False
+            return busy(
+                "rpc_ping", response["error"].get("message", "JSON-RPC ping returned error")
+            )
+
+        result["rpc_ping"] = True
+        result["reachable"] = True
+        result["state"] = "ok"
+        return result
+
+    @staticmethod
+    def _health_state(health: dict[str, Any]) -> str:
+        state = health.get("state")
+        if state:
+            return str(state)
+        return "ok" if health.get("reachable") else "dead"
+
+    def _probe_session_health_retrying(self, session: WorkerSession) -> dict[str, Any]:
+        health = self._probe_session_health(session)
+        for attempt in range(1, max(0, WORKER_HEALTH_RETRIES)):
+            if self._health_state(health) != "busy":
+                break
+            time.sleep(WORKER_HEALTH_RETRY_BACKOFF_SEC * attempt)
+            health = self._probe_session_health(session)
+        health["state"] = self._health_state(health)
+        return health
+
+    def _record_health_state(self, session: WorkerSession, state: str) -> bool:
+        """Track how long a live worker has been silent. Returns True if wedged."""
+        if state != "busy":
+            session.unresponsive_since = None
+            return False
+        now = time.monotonic()
+        if session.unresponsive_since is None:
+            session.unresponsive_since = now
+        if WORKER_WEDGED_GRACE_SEC <= 0:
+            return False
+        return (now - session.unresponsive_since) >= WORKER_WEDGED_GRACE_SEC
 
     def _unregister_session_locked(self, session_id: str) -> WorkerSession | None:
         session = self.sessions.pop(session_id, None)
@@ -1047,18 +729,12 @@ class IdalibSupervisor:
         ]
         for path_key in stale_paths:
             self.path_to_session.pop(path_key, None)
-        stale_contexts = [
-            context for context, bound in self.context_bindings.items() if bound == session_id
-        ]
-        for context in stale_contexts:
-            self.context_bindings.pop(context, None)
         return session
 
-    def _discard_opened_worker_session(self, worker: WorkerSession, session_id: str) -> None:
-        try:
-            self.call_worker_tool(worker, "idalib_close", {"session_id": session_id})
-        except Exception:
-            logger.debug("Worker idalib_close failed for discarded session %s", session_id, exc_info=True)
+    def _discard_opened_worker_session(self, worker: WorkerSession) -> None:
+        # Race lost: we opened a worker but a competing thread already
+        # registered another worker for the same path. The losing worker is
+        # only known to us, so just terminate the process.
         self._terminate_worker(worker)
 
     def _make_gui_session(self, resolved_path: str, session_id: str, instance: dict[str, Any]) -> WorkerSession:
@@ -1077,29 +753,90 @@ class IdalibSupervisor:
             pid=int(instance["pid"]) if instance.get("pid") is not None else None,
         )
 
+    def _adopt_worker_instance(
+        self, resolved_path: str, session_id: str, instance: dict[str, Any]
+    ) -> WorkerSession | None:
+        """Register a session pointing at a persistent worker discovered via
+        the registry. Returns None if the worker is no longer reachable."""
+        worker_stub = WorkerSession(
+            session_id=session_id,
+            input_path=str(instance.get("idb_path") or resolved_path),
+            filename=Path(str(instance.get("idb_path") or resolved_path)).name,
+            host=str(instance.get("host") or "127.0.0.1"),
+            port=int(instance.get("port") or 0),
+            process=None,
+            backend="worker",
+            owned=False,
+            pid=int(instance["pid"]) if instance.get("pid") is not None else None,
+        )
+        if not self._session_is_reachable(worker_stub):
+            return None
+        self._register_session_locked(worker_stub, resolved_path)
+        logger.info(
+            "Adopted persistent worker %s:%s for %s",
+            worker_stub.host,
+            worker_stub.port,
+            resolved_path,
+        )
+        return worker_stub
+
+    def _launch_gui_and_adopt(self, resolved_path: str, session_id: str) -> WorkerSession:
+        launched = _discovery.launch_gui_instance(resolved_path)
+        if not launched.get("success"):
+            raise RuntimeError(launched.get("error") or "Failed to launch GUI IDA process")
+        if "host" not in launched or "port" not in launched:
+            raise RuntimeError(
+                launched.get("message") or "GUI IDA launched but did not register"
+            )
+        instance = {
+            "host": launched["host"],
+            "port": launched["port"],
+            "pid": launched.get("pid"),
+            "binary": launched.get("binary", Path(resolved_path).name),
+            "idb_path": resolved_path,
+        }
+        with self._lock:
+            existing = self.path_to_session.get(self._path_key(resolved_path))
+            if existing is not None:
+                existing_session = self.sessions.get(existing)
+                if existing_session is not None and self._session_is_usable(existing_session):
+                    existing_session.last_accessed = datetime.now()
+                    return existing_session
+                self._unregister_session_locked(existing)
+            if session_id in self.sessions:
+                raise ValueError(f"Session already exists: {session_id}")
+            session = self._make_gui_session(resolved_path, session_id, instance)
+            self._register_session_locked(session, resolved_path)
+            logger.info(
+                "Launched and adopted GUI IDA %s:%s for %s",
+                session.host,
+                session.port,
+                resolved_path,
+            )
+            return session
+
     def open_session(
         self,
         input_path: str,
         *,
+        mode: str = "prefer_headless",
         run_auto_analysis: bool = True,
+        build_caches: bool = True,
+        init_hexrays: bool = True,
+        idle_ttl_sec: int = 600,
         session_id: str | None = None,
-        context_id: str | None = None,
     ) -> WorkerSession:
+        if mode not in IDB_OPEN_MODES:
+            raise ValueError(
+                f"Unknown mode: {mode!r}. Expected one of: {sorted(IDB_OPEN_MODES)}."
+            )
         resolved = self._normalize_input_path(input_path)
-        requested_session_id = session_id
         with self._lock:
             existing = self.path_to_session.get(self._path_key(resolved))
             if existing is not None:
                 session = self.sessions.get(existing)
-                if session is not None and session.is_alive():
-                    if requested_session_id is not None and requested_session_id != existing:
-                        raise ValueError(
-                            f"Binary already open as session '{existing}', cannot reuse "
-                            f"different session_id '{requested_session_id}'."
-                        )
+                if session is not None and self._session_is_usable(session):
                     session.last_accessed = datetime.now()
-                    if context_id is not None:
-                        self.bind_context(context_id, existing)
                     return session
                 self._unregister_session_locked(existing)
 
@@ -1108,34 +845,77 @@ class IdalibSupervisor:
             elif session_id in self.sessions:
                 raise ValueError(f"Session already exists: {session_id}")
 
-            gui_instance = self._find_gui_instance_for_path(resolved)
-            if gui_instance is not None:
-                session = self._make_gui_session(resolved, session_id, gui_instance)
-                self._register_session_locked(session, resolved, context_id)
-                logger.info(
-                    "Using GUI IDA instance %s:%s for %s",
-                    session.host,
-                    session.port,
-                    resolved,
-                )
-                return session
+            if mode in ("prefer_gui", "force_gui"):
+                gui_instance = self._find_instance_for_path(resolved, backend="gui")
+                if gui_instance is not None:
+                    session = self._make_gui_session(resolved, session_id, gui_instance)
+                    self._register_session_locked(session, resolved)
+                    logger.info(
+                        "Using GUI IDA instance %s:%s for %s",
+                        session.host,
+                        session.port,
+                        resolved,
+                    )
+                    return session
+                if mode == "force_gui":
+                    # Drop the lock so the long-running subprocess launch + poll
+                    # doesn't block other supervisor operations.
+                    break_for_launch = True
+                else:
+                    break_for_launch = False
+            else:
+                break_for_launch = False
+                # Headless modes never look at GUI instances. Try to attach
+                # to a persistent idalib worker that already has this path
+                # open (orphan from a previous supervisor).
+                worker_instance = self._find_instance_for_path(resolved, backend="worker")
+                if worker_instance is not None:
+                    adopted = self._adopt_worker_instance(resolved, session_id, worker_instance)
+                    if adopted is not None:
+                        return adopted
 
-            worker = self._allocate_worker_locked()
+            if not break_for_launch:
+                worker = self._allocate_worker_locked()
 
+        if break_for_launch:
+            return self._launch_gui_and_adopt(resolved, session_id)
+
+        open_timeout = (WORKER_OPEN_TIMEOUT_SEC or None) if run_auto_analysis else None
+        preexisting_parts = self._existing_partial_database_parts(resolved)
         try:
             opened = self.call_worker_tool(
                 worker,
-                "idalib_open",
+                "idb_open",
                 {
                     "input_path": resolved,
                     "run_auto_analysis": run_auto_analysis,
-                    "session_id": session_id,
+                    "build_caches": build_caches,
+                    "init_hexrays": init_hexrays,
+                    "idle_ttl_sec": idle_ttl_sec,
+                    "preferred_session_id": session_id,
                 },
+                timeout=open_timeout,
             )
             if isinstance(opened, dict) and opened.get("error"):
                 raise RuntimeError(str(opened["error"]))
+        except TimeoutError:
+            self._terminate_worker(worker)
+            winner = self._concurrent_session_for_path(resolved)
+            if winner is not None:
+                return winner
+            self._cleanup_partial_database(resolved, preserve=preexisting_parts)
+            raise RuntimeError(
+                f"idalib worker timed out after {open_timeout:.0f}s while opening and "
+                f"analyzing {resolved}. The binary may drive auto-analysis into an "
+                f"unbounded loop. Retry with run_auto_analysis=false (open without "
+                f"analysis and decompile on demand), or raise IDA_MCP_OPEN_TIMEOUT."
+            ) from None
         except Exception:
             self._terminate_worker(worker)
+            winner = self._concurrent_session_for_path(resolved)
+            if winner is not None:
+                return winner
+            self._cleanup_partial_database(resolved, preserve=preexisting_parts)
             raise
 
         worker_session = opened.get("session", {}) if isinstance(opened, dict) else {}
@@ -1151,78 +931,38 @@ class IdalibSupervisor:
             backend="worker",
             owned=True,
             pid=worker.process.pid if worker.process is not None else None,
+            last_warmup=opened.get("warmup") if isinstance(opened, dict) else None,
         )
         with self._lock:
             existing = self.path_to_session.get(self._path_key(resolved))
             if existing is not None:
                 existing_session = self.sessions.get(existing)
-                if existing_session is not None and existing_session.is_alive():
+                if existing_session is not None and self._session_is_usable(existing_session):
                     existing_session.last_accessed = datetime.now()
-                    if context_id is not None:
-                        self.bind_context(context_id, existing)
-                    collision_error = None
-                    if requested_session_id is not None and requested_session_id != existing:
-                        collision_error = ValueError(
-                            f"Binary already open as session '{existing}', cannot reuse "
-                            f"different session_id '{requested_session_id}'."
-                        )
                 else:
                     self._unregister_session_locked(existing)
                     existing_session = None
-                    collision_error = None
             else:
                 existing_session = None
-                collision_error = None
 
             session_collision_error = None
             if existing_session is None:
                 existing_by_id = self.sessions.get(session_id)
                 if existing_by_id is not None:
-                    if existing_by_id.is_alive():
+                    if self._session_is_usable(existing_by_id):
                         existing_by_id.last_accessed = datetime.now()
                         session_collision_error = ValueError(f"Session already exists: {session_id}")
                     else:
                         self._unregister_session_locked(session_id)
 
             if existing_session is None and session_collision_error is None:
-                self._register_session_locked(session, resolved, context_id)
+                self._register_session_locked(session, resolved)
                 return session
 
-        self._discard_opened_worker_session(worker, session_id)
-        if collision_error is not None:
-            raise collision_error
+        self._discard_opened_worker_session(worker)
         if session_collision_error is not None:
             raise session_collision_error
         return existing_session
-
-    def close_session(self, session_id: str) -> bool:
-        with self._lock:
-            session = self._unregister_session_locked(session_id)
-            if session is None:
-                return False
-        if session.backend == "worker":
-            try:
-                self.call_worker_tool(session, "idalib_close", {"session_id": session_id})
-            except Exception:
-                logger.debug("Worker idalib_close failed for %s", session_id, exc_info=True)
-        self._terminate_worker(session)
-        return True
-
-    def restart_worker(self, session_id: str) -> WorkerSession | None:
-        """Force-kill a (possibly wedged) worker and clear its session.
-
-        Unlike close_session, this does NOT attempt a graceful idalib_close RPC
-        first -- a wedged worker would never answer it. The process is
-        terminated directly and the session/bindings are dropped so the next
-        tool call re-spawns a fresh worker. Returns the removed session, or
-        None if no such session exists. In-flight work in that worker is lost.
-        """
-        with self._lock:
-            session = self._unregister_session_locked(session_id)
-        if session is None:
-            return None
-        self._terminate_worker(session)
-        return session
 
     def _resolve_gui_fallback_path(self, session: WorkerSession) -> str:
         candidates = [session.input_path]
@@ -1251,20 +991,24 @@ class IdalibSupervisor:
         resolved = self._resolve_gui_fallback_path(session)
         with self._lock:
             worker = self._allocate_worker_locked()
+        preexisting_parts = self._existing_partial_database_parts(resolved)
         try:
             opened = self.call_worker_tool(
                 worker,
-                "idalib_open",
+                "idb_open",
                 {
                     "input_path": resolved,
                     "run_auto_analysis": False,
-                    "session_id": session.session_id,
+                    "build_caches": True,
+                    "init_hexrays": True,
+                    "preferred_session_id": session.session_id,
                 },
             )
             if isinstance(opened, dict) and opened.get("error"):
                 raise RuntimeError(str(opened["error"]))
         except Exception:
             self._terminate_worker(worker)
+            self._cleanup_partial_database(resolved, preserve=preexisting_parts)
             raise
 
         worker_session = opened.get("session", {}) if isinstance(opened, dict) else {}
@@ -1280,13 +1024,14 @@ class IdalibSupervisor:
             backend="worker",
             owned=True,
             pid=worker.process.pid if worker.process is not None else None,
+            last_warmup=opened.get("warmup") if isinstance(opened, dict) else None,
         )
         with self._lock:
             current = self.sessions.get(session.session_id)
             if current is session:
-                self._register_session_locked(replacement, resolved, None)
+                self._register_session_locked(replacement, resolved)
                 return replacement
-            if current is not None and current.is_alive():
+            if current is not None and self._session_is_usable(current):
                 current.last_accessed = datetime.now()
                 replacement_session = current
                 reopen_error = None
@@ -1298,94 +1043,172 @@ class IdalibSupervisor:
                     f"Session '{session.session_id}' was closed or replaced while reopening headlessly"
                 )
 
-        self._discard_opened_worker_session(worker, session.session_id)
+        self._discard_opened_worker_session(worker)
         if replacement_session is not None:
             return replacement_session
         if reopen_error is not None:
             raise reopen_error
         raise RuntimeError(f"Session '{session.session_id}' changed while reopening headlessly")
 
-    def resolve_session(self, database: str | None = None) -> WorkerSession:
-        with self._lock:
-            session_id: str | None = None
-            if database:
-                matches: list[str] = [database] if database in self.sessions else []
-                if not matches:
-                    try:
-                        mapped = self.path_to_session.get(self._path_key(database))
-                    except Exception:
-                        mapped = self.path_to_session.get(os.path.normcase(database))
-                    if mapped is not None:
-                        matches = [mapped]
-                if not matches:
-                    matches = [
-                        s.session_id
-                        for s in self.sessions.values()
-                        if database in {s.session_id, s.filename, s.input_path}
-                        or os.path.normcase(database) == os.path.normcase(s.input_path)
-                    ]
-                if not matches:
-                    # Try resolved path match without requiring it to exist now.
-                    try:
-                        normalized = os.path.normcase(str(Path(database).resolve()))
-                    except Exception:
-                        normalized = os.path.normcase(database)
-                    matches = [
-                        s.session_id
-                        for s in self.sessions.values()
-                        if os.path.normcase(s.input_path) == normalized
-                    ]
-                if len(matches) > 1:
-                    raise RuntimeError(f"Database selector is ambiguous: {database}")
-                if not matches:
-                    raise RuntimeError(f"Database/session not found: {database}")
-                session_id = matches[0]
-            else:
-                context_id = self.resolve_context_id()
-                session_id = self.context_bindings.get(context_id)
-                if session_id is None and not self.isolated_contexts:
-                    session_id = self.context_bindings.get(SHARED_FALLBACK_CONTEXT_ID)
-                if session_id is None and self.isolated_contexts:
-                    live = [s for s in self.sessions.values() if s.is_alive()]
-                    if len(live) == 1:
-                        sole = live[0]
-                        self.bind_context(context_id, sole.session_id)
-                        session_id = sole.session_id
-                        logger.info(
-                            "Auto-rebound context %s to sole live session %s (%s)",
-                            context_id,
-                            sole.session_id,
-                            sole.filename,
-                        )
-                if session_id is None:
-                    raise RuntimeError(
-                        "No database bound for this context. Use idalib_open(...), "
-                        "idalib_switch(session_id), or pass database=..."
-                    )
-            session = self.sessions.get(session_id)
-            if session is None:
-                raise RuntimeError(f"Session is stale or missing: {session_id}")
+    def resolve_session(self, database: str) -> WorkerSession:
+        session = self.peek_session(database)
+        # Short timeouts: a busy worker is forwarded to anyway, so waiting
+        # longer here only adds latency to every call.
+        health = self._probe_session_health(
+            session,
+            tcp_timeout=WORKER_QUICK_TCP_TIMEOUT_SEC,
+            rpc_timeout=WORKER_QUICK_RPC_TIMEOUT_SEC,
+        )
+        state = self._health_state(health)
+        wedged = self._record_health_state(session, state)
+        if state == "ok":
             session.last_accessed = datetime.now()
-
-        if session.is_alive():
             return session
+        if state == "busy":
+            if not wedged:
+                # Mid tool call: let the request queue on the worker rather
+                # than killing the analysis.
+                logger.info(
+                    "Worker session %s is busy (%s); forwarding anyway",
+                    session.session_id,
+                    health.get("failed_probe"),
+                )
+                session.last_accessed = datetime.now()
+                return session
+            # Silent past the grace window: confirm with generous timeouts
+            # before killing a process that may still be working.
+            confirmed = self._probe_session_health_retrying(session)
+            if self._health_state(confirmed) == "ok":
+                self._record_health_state(session, "ok")
+                session.last_accessed = datetime.now()
+                return session
+            logger.warning(
+                "Worker session %s unresponsive for over %.0fs; reaping",
+                session.session_id,
+                WORKER_WEDGED_GRACE_SEC,
+            )
         if session.backend == "gui":
             return self._reopen_gui_session_headless(session)
-        raise RuntimeError(f"Worker for session '{session_id}' is not running")
-
-    def list_sessions(self, context_id: str) -> list[IdalibSessionListInfo]:
+        session_id = session.session_id
         with self._lock:
-            current = self.context_bindings.get(context_id)
-            binding_counts: dict[str, int] = {}
-            for bound in self.context_bindings.values():
-                binding_counts[bound] = binding_counts.get(bound, 0) + 1
-            return [
-                session.to_list_dict(
-                    current=session.session_id == current,
-                    bound_contexts=binding_counts.get(session.session_id, 0),
-                )
-                for session in self.sessions.values()
+            current = self.sessions.get(session_id)
+            if current is session:
+                self._unregister_session_locked(session_id)
+        self._terminate_worker(session)
+        raise RuntimeError(f"Worker for session '{session_id}' is not reachable")
+
+    def peek_session(self, database: str) -> WorkerSession:
+        if not database:
+            raise RuntimeError(_DATABASE_REQUIRED_ERROR)
+        with self._lock:
+            session = self.sessions.get(database)
+            if session is None:
+                raise RuntimeError(f"Session not found: {database}")
+            session.last_accessed = datetime.now()
+            return session
+
+    def close_session(self, database: str, *, save: bool = True) -> IdalibCloseResult:
+        """Save (optionally), unregister, and terminate a session's owned worker.
+
+        Adopted GUI/worker instances (``owned`` is False) are detached rather
+        than killed: they keep running so another supervisor can adopt them.
+        """
+        session = self.peek_session(database)
+        saved: bool | None = None
+        save_error: str | None = None
+        if save and self._session_is_reachable(session):
+            try:
+                result = self.call_worker_tool(session, "idb_save")
+                if isinstance(result, dict):
+                    saved = bool(result.get("ok"))
+                    if result.get("error"):
+                        save_error = str(result["error"])
+            except Exception as e:
+                save_error = str(e)
+
+        with self._lock:
+            if self.sessions.get(database) is session:
+                self._unregister_session_locked(database)
+        self._terminate_worker(session)
+        if saved and session.owned:
+            # The worker is SIGTERM'd without a clean close_database(), so the
+            # working files it unpacked stay behind; the save above already
+            # rewrote the packed database.
+            self._cleanup_partial_database(session.input_path)
+
+        info: IdalibCloseResult = {
+            "success": True,
+            "session_id": database,
+            "backend": session.backend,
+            "owned": session.owned,
+            "saved": saved,
+            "message": f"Session closed: {session.filename} ({database})",
+        }
+        if save_error is not None:
+            info["save_error"] = save_error
+        return info
+
+    def _session_list_entry(self, session: WorkerSession) -> IdalibSessionListInfo:
+        """Listing must stay snappy, so probe with short timeouts only."""
+        health = self._probe_session_health(
+            session,
+            tcp_timeout=WORKER_QUICK_TCP_TIMEOUT_SEC,
+            rpc_timeout=WORKER_QUICK_RPC_TIMEOUT_SEC,
+        )
+        state = self._health_state(health)
+        entry = session.to_list_dict(active=state != "dead")
+        entry["busy"] = state == "busy"
+        return entry
+
+    def list_sessions(self) -> list[IdalibSessionListInfo]:
+        with self._lock:
+            adopted = [
+                self._session_list_entry(session) for session in self.sessions.values()
             ]
+            adopted_path_keys = {
+                key
+                for key in self.path_to_session
+            }
+
+        unadopted: list[IdalibSessionListInfo] = []
+        try:
+            instances = _discovery.discover_instances()
+        except Exception:
+            logger.debug("discover_instances failed during list_sessions", exc_info=True)
+            instances = []
+        for inst in instances:
+            idb_path = str(inst.get("idb_path") or "")
+            if idb_path:
+                try:
+                    key = self._path_key(idb_path)
+                except Exception:
+                    key = os.path.normcase(idb_path)
+                if key in adopted_path_keys:
+                    continue
+            try:
+                reachable = bool(_discovery.probe_instance(inst["host"], inst["port"], timeout=0.5))
+            except Exception:
+                reachable = False
+            backend = _discovered_instance_backend(inst)
+            pid = int(inst["pid"]) if inst.get("pid") is not None else None
+            unadopted.append(
+                {
+                    "session_id": "",
+                    "input_path": idb_path,
+                    "filename": Path(idb_path).name if idb_path else "",
+                    "created_at": str(inst.get("started_at", "")),
+                    "last_accessed": "",
+                    "is_analyzing": False,
+                    "metadata": {"backend": backend, "host": inst.get("host"), "port": inst.get("port")},
+                    "is_active": reachable,
+                    "backend": backend,
+                    "owned": False,
+                    "adopted": False,
+                    "pid": pid,
+                    "worker_pid": pid if backend == "worker" else None,
+                }
+            )
+        return adopted + unadopted
 
     # ------------------------------------------------------------------
     # Schema/resource forwarding
@@ -1400,8 +1223,7 @@ class IdalibSupervisor:
         worker = self._schema_or_idle_worker()
         response = self._worker_rpc(worker, {"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
         tools = response.get("result", {}).get("tools", [])
-        hidden_tools = IDALIB_MANAGEMENT_TOOLS | IDALIB_HIDDEN_PLUGIN_TOOLS
-        filtered = [t for t in tools if t.get("name") not in hidden_tools]
+        filtered = [t for t in tools if t.get("name") not in IDB_MANAGEMENT_TOOLS]
         injected = [self._inject_database_arg(t) for t in filtered]
         with self._lock:
             self._tools_cache[cache_key] = injected
@@ -1414,8 +1236,8 @@ class IdalibSupervisor:
         props = schema.setdefault("properties", {})
         props.setdefault(_DATABASE_ARG, _DATABASE_ARG_SCHEMA)
         required = schema.setdefault("required", [])
-        if _DATABASE_ARG in required:
-            required.remove(_DATABASE_ARG)
+        if _DATABASE_ARG not in required:
+            required.append(_DATABASE_ARG)
         return tool
 
     def worker_resources(self, method: str) -> list[dict]:
@@ -1443,18 +1265,6 @@ def _require_supervisor() -> IdalibSupervisor:
     return supervisor
 
 
-def _context_fields_or_empty(sup: IdalibSupervisor) -> dict:
-    """Context fields for an error payload, or {} if the context won't resolve.
-
-    Error returns need these to satisfy the published output schema; resolving
-    a context can itself raise, and an error message must not be lost to that.
-    """
-    try:
-        return dict(sup.context_fields(sup.resolve_context_id()))
-    except Exception:
-        return {}
-
-
 def _call_tool_result(result: Any, *, is_error: bool = False) -> dict:
     response: dict[str, Any] = {
         "content": [{"type": "text", "text": json.dumps(result, separators=(",", ":"))}],
@@ -1476,1234 +1286,82 @@ def _jsonrpc_error(request_id: Any, code: int, message: str) -> dict | None:
 
 
 @mcp.tool
-def idalib_open(
-    input_path: Annotated[
+def idb_open(
+    input_path: Annotated[str, "Path to the binary file to analyze"],
+    mode: Annotated[
         str,
-        "Absolute path to the binary, OR a bare filename previously surfaced by "
-        "list_pe_images (resolved via the supervisor alias registry).",
-    ],
+        "How to open: prefer_headless (default; idalib worker, ignore GUI), "
+        "force_headless (idalib worker only, never adopt GUI), "
+        "prefer_gui (adopt running GUI if present, else spawn worker), "
+        "force_gui (adopt running GUI or launch a new IDA GUI process)."
+    ] = "prefer_headless",
     run_auto_analysis: Annotated[bool, "Run automatic analysis on the binary"] = True,
-    session_id: Annotated[
-        Optional[str], "Custom session ID (auto-generated if not provided)"
-    ] = None,
-    directory: Annotated[
-        Optional[str],
-        "Optional directory hint that narrows alias resolution when the same "
-        "filename has been seen in multiple folders.",
-    ] = None,
-    bitness: Annotated[
-        Optional[int],
-        "Force the addressing width after loading: 16, 32 or 64. Needed for raw "
-        "and extender images, where the binary loader defaults to the host "
-        "width, so a 32-bit image decodes as 64-bit code.",
-    ] = None,
-    processor: Annotated[
-        Optional[str],
-        "Force the processor module after loading (metapc, arm, mips, ...).",
-    ] = None,
-    keep_stale_components: Annotated[
-        bool,
-        "Open unsaved .id0/.id1/... components left by a worker that died "
-        "before saving, instead of moving them to .ida_stale/ and starting "
-        "from the last saved .i64 (default: false).",
-    ] = False,
+    build_caches: Annotated[bool, "Build core caches after open"] = True,
+    init_hexrays: Annotated[bool, "Initialize Hex-Rays decompiler after open"] = True,
+    idle_ttl_sec: Annotated[
+        int,
+        "Minimum idle TTL in seconds before the headless worker self-exits.",
+    ] = 600,
+    preferred_session_id: Annotated[
+        str, "Preferred session ID (auto-generated if empty). Ignored if the file is already open in a GUI or worker session."
+    ] = "",
 ) -> IdalibOpenResult:
-    """Open a binary in its own idalib worker process and bind it to this context.
-
-    ``input_path`` accepts either an absolute filesystem path or a bare filename
-    that was returned by a prior ``list_pe_images`` call on this supervisor — the
-    registry built up by ``list_pe_images`` makes it safe for clients whose
-    upstream safety layer strips absolute paths to still address discovered
-    binaries by name. Use ``directory`` to disambiguate if the same filename has
-    been seen in multiple folders. Note that ``list_pe_images`` only registers
-    PE images by default: to address a raw blob or an LE/LX extender image by
-    name, discover it with ``list_pe_images(..., include_non_pe=True)`` first,
-    or pass its absolute path here (which always works).
-
-    ``bitness``/``processor`` are applied as a post-load fixup, because idalib
-    cannot pass load options to IDA: the database is opened, then the affected
-    segments are re-addressed, undefined and re-analyzed (the same work the
-    ``set_bitness`` tool does, which also repairs databases opened earlier).
-    They are honoured for an already-open session too. Pair them with
-    ``run_auto_analysis=False`` to avoid analyzing a large image at the wrong
-    width first.
-
-    Unsaved .id0/.id1/... components left by a worker that died before saving
-    are moved to ``.ida_stale/`` beside the binary (reported in ``notes``) so
-    the open starts from the last saved .i64, not half-written state.
-    """
+    """Open a binary and warm it up. Returns the existing session if the file is already open under the supervisor; otherwise creates one according to `mode`."""
     sup = _require_supervisor()
-    # Compute context fields up front so every return path (including errors)
-    # satisfies the published IdalibOpenResult schema, which requires
-    # context_id / transport_context_id / isolated_contexts.
     try:
-        context_id = sup.resolve_context_id()
-        ctx = dict(sup.context_fields(context_id))
-    except Exception as e:
-        return {
-            "success": False,
-            "context_id": "",
-            "transport_context_id": None,
-            "isolated_contexts": sup.isolated_contexts,
-            "error": f"Failed to resolve context: {e}",
-        }
-    notes: list[str] = []
-    try:
-        # Resolve the requested path decisively (see resolve_open_target): an
-        # existing path opens as-is; a unique known filename opens; a duplicate
-        # filename is disambiguated by trailing path components (so a partial
-        # path like 'system/Mplayer.dll' is enough); an unknown filename triggers
-        # a bounded on-disk search. The goal is a one-call open so weak clients
-        # don't loop guessing paths.
-        original_input = input_path
-        outcome = sup.resolve_open_target(input_path, directory_hint=directory)
-        status = outcome["status"]
-
-        if status == "miss":
-            suggestions = outcome.get("suggestions") or []
-            searched = " (after an on-disk search)" if outcome.get("searched") else ""
-            notes.append(
-                f"Could not resolve '{original_input}'{searched}: no matching file "
-                f"on disk or in the alias registry. Run list_pe_images on the "
-                f"containing folder, or call idalib_aliases() to see known names."
-            )
-            if suggestions:
-                notes.append(f"Did you mean: {', '.join(suggestions)}?")
-            err: IdalibOpenResult = {
-                "success": False,
-                **ctx,
-                "error": f"Could not resolve binary: {original_input}",
-                "notes": notes,
-            }
-            if suggestions:
-                err["suggestions"] = suggestions
-            return err
-
-        if status == "ambiguous":
-            cand_paths = outcome.get("candidates") or []
-            candidates: list[IdalibOpenCandidate] = []
-            for p in cand_paths[:8]:
-                info: IdalibOpenCandidate = {"path": p, "filename": Path(p).name}
-                try:
-                    sha256, md5 = _hash_file_verify(Path(p))
-                    info["sha256"] = sha256
-                    info["md5"] = md5
-                except OSError as he:
-                    info["error"] = f"{type(he).__name__}: {he}"
-                candidates.append(info)
-            notes.append(outcome["how"])
-            return {
-                "success": False,
-                **ctx,
-                "error": (
-                    f"Ambiguous: {len(cand_paths)} files match '{original_input}'. "
-                    f"Re-call idalib_open with more path components to pick one."
-                ),
-                "candidates": candidates,
-                "notes": notes,
-            }
-
-        # status == "open"
-        resolved = outcome["path"]
-        if os.path.normcase(resolved) != os.path.normcase(original_input):
-            notes.append(
-                f"Resolved '{original_input}' -> '{resolved}' ({outcome['how']})."
-            )
-        input_path = resolved
-
-        if not sup.is_path_owned(input_path):
-            stale = _stale_idb_components(input_path)
-            if stale and keep_stale_components:
-                notes.append(
-                    "Opening over unsaved components left by a worker that died "
-                    f"before saving ({', '.join(p.name for p in stale)}); the "
-                    "database may be partially analyzed. Verify function counts."
-                )
-            elif stale:
-                moved_to, failures = _quarantine_idb_components(input_path, stale)
-                if moved_to is not None:
-                    notes.append(
-                        "Found unsaved database components left by a worker that "
-                        "died before saving; moved them to "
-                        f"{moved_to} and opened from the last saved state "
-                        "(or a fresh analysis if none). Pass "
-                        "keep_stale_components=true to open them instead."
-                    )
-                if failures:
-                    notes.append(
-                        "Could not move some stale components (likely locked by "
-                        f"another IDA process): {'; '.join(failures)}"
-                    )
-
         session = sup.open_session(
             input_path,
+            mode=mode,
             run_auto_analysis=run_auto_analysis,
-            session_id=session_id,
-            context_id=context_id,
+            build_caches=build_caches,
+            init_hexrays=init_hexrays,
+            idle_ttl_sec=idle_ttl_sec,
+            session_id=preferred_session_id or None,
         )
-        result: IdalibOpenResult = {
-            "success": True,
-            **ctx,
-            "session": session.to_dict(),
-            "message": f"Binary opened and bound to context: {session.filename} ({session.session_id})",
-        }
-        # Always surface SHA-256 + MD5 of the opened binary for verification.
-        try:
-            sha256, md5 = _hash_file_verify(Path(input_path))
-            result["sha256"] = sha256
-            result["md5"] = md5
-        except OSError:
-            pass
-        if bitness is not None or processor:
-            fixup_args: dict[str, Any] = {}
-            if bitness is not None:
-                fixup_args["bitness"] = bitness
-            if processor:
-                fixup_args["processor"] = processor
-            try:
-                result["load_fixup"] = sup.call_worker_tool(
-                    session, "set_bitness", fixup_args
-                )
-            except Exception as e:
-                notes.append(
-                    f"Binary opened, but the load fixup failed: {e}. Call "
-                    f"set_bitness on this database to retry."
-                )
-        if notes:
-            result["notes"] = notes
-        return result
-    except Exception as e:
-        err: IdalibOpenResult = {"success": False, **ctx, "error": str(e)}
-        if notes:
-            err["notes"] = notes
-        return err
-
-
-@mcp.tool
-def idalib_close(session_id: Annotated[str, "Session ID to close"]) -> IdalibCloseResult:
-    """Close a database worker and remove all context bindings targeting it."""
-    sup = _require_supervisor()
-    try:
-        if sup.close_session(session_id):
-            return {"success": True, "message": f"Session closed: {session_id}"}
-        return {"success": False, "error": f"Session not found: {session_id}"}
-    except Exception as e:
-        return {"error": f"Failed to close session: {e}"}
-
-
-@mcp.tool
-def idalib_restart_worker(
-    session_id: Annotated[
-        Optional[str],
-        "Session to restart. Default: the session bound to YOUR context.",
-    ] = None,
-    force: Annotated[
-        bool,
-        "Restart even if the session isn't yours or is shared by other contexts.",
-    ] = False,
-) -> dict:
-    """Force-kill a wedged worker and clear its session.
-
-    The escape hatch for a hard wedge: when a worker is stuck in a tight
-    C-level IDA call that timeouts and notifications/cancelled can't interrupt,
-    use this to terminate the worker process and drop its session so the next
-    tool call spawns a fresh one -- without a full gateway reload. In-flight
-    work in that worker is lost. Use idalib_health(full=false) first to confirm
-    the worker is actually wedged (alive=false or busy with a large
-    inflight_seconds) before restarting.
-
-    Multi-agent safety: by default this only restarts the session bound to your
-    own context, and refuses to restart a session that other contexts are also
-    bound to (a worker is shared when multiple agents opened the same binary) --
-    so one agent can't nuke another's in-flight work by accident. Pass
-    force=true to override (e.g. to clear a genuinely orphaned/wedged worker).
-    """
-    sup = _require_supervisor()
-    try:
-        context_id = sup.resolve_context_id()
-
-        # Default to the caller's own bound session.
-        if not session_id:
-            session_id = sup.context_bindings.get(context_id)
-            if not session_id and not sup.isolated_contexts:
-                session_id = sup.context_bindings.get(SHARED_FALLBACK_CONTEXT_ID)
-            if not session_id:
-                return {
-                    "success": False,
-                    "error": (
-                        "No session bound to your context. Pass session_id "
-                        "explicitly (and force=true if it isn't yours)."
-                    ),
-                }
-
-        with sup._lock:
-            exists = session_id in sup.sessions
-            bound_contexts = [c for c, s in sup.context_bindings.items() if s == session_id]
-        if not exists:
-            return {"success": False, "error": f"Session not found: {session_id}"}
-
-        owns = context_id in bound_contexts
-        other_contexts = [c for c in bound_contexts if c != context_id]
-
-        if not force:
-            # In isolated mode, restarting a session you aren't bound to is a
-            # cross-agent action -- require force.
-            if sup.isolated_contexts and not owns:
-                return {
-                    "success": False,
-                    "error": (
-                        f"Session {session_id} is not bound to your context. "
-                        f"It belongs to {len(bound_contexts)} other context(s). "
-                        f"Pass force=true to restart someone else's worker."
-                    ),
-                    "bound_other_contexts": len(other_contexts),
-                }
-            # The worker is shared by other agents (same binary opened by
-            # multiple contexts) -- restarting kills their work too.
-            if other_contexts:
-                return {
-                    "success": False,
-                    "error": (
-                        f"Session {session_id} is shared by {len(other_contexts)} "
-                        f"other context(s); restarting kills their in-flight work "
-                        f"too. Pass force=true to proceed."
-                    ),
-                    "bound_other_contexts": len(other_contexts),
-                }
-
-        session = sup.restart_worker(session_id)
-        if session is None:
-            return {"success": False, "error": f"Session not found: {session_id}"}
         return {
             "success": True,
-            "message": f"Worker for session {session_id} terminated; next call respawns.",
-            "session_id": session_id,
-            "affected_contexts": len(bound_contexts),
-        }
-    except Exception as e:
-        return {"success": False, "error": f"Failed to restart worker: {e}"}
-
-
-@mcp.tool
-def idalib_switch(session_id: Annotated[str, "Session ID to bind to active context"]) -> IdalibSwitchResult:
-    """Bind the active idalib context to an existing database worker."""
-    sup = _require_supervisor()
-    try:
-        context_id = sup.resolve_context_id()
-        session = sup.resolve_session(session_id)
-        sup.bind_context(context_id, session.session_id)
-        return {
-            "success": True,
-            **sup.context_fields(context_id),
             "session": session.to_dict(),
-            "message": f"Bound context to session: {session.session_id} ({session.filename})",
+            "warmup": session.last_warmup,
+            "message": f"Binary opened: {session.filename} ({session.session_id})",
         }
     except Exception as e:
-        return {**_context_fields_or_empty(sup), "error": str(e)}
+        return {"error": str(e)}
 
 
 @mcp.tool
-def idalib_unbind() -> IdalibUnbindResult:
-    """Unbind the active idalib context from any database."""
+def idb_list() -> IdalibListResult:
+    """List adopted sessions and discovered GUI/worker instances not yet opened through idb_open."""
     sup = _require_supervisor()
-    ctx = _context_fields_or_empty(sup)
     try:
-        context_id = sup.resolve_context_id()
-        if sup.unbind_context(context_id):
-            return {
-                "success": True,
-                **sup.context_fields(context_id),
-                "message": "Context unbound successfully.",
-            }
-        return {
-            "success": False,
-            **sup.context_fields(context_id),
-            "error": "No bound session for this context.",
-        }
+        sessions = sup.list_sessions()
+        return {"sessions": sessions, "count": len(sessions)}
     except Exception as e:
-        return {**ctx, "error": f"Failed to unbind context: {e}"}
+        return {"error": f"Failed to list sessions: {e}"}
 
 
 @mcp.tool
-def idalib_list() -> IdalibListResult:
-    """List database workers with context-binding metadata."""
+def idb_close(
+    database: Annotated[str, "Session ID returned by idb_open (see idb_list)."],
+    save: Annotated[bool, "Save the database before closing"] = True,
+) -> IdalibCloseResult:
+    """
+    Close a session: optionally save it, unregister it from the supervisor, and
+    terminate its owned worker (freeing a worker slot). Adopted GUI/worker instances
+    are detached, not killed.
+    """
     sup = _require_supervisor()
-    ctx = _context_fields_or_empty(sup)
     try:
-        context_id = sup.resolve_context_id()
-        sessions = sup.list_sessions(context_id)
-        return {
-            "sessions": sessions,
-            "count": len(sessions),
-            **sup.context_fields(context_id),
-            "current_context_session_id": sup.context_bindings.get(context_id),
-        }
+        return sup.close_session(database, save=save)
     except Exception as e:
-        return {**ctx, "error": f"Failed to list sessions: {e}"}
-
-
-@mcp.tool
-def idalib_current() -> IdalibCurrentResult:
-    """Return the database bound to the active idalib context."""
-    sup = _require_supervisor()
-    ctx = _context_fields_or_empty(sup)
-    try:
-        context_id = sup.resolve_context_id()
-        session_id = sup.context_bindings.get(context_id)
-        if session_id is None:
-            return {
-                "error": "No session bound for this context. Use idalib_open(...) or idalib_switch(session_id) first.",
-                **sup.context_fields(context_id),
-            }
-        session = sup.resolve_session(session_id)
-        return {**session.to_dict(), **sup.context_fields(context_id)}
-    except Exception as e:
-        return {**ctx, "error": f"Failed to get current session: {e}"}
-
-
-@mcp.tool
-def idalib_save(
-    path: Annotated[str, "Optional destination path (default: current IDB path)"] = "",
-    session_id: Annotated[Optional[str], "Optional session to save"] = None,
-) -> IdalibSaveResult:
-    """Save the selected database worker's IDB."""
-    sup = _require_supervisor()
-    ctx = _context_fields_or_empty(sup)
-    try:
-        context_id = sup.resolve_context_id()
-        session = sup.resolve_session(session_id)
-        if session_id:
-            sup.bind_context(context_id, session.session_id)
-        tool_name = "idb_save" if session.backend == "gui" else "idalib_save"
-        result = sup.call_worker_tool(session, tool_name, {"path": path})
-        if isinstance(result, dict):
-            return {**result, **sup.context_fields(context_id)}
-        return {"ok": False, **sup.context_fields(context_id), "error": "Unexpected save result"}
-    except Exception as e:
-        return {"ok": False, **ctx, "error": str(e)}
-
-
-@mcp.tool
-def idalib_health(
-    session_id: Annotated[Optional[str], "Optional session to probe"] = None,
-    full: Annotated[
-        bool, "Also fetch IDB readiness details (queues behind in-flight work)"
-    ] = True,
-) -> IdalibHealthResult:
-    """Health/ready probe for a database worker.
-
-    Liveness-first: probes the worker's non-blocking server_liveness with a
-    short timeout, so it answers even when the worker is busy or wedged. When
-    alive and idle (or full=True and not busy), it also fetches full IDB
-    readiness details. A busy worker returns alive=True, busy=True and the
-    in-flight tool / seconds instead of timing out behind the wedge.
-    """
-    sup = _require_supervisor()
-    try:
-        context_id = sup.resolve_context_id()
-        session = sup.resolve_session(session_id)
-        if session_id:
-            sup.bind_context(context_id, session.session_id)
-
-        ctx = sup.context_fields(context_id)
-
-        # 1) Liveness probe — short timeout, non-@idasync on the worker, so it
-        #    answers regardless of in-flight work. If it times out, the worker
-        #    is genuinely wedged/dead.
-        try:
-            live = sup.call_worker_tool(
-                session, "server_liveness", {}, timeout=_PROBE_WORKER_TIMEOUT_SEC
-            )
-        except Exception as e:
-            return {
-                "ready": False,
-                "alive": False,
-                **ctx,
-                "session": session.to_dict(),
-                "health": None,
-                "error": f"worker not responsive to liveness probe: {e}",
-            }
-
-        live = live if isinstance(live, dict) else {}
-        busy = bool(live.get("busy"))
-        base: IdalibHealthResult = {
-            **ctx,
-            "session": session.to_dict(),
-            "alive": True,
-            "busy": busy,
-            "inflight_tool": live.get("inflight_tool"),
-            "inflight_seconds": float(live.get("inflight_seconds") or 0.0),
-            "inflight_depth": int(live.get("inflight_depth") or 0),
-        }
-
-        # 2) Full readiness details only if requested AND the worker isn't busy
-        #    (fetching them is @idasync and would queue behind the in-flight tool).
-        if not full or busy:
-            base["ready"] = not busy
-            base["health"] = None
-            base["error"] = None
-            return base
-
-        health_tool = "server_health" if session.backend == "gui" else "idalib_health"
-        try:
-            result = sup.call_worker_tool(
-                session, health_tool, {}, timeout=_DEFAULT_WORKER_TOOL_TIMEOUT_SEC
-            )
-        except Exception as e:
-            # Liveness said alive; full health failed (likely just became busy).
-            base["ready"] = False
-            base["health"] = None
-            base["error"] = f"full health unavailable: {e}"
-            return base
-
-        if isinstance(result, dict):
-            # idalib_health worker tool already returns {ready, session, health}.
-            if health_tool == "idalib_health":
-                return {**result, **base}
-            return {
-                **base,
-                "ready": bool(not result.get("error")),
-                "health": result,
-                "error": None,
-            }
-        base["ready"] = False
-        base["health"] = None
-        base["error"] = "Unexpected health result"
-        return base
-    except Exception as e:
-        return {"ready": False, "alive": False, "error": str(e)}
-
-
-@mcp.tool
-def idalib_warmup(
-    session_id: Annotated[Optional[str], "Optional session to warm up"] = None,
-    wait_auto_analysis: Annotated[bool, "Wait for auto analysis queue"] = True,
-    build_caches: Annotated[bool, "Build core caches"] = True,
-    init_hexrays: Annotated[bool, "Initialize Hex-Rays plugin"] = True,
-) -> IdalibWarmupResult:
-    """Warm up selected database worker and core subsystems."""
-    sup = _require_supervisor()
-    try:
-        context_id = sup.resolve_context_id()
-        session = sup.resolve_session(session_id)
-        if session_id:
-            sup.bind_context(context_id, session.session_id)
-        if session.backend == "gui":
-            warmup = sup.call_worker_tool(
-                session,
-                "server_warmup",
-                {
-                    "wait_auto_analysis": wait_auto_analysis,
-                    "build_caches": build_caches,
-                    "init_hexrays": init_hexrays,
-                },
-                timeout=_WARMUP_WORKER_TIMEOUT_SEC,
-            )
-            return {
-                "ready": bool(isinstance(warmup, dict) and warmup.get("ok")),
-                **sup.context_fields(context_id),
-                "session": session.to_dict(),
-                "warmup": warmup if isinstance(warmup, dict) else None,
-                "error": None,
-            }
-        result = sup.call_worker_tool(
-            session,
-            "idalib_warmup",
-            {
-                "wait_auto_analysis": wait_auto_analysis,
-                "build_caches": build_caches,
-                "init_hexrays": init_hexrays,
-            },
-            timeout=_WARMUP_WORKER_TIMEOUT_SEC,
-        )
-        if isinstance(result, dict):
-            return {**result, **sup.context_fields(context_id)}
-        return {"ready": False, **sup.context_fields(context_id), "session": None, "warmup": None, "error": "Unexpected warmup result"}
-    except Exception as e:
-        return {"ready": False, "error": str(e)}
-
-
-@mcp.tool
-def idalib_aliases(
-    filename: Annotated[
-        Optional[str],
-        "If set, return only paths matching this filename (or empty if unknown).",
-    ] = None,
-) -> dict:
-    """Show filenames known to the supervisor alias registry.
-
-    The registry is populated by ``list_pe_images`` and lets ``idalib_open``
-    resolve bare filenames to absolute paths — useful when an upstream safety
-    layer strips absolute paths from tool arguments.
-    """
-    sup = _require_supervisor()
-    with sup._lock:
-        if filename is not None:
-            paths = sorted(sup.alias_registry.get(filename, ()))
-            return {"filename": filename, "paths": paths, "count": len(paths)}
-        snapshot = {
-            name: sorted(paths) for name, paths in sup.alias_registry.items()
-        }
-    return {"count": len(snapshot), "aliases": snapshot}
-
-
-@mcp.tool
-def idalib_search_roots() -> dict:
-    """Show directories the supervisor pre-scanned at startup via --search-root.
-
-    Each --search-root directory is walked once at supervisor startup and every
-    PE image found is registered in the alias registry. This means a freshly
-    connected client can call ``idalib_aliases()`` immediately to see what
-    binaries are available -- no need to know any server-side absolute path or
-    call ``list_pe_images`` first.
-    """
-    sup = _require_supervisor()
-    with sup._lock:
-        roots = list(sup.search_roots)
-    return {"roots": roots, "count": len(roots)}
-
-
-_PE_MACHINE_TABLE: dict[int, tuple[str, int | None]] = {
-    0x014C: ("x86", 32),
-    0x8664: ("x64", 64),
-    0x01C0: ("arm", 32),
-    0x01C4: ("armnt", 32),
-    0xAA64: ("arm64", 64),
-    0xA641: ("arm64ec", 64),
-    0x0200: ("ia64", 64),
-}
-
-_PE_OPT_MAGIC_BITNESS: dict[int, int] = {
-    0x10B: 32,
-    0x20B: 64,
-}
-
-_HASH_CHUNK_SIZE = 1024 * 1024
-
-# IDA on-disk artifacts that sit next to an analyzed binary. They are never
-# PE images, frequently exclusively locked by a live IDA worker (PermissionError
-# on read), and would otherwise show up as noise in every result entry for any
-# folder where someone has previously run IDA.
-_IDA_ARTIFACT_SUFFIXES = frozenset({
-    ".id0", ".id1", ".id2", ".nam", ".til", ".i64", ".idb",
-})
-
-
-# Unpacked database components. IDA keeps a database in this form only while it
-# is open and packs it into .i64/.idb on a clean close, so finding them with no
-# live owner means a worker died (killed, recycled, supervisor restart) before
-# saving. Reopening silently attaches to that half-written state.
-_IDA_COMPONENT_SUFFIXES = (".id0", ".id1", ".id2", ".nam", ".til", ".$$$")
-
-
-def _stale_idb_components(input_path: str) -> list[Path]:
-    """Unpacked database components next to ``input_path`` (GAME.EXE.id0 or GAME.id0)."""
-    path = Path(input_path)
-    bases = {str(path), str(path.with_suffix(""))}
-    found: list[Path] = []
-    for base in sorted(bases):
-        for suffix in _IDA_COMPONENT_SUFFIXES:
-            candidate = Path(base + suffix)
-            if candidate.is_file() and candidate not in found:
-                found.append(candidate)
-    return found
-
-
-def _quarantine_idb_components(
-    input_path: str, components: list[Path]
-) -> tuple[Path | None, list[str]]:
-    """Move orphaned components to ``.ida_stale/<name>-<timestamp>/`` beside the binary.
-
-    Moved rather than deleted so a crashed session's work stays recoverable.
-    Returns the quarantine directory (None if nothing moved) and per-file
-    failures; a file that can't be moved is usually locked by a live IDA.
-    """
-    path = Path(input_path)
-    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    target = path.parent / ".ida_stale" / f"{path.name}-{stamp}"
-    moved = False
-    failures: list[str] = []
-    for component in components:
-        try:
-            target.mkdir(parents=True, exist_ok=True)
-            shutil.move(str(component), str(target / component.name))
-            moved = True
-        except OSError as e:
-            failures.append(f"{component.name}: {e}")
-    return (target if moved else None), failures
-
-
-def _is_ida_artifact(name: str) -> bool:
-    # Path.suffix is lowercase-sensitive; normalize.
-    dot = name.rfind(".")
-    if dot < 0:
-        return False
-    return name[dot:].lower() in _IDA_ARTIFACT_SUFFIXES
-
-
-def _iter_candidate_files(
-    root: Path,
-    recursive: bool,
-    on_dir_error,
-    on_subdir=None,
-):
-    """Yield regular files under ``root``, skipping IDA artifact files.
-
-    Symlinks are not followed. Per-directory traversal errors are passed to
-    ``on_dir_error(path, exc)`` instead of aborting the walk. In non-recursive
-    mode, ``on_subdir(path)`` (when given) is called once per immediate
-    subdirectory so callers can report what a shallow scan skipped.
-    """
-    if recursive:
-        def _walk_error(err: OSError) -> None:
-            on_dir_error(getattr(err, "filename", str(root)) or str(root), err)
-
-        for dirpath, _dirnames, filenames in os.walk(
-            str(root), followlinks=False, onerror=_walk_error
-        ):
-            for name in filenames:
-                if _is_ida_artifact(name):
-                    continue
-                full = Path(dirpath) / name
-                try:
-                    st = full.lstat()
-                except OSError as e:
-                    on_dir_error(str(full), e)
-                    continue
-                import stat as _stat
-
-                if not _stat.S_ISREG(st.st_mode):
-                    continue
-                yield full, st
-        return
-
-    try:
-        entries = list(os.scandir(str(root)))
-    except OSError as e:
-        on_dir_error(str(root), e)
-        return
-    try:
-        import stat as _stat
-
-        for entry in entries:
-            if _is_ida_artifact(entry.name):
-                continue
-            try:
-                st = entry.stat(follow_symlinks=False)
-            except OSError as e:
-                on_dir_error(entry.path, e)
-                continue
-            if _stat.S_ISDIR(st.st_mode):
-                if on_subdir is not None:
-                    on_subdir(entry.path)
-                continue
-            if not _stat.S_ISREG(st.st_mode):
-                continue
-            yield Path(entry.path), st
-    finally:
-        for entry in entries:
-            try:
-                entry.close = entry.close  # entries from scandir are closed when GC'd
-            except Exception:
-                pass
-
-
-def _parse_pe_header(fh, file_size: int) -> dict | None:
-    """Parse a PE header from an open binary file. Returns ``None`` if not a PE."""
-    import struct
-
-    if file_size < 0x40:
-        return None
-    fh.seek(0)
-    dos = fh.read(0x40)
-    if len(dos) < 0x40 or dos[:2] != b"MZ":
-        return None
-    (e_lfanew,) = struct.unpack_from("<I", dos, 0x3C)
-    if e_lfanew < 0x40 or e_lfanew + 24 > file_size:
-        return None
-    fh.seek(e_lfanew)
-    pe_sig = fh.read(4)
-    if pe_sig != b"PE\x00\x00":
-        return None
-    file_header = fh.read(20)
-    if len(file_header) < 20:
-        return None
-    machine, _num_sections, _ts, _ptr_sym, _num_sym, size_opt, characteristics = struct.unpack(
-        "<HHIIIHH", file_header
-    )
-    bitness: int | None
-    arch_entry = _PE_MACHINE_TABLE.get(machine)
-    if arch_entry is not None:
-        arch, bitness = arch_entry
-    else:
-        arch, bitness = "unknown", None
-
-    if size_opt >= 2:
-        opt_magic_bytes = fh.read(2)
-        if len(opt_magic_bytes) == 2:
-            (opt_magic,) = struct.unpack("<H", opt_magic_bytes)
-            mag_bits = _PE_OPT_MAGIC_BITNESS.get(opt_magic)
-            if mag_bits is not None:
-                bitness = mag_bits
-
-    return {
-        "machine": "0x%04x" % machine,
-        "arch": arch,
-        "bitness": bitness,
-        "characteristics": "0x%04x" % characteristics,
-        "is_executable_image": bool(characteristics & 0x0002),
-        "is_dll": bool(characteristics & 0x2000),
-        "is_system": bool(characteristics & 0x1000),
-    }
-
-
-_ELF_MAGIC = bytes((0x7F, 0x45, 0x4C, 0x46))
-_MACHO_MAGICS_32 = (bytes((0xFE, 0xED, 0xFA, 0xCE)), bytes((0xCE, 0xFA, 0xED, 0xFE)))
-_MACHO_MAGICS_64 = (bytes((0xFE, 0xED, 0xFA, 0xCF)), bytes((0xCF, 0xFA, 0xED, 0xFE)))
-_ET_DYN = bytes((0x03, 0x00))
-
-_ELF_MACHINE_TABLE = {
-    0x03: ("x86", 32),
-    0x3E: ("x86_64", 64),
-    0x28: ("arm", 32),
-    0xB7: ("arm64", 64),
-    0x08: ("mips", 32),
-    0x14: ("ppc", 32),
-    0x15: ("ppc64", 64),
-    0xF3: ("riscv", None),
-}
-
-# MZ stub sub-formats keyed by the signature at e_lfanew. LE/LX are the DOS
-# extender / OS2 formats Watcom-era 386 tooling ships (DOS/4GW and friends) --
-# exactly the class of image a PE-only filter hides.
-_MZ_SUBFORMATS = {
-    b"NE": ("NE", "i386-16", 16),
-    b"LE": ("LE", "i386", 32),
-    b"LX": ("LX", "i386", 32),
-}
-
-
-def _sniff_binary_header(fh, file_size: int) -> dict:
-    """Classify any file the way ``_parse_pe_header`` classifies PE files.
-
-    Always returns a dict (``format`` "RAW" when nothing is recognized), so
-    non-PE images -- LE/LX extender images, ELF, headerless blobs -- can be
-    listed with the same entry shape as PE images.
-    """
-    import struct
-
-    unknown = {
-        "format": "RAW",
-        "machine": "",
-        "arch": "unknown",
-        "bitness": None,
-        "characteristics": "",
-        "is_executable_image": False,
-        "is_dll": False,
-        "is_system": False,
-    }
-
-    pe = _parse_pe_header(fh, file_size)
-    if pe is not None:
-        return {**pe, "format": "PE"}
-
-    fh.seek(0)
-    head = fh.read(0x40)
-    if len(head) < 4:
-        return unknown
-
-    if head[:4] == _ELF_MAGIC:
-        bitness = {1: 32, 2: 64}.get(head[4])
-        machine = None
-        if len(head) >= 0x14:
-            (machine,) = struct.unpack_from("<H", head, 0x12)
-        arch, arch_bits = _ELF_MACHINE_TABLE.get(machine, ("unknown", None))
-        return {
-            **unknown,
-            "format": "ELF",
-            "machine": "0x%04x" % machine if machine is not None else "",
-            "arch": arch,
-            "bitness": bitness or arch_bits,
-            "is_executable_image": True,
-            "is_dll": head[0x10:0x12] == _ET_DYN,
-        }
-
-    if head[:4] in _MACHO_MAGICS_32:
-        return {**unknown, "format": "MACHO", "bitness": 32, "is_executable_image": True}
-    if head[:4] in _MACHO_MAGICS_64:
-        return {**unknown, "format": "MACHO", "bitness": 64, "is_executable_image": True}
-
-    # A bare LE/LX image: an extender payload already carved out of its MZ stub.
-    if head[:2] in _MZ_SUBFORMATS:
-        fmt, arch, bitness = _MZ_SUBFORMATS[head[:2]]
-        return {
-            **unknown,
-            "format": fmt,
-            "arch": arch,
-            "bitness": bitness,
-            "is_executable_image": True,
-        }
-
-    if head[:2] in (b"MZ", b"ZM") and len(head) >= 0x40:
-        (e_lfanew,) = struct.unpack_from("<I", head, 0x3C)
-        if e_lfanew >= 0x40 and e_lfanew + 2 <= file_size:
-            fh.seek(e_lfanew)
-            sig = fh.read(2)
-            if sig in _MZ_SUBFORMATS:
-                fmt, arch, bitness = _MZ_SUBFORMATS[sig]
-                return {
-                    **unknown,
-                    "format": fmt,
-                    "arch": arch,
-                    "bitness": bitness,
-                    "is_executable_image": True,
-                }
-        return {
-            **unknown,
-            "format": "MZ",
-            "arch": "i386-16",
-            "bitness": 16,
-            "is_executable_image": True,
-        }
-
-    return unknown
-
-
-def _hash_file(path: Path) -> tuple[str, str]:
-    """Stream ``path`` and return ``(sha1_hex, "0x%08x" % crc32)``."""
-    import hashlib
-    import zlib
-
-    sha1 = hashlib.sha1()
-    crc = 0
-    with open(path, "rb") as f:
-        while True:
-            chunk = f.read(_HASH_CHUNK_SIZE)
-            if not chunk:
-                break
-            sha1.update(chunk)
-            crc = zlib.crc32(chunk, crc)
-    return sha1.hexdigest(), "0x%08x" % (crc & 0xFFFFFFFF)
-
-
-def _hash_file_verify(path: Path) -> tuple[str, str]:
-    """Stream ``path`` and return ``(sha256_hex, md5_hex)`` for caller verification."""
-    import hashlib
-
-    sha256 = hashlib.sha256()
-    md5 = hashlib.md5()
-    with open(path, "rb") as f:
-        while True:
-            chunk = f.read(_HASH_CHUNK_SIZE)
-            if not chunk:
-                break
-            sha256.update(chunk)
-            md5.update(chunk)
-    return sha256.hexdigest(), md5.hexdigest()
-
-
-def _path_components(p: str) -> list[str]:
-    """Split a path into lowercased components, tolerant of mixed / and \\.
-
-    A leading drive letter (``c:``) is dropped so ``c:/a/x.exe`` and ``/a/x.exe``
-    compare on their tails.
-    """
-    norm = (p or "").replace("\\", "/")
-    parts = [seg for seg in norm.split("/") if seg not in ("", ".")]
-    if parts and len(parts[0]) == 2 and parts[0][1] == ":":
-        parts = parts[1:]
-    return [seg.lower() for seg in parts]
-
-
-def _suffix_match_len(query_parts: list[str], candidate_path: str) -> int:
-    """Count trailing path components shared by query and candidate.
-
-    e.g. query ``system/Mplayer.dll`` vs candidate
-    ``F:/Reversing/mplayer/files/system/Mplayer.dll`` -> 2 (``system``,
-    ``mplayer.dll``). A bare filename matching the candidate's filename scores 1.
-    """
-    cand_parts = _path_components(candidate_path)
-    n = 0
-    for q, c in zip(reversed(query_parts), reversed(cand_parts)):
-        if q != c:
-            break
-        n += 1
-    return n
-
-
-def _loaded_index(sup: IdalibSupervisor) -> dict[str, str]:
-    """Snapshot ``path_key -> session_id`` for live sessions, taken under the supervisor lock."""
-    snapshot: list[tuple[str, str]] = []
-    with sup._lock:
-        for session in sup.sessions.values():
-            if not session.input_path:
-                continue
-            try:
-                if not session.is_alive():
-                    continue
-            except Exception:
-                continue
-            try:
-                key = sup._path_key(session.input_path)
-            except Exception:
-                key = os.path.normcase(session.input_path)
-            snapshot.append((key, session.session_id))
-    return dict(snapshot)
-
-
-@mcp.tool
-def list_pe_images(
-    directory: Annotated[str, "Absolute path to the directory to scan"],
-    recursive: Annotated[bool, "Recurse into subdirectories"] = False,
-    max_files: Annotated[int, "Max files to include before truncating (soft cap)"] = 2000,
-    max_errors: Annotated[int, "Max per-file/dir errors to record before truncating"] = 100,
-    time_budget_sec: Annotated[
-        float, "Wall-clock budget for the scan; 0 disables. Truncates when exceeded."
-    ] = 60.0,
-    hash: Annotated[
-        bool, "Compute SHA1/CRC32 per file. Disable for a fast discovery pass."
-    ] = True,
-    include_non_pe: Annotated[
-        bool,
-        "Also list non-PE files (LE/LX extender images, NE, plain MZ, ELF, "
-        "Mach-O and headerless blobs). Each entry's `format` says which.",
-    ] = False,
-) -> ListPeImagesResult:
-    """List PE images (EXE, DLL, SYS, OCX, ...) under a directory.
-
-    Filters to files with a valid MZ + PE\\0\\0 header, so LE/LX extender images,
-    16-bit NE binaries and headerless/raw blobs are invisible by default -- pass
-    ``include_non_pe=True`` to list every file with its detected ``format`` (PE, NE,
-    LE, LX, MZ, ELF, MACHO, RAW) instead. Each entry includes size, UTC
-    mtime, machine/arch/bitness, and Characteristics flags (is_executable_image, is_dll,
-    is_system). When ``hash=True`` (default) each entry also includes SHA1 and CRC32 over
-    the full file contents; when ``hash=False`` sha1 and crc32 are returned as empty
-    strings (the fields are always present so the published schema stays consistent),
-    which is much faster on large trees. Entries already opened in this supervisor are
-    flagged (loaded + session_id).
-
-    The ``path`` field is relative to the queried ``directory`` (forward-slash
-    separated) -- non-recursive scans return paths equal to the filename, recursive
-    scans return ``subdir/file.exe`` style relatives. Absolute paths stay strictly
-    server-internal: the alias registry built by this call uses absolute paths under
-    the hood so callers can pass either ``path`` or ``filename`` to ``idalib_open``.
-
-    Intended for shared/supervisor mode so clients can pick a binary for idalib_open and
-    compare against on-disk copies. ``directory`` must be an absolute path. For recursive
-    scans of very large trees: use ``hash=False`` for discovery, then call again with
-    ``hash=True`` on a narrowed directory. Scans truncate when any of ``max_files``,
-    ``max_errors``, or ``time_budget_sec`` is hit; the result reports ``limit_hit``.
-
-    Fallback: if ``directory`` does not exist on the server but ``--search-root``
-    was configured at startup, the supervisor scans the configured roots instead
-    and tags each entry with its ``source_root``. This lets agents that don't
-    know which paths the server has reachable -- e.g. a Linux-mounted view that
-    differs from the Windows-side mount -- still get a useful response.
-    """
-    from datetime import timezone
-
-    sup = _require_supervisor()
-    result: ListPeImagesResult = {
-        "directory": directory,
-        "recursive": bool(recursive),
-        "count": 0,
-        "images": [],
-    }
-
-    dir_path = Path(directory)
-    if not dir_path.is_absolute():
-        result["error"] = "directory must be an absolute path"
-        return result
-
-    # Decide which directories to scan. Normal path: just the requested one.
-    # Fallback path: the requested directory doesn't exist on the server, but
-    # --search-root directories were configured -- scan those and tag entries
-    # with source_root so the caller knows.
-    notes: list[str] = []
-    scan_targets: list[tuple[Path, str]] = []  # (scan_root, source_root_str or "")
-    fallback = False
-    searched_roots: list[str] = []
-
-    if dir_path.exists():
-        if not dir_path.is_dir():
-            result["error"] = f"not a directory: {directory}"
-            return result
-        scan_targets.append((dir_path, ""))
-    elif sup.search_roots:
-        fallback = True
-        with sup._lock:
-            configured_roots = list(sup.search_roots)
-        for raw_root in configured_roots:
-            root_path = Path(raw_root)
-            if root_path.exists() and root_path.is_dir():
-                scan_targets.append((root_path, raw_root))
-                searched_roots.append(raw_root)
-        if not scan_targets:
-            result["error"] = (
-                f"directory not found: {directory}; configured search roots are "
-                f"all unreachable: {configured_roots}"
-            )
-            return result
-        notes.append(
-            f"Directory '{directory}' not found on server; falling back to "
-            f"{len(searched_roots)} configured --search-root director"
-            f"{'y' if len(searched_roots) == 1 else 'ies'}."
-        )
-    else:
-        result["error"] = (
-            f"directory not found: {directory}. No --search-root configured "
-            f"so no fallback is available; call idalib_search_roots() to see "
-            f"what was configured."
-        )
-        return result
-
-    loaded = _loaded_index(sup)
-
-    # Each pending entry pairs the wire-format PeImageInfo (relative `path`) with the
-    # absolute filesystem path used for internal cross-referencing and registry
-    # population. Absolute paths never escape this function except inside `notes`
-    # (intentional debug aid) and aggregated via record_aliases (server-internal).
-    pending: list[tuple[PeImageInfo, str]] = []
-    errors: list[PeImageError] = []
-    truncated = False
-    limit_hit: str | None = None
-    deadline = time.monotonic() + time_budget_sec if time_budget_sec > 0 else None
-
-    def _record_error(path: str, exc: BaseException) -> None:
-        nonlocal truncated, limit_hit
-        if len(errors) >= max_errors:
-            if not truncated:
-                truncated = True
-                limit_hit = "max_errors"
-            return
-        errors.append({"path": path, "error": f"{type(exc).__name__}: {exc}"})
-
-    # Count immediate subdirectories skipped by a non-recursive scan so we can
-    # tell the caller what they'd reach with recursive=True (the mplayer case:
-    # executables landed one level down in system/ and Programs/).
-    skipped_subdirs = 0
-
-    def _record_subdir(_path: str) -> None:
-        nonlocal skipped_subdirs
-        skipped_subdirs += 1
-
-    on_subdir = None if recursive else _record_subdir
-
-    for scan_root, source_root in scan_targets:
-        if truncated:
-            break
-        for full_path, st in _iter_candidate_files(
-            scan_root, bool(recursive), _record_error, on_subdir=on_subdir
-        ):
-            if len(pending) >= max_files:
-                truncated = True
-                limit_hit = "max_files"
-                break
-            if deadline is not None and time.monotonic() >= deadline:
-                truncated = True
-                limit_hit = "time_budget"
-                break
-
-            try:
-                with open(full_path, "rb") as fh:
-                    if include_non_pe:
-                        header = _sniff_binary_header(fh, st.st_size)
-                    else:
-                        header = _parse_pe_header(fh, st.st_size)
-                        if header is not None:
-                            header = {**header, "format": "PE"}
-            except OSError as e:
-                _record_error(str(full_path), e)
-                continue
-            if header is None:
-                continue
-
-            sha1 = ""
-            crc32 = ""
-            if hash:
-                try:
-                    sha1, crc32 = _hash_file(full_path)
-                except OSError as e:
-                    _record_error(str(full_path), e)
-                    continue
-
-            abs_path = str(full_path)
-            try:
-                key = sup._path_key(abs_path)
-            except Exception:
-                key = os.path.normcase(abs_path)
-            session_id = loaded.get(key)
-
-            try:
-                rel_path = full_path.relative_to(scan_root).as_posix()
-            except ValueError:
-                # Walker promised a file under scan_root; if relative_to ever
-                # fails, fall back to the basename so we still emit something
-                # non-absolute on the wire.
-                rel_path = full_path.name
-
-            mtime = datetime.fromtimestamp(st.st_mtime, tz=timezone.utc).isoformat()
-
-            entry: PeImageInfo = {
-                "path": rel_path,
-                "filename": full_path.name,
-                "size": int(st.st_size),
-                "mtime": mtime,
-                "format": header["format"],
-                "sha1": sha1,
-                "crc32": crc32,
-                "machine": header["machine"],
-                "arch": header["arch"],
-                "bitness": header["bitness"],
-                "characteristics": header["characteristics"],
-                "is_executable_image": header["is_executable_image"],
-                "is_dll": header["is_dll"],
-                "is_system": header["is_system"],
-                "loaded": session_id is not None,
-                "session_id": session_id,
-                "source_root": source_root,
-            }
-            pending.append((entry, abs_path))
-
-    pending.sort(key=lambda pair: (pair[0].get("source_root", ""), pair[0]["path"].lower()))
-    # Record (filename -> absolute path) so callers can later open these binaries
-    # by bare filename (or by the relative `path` we just returned, which the
-    # idalib_open basename fallback handles). The registry keeps absolute paths
-    # internally; only the wire response uses relative paths.
-    sup.record_aliases({entry["filename"]: abs_p for entry, abs_p in pending})
-    images = [entry for entry, _ in pending]
-    result["images"] = images
-    result["count"] = len(images)
-    if errors:
-        result["errors"] = errors
-    if truncated:
-        result["truncated"] = True
-        if limit_hit is not None:
-            result["limit_hit"] = limit_hit
-    if fallback:
-        result["fallback_to_search_roots"] = True
-        result["searched_roots"] = searched_roots
-    if not recursive and skipped_subdirs and not truncated:
-        notes.append(
-            f"{skipped_subdirs} subdirector"
-            f"{'y' if skipped_subdirs == 1 else 'ies'} not scanned; "
-            f"pass recursive=True to descend into them."
-        )
-    if notes:
-        result["notes"] = notes
-    return result
+        return {"error": str(e)}
 
 
 @mcp.resource("ida://databases")
 def databases_resource() -> dict:
     """List open idalib worker databases."""
     sup = _require_supervisor()
-    context_id = sup.resolve_context_id()
-    return {
-        "databases": sup.list_sessions(context_id),
-        "count": len(sup.sessions),
-        **sup.context_fields(context_id),
-    }
+    databases = sup.list_sessions()
+    return {"databases": databases, "count": len(databases)}
 
 
 def _handle_tools_list(request_obj: dict[str, Any]) -> dict[str, Any]:
@@ -2719,25 +1377,16 @@ def _handle_tools_call(request_obj: dict[str, Any]) -> dict[str, Any] | None:
     tool_name = params.get("name", "")
     request_id = request_obj.get("id")
 
-    if tool_name in IDALIB_MANAGEMENT_TOOLS:
+    if tool_name in IDB_MANAGEMENT_TOOLS:
         return _original_dispatch(request_obj)
-    if tool_name in IDALIB_HIDDEN_PLUGIN_TOOLS:
-        return _jsonrpc_result(
-            request_id,
-            _call_tool_result(
-                {
-                    "error": (
-                        f"{tool_name} is a GUI-plugin routing tool and is not "
-                        "available through idalib-mcp. Use idalib_list or "
-                        "idalib_switch instead."
-                    )
-                },
-                is_error=True,
-            ),
-        )
 
     arguments = copy.deepcopy(params.get("arguments") or {})
     database = arguments.pop(_DATABASE_ARG, None)
+    if not isinstance(database, str) or not database:
+        return _jsonrpc_result(
+            request_id,
+            _call_tool_result({"error": _DATABASE_REQUIRED_ERROR}, is_error=True),
+        )
     try:
         session = sup.resolve_session(database)
     except Exception as e:
@@ -2746,7 +1395,25 @@ def _handle_tools_call(request_obj: dict[str, Any]) -> dict[str, Any] | None:
     forwarded = copy.deepcopy(request_obj)
     forwarded.setdefault("params", {})["arguments"] = arguments
     try:
-        return sup.forward_raw(session, forwarded)
+        return sup._worker_rpc(
+            session, forwarded, timeout=WORKER_CALL_TIMEOUT_SEC or None
+        )
+    except socket.timeout:
+        return _jsonrpc_result(
+            request_id,
+            _call_tool_result(
+                {
+                    "error": (
+                        f"Worker for session '{database}' did not respond within "
+                        f"{WORKER_CALL_TIMEOUT_SEC:.0f}s; it is still busy with an "
+                        f"earlier call. The session is kept open — retry later or "
+                        f"raise IDA_MCP_WORKER_CALL_TIMEOUT."
+                    ),
+                    "busy": True,
+                },
+                is_error=True,
+            ),
+        )
     except Exception as e:
         return _jsonrpc_result(request_id, _call_tool_result({"error": str(e)}, is_error=True))
 
@@ -2766,15 +1433,15 @@ def _handle_resource_templates_list(request_obj: dict[str, Any]) -> dict[str, An
 
 
 def _handle_resources_read(request_obj: dict[str, Any]) -> dict[str, Any] | None:
-    sup = _require_supervisor()
     uri = (request_obj.get("params") or {}).get("uri", "")
     if uri == "ida://databases":
         return _original_dispatch(request_obj)
-    try:
-        session = sup.resolve_session(None)
-        return sup.forward_raw(session, request_obj)
-    except Exception as e:
-        return _jsonrpc_error(request_obj.get("id"), -32001, str(e))
+    return _jsonrpc_error(
+        request_obj.get("id"),
+        -32001,
+        f"Resource '{uri}' is not routable from idalib-mcp. "
+        "Use tools with an explicit database= argument instead.",
+    )
 
 
 def dispatch_supervisor(request: dict | str | bytes | bytearray) -> dict | None:
@@ -2802,265 +1469,15 @@ def dispatch_supervisor(request: dict | str | bytes | bytearray) -> dict | None:
     if method in {"prompts/list", "prompts/get"}:
         return _original_dispatch(request_obj)
 
-    try:
-        session = _require_supervisor().resolve_session(None)
-    except Exception as e:
-        return _jsonrpc_error(request_obj.get("id"), -32001, str(e))
-    return _require_supervisor().forward_raw(session, request_obj)
-
-
-def _jsonrpc_proxy_error(request: bytes, message: str) -> dict | None:
-    request_id = None
-    try:
-        parsed = json.loads(request)
-        if isinstance(parsed, dict):
-            request_id = parsed.get("id")
-    except Exception:
-        request_id = None
-    if request_id is None:
-        return None
-    return {
-        "jsonrpc": "2.0",
-        "error": {"code": -32000, "message": message},
-        "id": request_id,
-    }
-
-
-def _http_jsonrpc(
-    *,
-    host: str,
-    port: int,
-    body: bytes,
-    session_id: str | None,
-    timeout: float | None = None,
-) -> tuple[dict | None, str | None]:
-    headers = {
-        "Content-Type": "application/json",
-        "Accept": "application/json, text/event-stream",
-    }
-    if session_id:
-        headers["Mcp-Session-Id"] = session_id
-
-    conn = http.client.HTTPConnection(host, port, timeout=timeout)
-    try:
-        conn.request("POST", "/mcp", body, headers)
-        response = conn.getresponse()
-        raw = response.read()
-        next_session_id = response.getheader("Mcp-Session-Id") or session_id
-        if response.status >= 400:
-            text = raw.decode("utf-8", errors="replace")
-            raise RuntimeError(f"HTTP {response.status} {response.reason}: {text}")
-        if response.status == 202:
-            return None, next_session_id
-        return json.loads(raw.decode("utf-8")), next_session_id
-    finally:
-        conn.close()
-
-
-def _probe_http_supervisor(host: str, port: int) -> bool:
-    try:
-        result, _ = _http_jsonrpc(
-            host=host,
-            port=port,
-            body=(
-                b'{"jsonrpc":"2.0","id":1,"method":"initialize",'
-                b'"params":{"protocolVersion":"2025-06-18",'
-                b'"capabilities":{},"clientInfo":{"name":"idalib-stdio-proxy",'
-                b'"version":"0"}}}'
-            ),
-            session_id=STDIO_PROXY_PROBE_SESSION_ID,
-            timeout=2.0,
-        )
-    except Exception:
-        return False
-    if not isinstance(result, dict) or "error" in result:
-        return False
-    initialize_result = result.get("result")
-    if not isinstance(initialize_result, dict):
-        return False
-    server_info = initialize_result.get("serverInfo")
-    return isinstance(server_info, dict) and server_info.get("name") == mcp.name
-
-
-def _spawn_shared_http_supervisor(
-    *,
-    host: str,
-    port: int,
-    worker_args: list[str],
-) -> subprocess.Popen:
-    cmd = [
-        sys.executable,
-        "-m",
-        "ida_pro_mcp.idalib_supervisor",
-        "--host",
-        host,
-        "--port",
-        str(port),
-        *worker_args,
-    ]
-
-    creationflags = 0
-    start_new_session = False
-    if os.name == "nt":
-        creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-    else:
-        start_new_session = True
-
-    logger.info("Starting shared idalib HTTP supervisor on %s:%d", host, port)
-    return subprocess.Popen(
-        cmd,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        creationflags=creationflags,
-        start_new_session=start_new_session,
-    )
-
-
-def _ensure_shared_http_supervisor(
-    *,
-    host: str,
-    port: int,
-    worker_args: list[str],
-) -> None:
-    if _probe_http_supervisor(host, port):
-        return
-
-    process = _spawn_shared_http_supervisor(
-        host=host,
-        port=port,
-        worker_args=worker_args,
-    )
-    deadline = time.monotonic() + STDIO_PROXY_START_TIMEOUT_SEC
-    while time.monotonic() < deadline:
-        if process.poll() is not None:
-            raise RuntimeError(
-                f"Shared idalib HTTP supervisor exited early with code {process.returncode}"
-            )
-        if _probe_http_supervisor(host, port):
-            return
-        time.sleep(0.2)
-    raise TimeoutError(
-        f"Shared idalib HTTP supervisor did not start on {host}:{port}"
-    )
-
-
-def _open_stdio_initial_database(
-    *,
-    host: str,
-    port: int,
-    input_path: Path,
-    session_id: str | None,
-) -> None:
-    payload = {
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "tools/call",
-        "params": {
-            "name": "idalib_open",
-            "arguments": {"input_path": str(input_path)},
-        },
-    }
-    response, _ = _http_jsonrpc(
-        host=host,
-        port=port,
-        body=json.dumps(payload).encode("utf-8"),
-        session_id=session_id,
-        timeout=None,
-    )
-    if not isinstance(response, dict) or "error" in response:
-        raise RuntimeError(
-            f"Failed to open initial database through shared supervisor: {response}"
-        )
-    result = response.get("result") or {}
-    if result.get("isError"):
-        content = result.get("content") or []
-        message = content[0].get("text", "unknown error") if content else "unknown error"
-        raise RuntimeError(
-            f"Failed to open initial database through shared supervisor: {message}"
-        )
-
-
-def _stdio_proxy(host: str, port: int, input_path: Path | None = None) -> None:
-    session_id: str | None = None
-    stdin = sys.stdin.buffer
-    stdout = sys.stdout.buffer
-
-    while True:
-        try:
-            request = stdin.readline()
-            if not request:
-                break
-            request = request.strip()
-            if not request:
-                continue
-
-            request_id = None
-            request_method = None
-            try:
-                parsed_request = json.loads(request)
-                if isinstance(parsed_request, dict):
-                    request_id = parsed_request.get("id")
-                    method = parsed_request.get("method")
-                    if isinstance(method, str):
-                        request_method = method
-            except Exception:
-                pass
-
-            try:
-                response, session_id = _http_jsonrpc(
-                    host=host,
-                    port=port,
-                    body=request,
-                    session_id=session_id,
-                    timeout=None,
-                )
-            except Exception as e:
-                response = _jsonrpc_proxy_error(request, str(e))
-
-            if (
-                input_path is not None
-                and request_method == "initialize"
-                and isinstance(response, dict)
-                and "error" not in response
-            ):
-                try:
-                    _open_stdio_initial_database(
-                        host=host,
-                        port=port,
-                        input_path=input_path,
-                        session_id=session_id,
-                    )
-                except Exception as e:
-                    response = _jsonrpc_error(request_id, -32000, str(e))
-
-            if response is not None:
-                stdout.write(json.dumps(response).encode("utf-8") + b"\n")
-                stdout.flush()
-        except (BrokenPipeError, KeyboardInterrupt):
-            break
+    return _original_dispatch(request_obj)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="MCP supervisor for IDA Pro via idalib")
     parser.add_argument("--verbose", "-v", action="store_true", help="Show debug messages")
-    stdio_group = parser.add_mutually_exclusive_group()
-    stdio_group.add_argument("--stdio", action="store_true", help="Serve MCP over stdio instead of HTTP")
-    stdio_group.add_argument(
-        "--stdio-shared",
-        action="store_true",
-        help=(
-            "Serve MCP over stdio by proxying to a shared local HTTP supervisor. "
-            "This lets stdio clients such as Codex sub-agents share opened databases."
-        ),
-    )
+    parser.add_argument("--stdio", action="store_true", help="Serve MCP over stdio instead of HTTP")
     parser.add_argument("--host", type=str, default="127.0.0.1", help="HTTP host, default: 127.0.0.1")
     parser.add_argument("--port", type=int, default=8745, help="HTTP port, default: 8745")
-    parser.add_argument(
-        "--isolated-contexts",
-        action="store_true",
-        help="Enable strict per-transport database binding isolation.",
-    )
     parser.add_argument("--unsafe", action="store_true", help="Enable unsafe worker tools (DANGEROUS)")
     parser.add_argument(
         "--profile",
@@ -3072,35 +1489,14 @@ def main() -> None:
     parser.add_argument(
         "--max-workers",
         type=int,
-        default=int(os.environ.get("IDA_MCP_MAX_WORKERS", "4")),
+        default=_env_int("IDA_MCP_MAX_WORKERS", 4),
         help="Maximum simultaneous idalib worker databases (0 = unlimited, default: 4).",
-    )
-    parser.add_argument(
-        "--search-root",
-        action="append",
-        default=[],
-        metavar="DIR",
-        help=(
-            "Absolute directory to pre-scan at startup. Every PE image found is "
-            "registered in the alias registry so clients can call idalib_open(filename) "
-            "without knowing the server-side absolute path. Repeatable."
-        ),
-    )
-    parser.add_argument(
-        "--search-root-recursive",
-        action="store_true",
-        help="Walk --search-root directories recursively. Off by default.",
     )
     parser.add_argument("input_path", type=Path, nargs="?", help="Optional binary to open on startup.")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO)
 
-    # worker_args is forwarded to idalib_server worker subprocesses (one per
-    # opened binary). Those workers accept --verbose / --unsafe / --profile but
-    # NOT supervisor-only flags like --search-root: a worker just opens one
-    # file, it never pre-scans directories. Adding supervisor-only flags here
-    # crashes every worker spawn with argparse exit code 2.
     worker_args: list[str] = []
     if args.verbose:
         worker_args.append("--verbose")
@@ -3109,60 +1505,17 @@ def main() -> None:
     if args.profile is not None:
         worker_args.extend(["--profile", str(args.profile)])
 
-    # Supervisor-only flags that re-spawning the supervisor as a daemon
-    # (--stdio-shared) needs to re-receive. Not forwarded to worker subprocesses.
-    supervisor_only_args: list[str] = []
-    for root in args.search_root:
-        supervisor_only_args.extend(["--search-root", str(root)])
-    if args.search_root_recursive:
-        supervisor_only_args.append("--search-root-recursive")
-
-    if args.stdio_shared:
-        if args.input_path is not None and not args.input_path.exists():
-            raise SystemExit(f"Input file not found: {args.input_path}")
-        daemon_args = list(worker_args) + list(supervisor_only_args)
-        if args.isolated_contexts:
-            daemon_args.append("--isolated-contexts")
-        daemon_args.extend(["--max-workers", str(args.max_workers)])
-        _ensure_shared_http_supervisor(
-            host=args.host,
-            port=args.port,
-            worker_args=daemon_args,
-        )
-        _stdio_proxy(args.host, args.port, input_path=args.input_path)
-        return
-
     global supervisor
     supervisor = IdalibSupervisor(
         mcp,
-        isolated_contexts=args.isolated_contexts,
         max_workers=args.max_workers,
         worker_args=worker_args,
     )
     mcp.registry.dispatch = dispatch_supervisor
-    mcp.require_streamable_http_session = args.isolated_contexts
-
-    if args.search_root:
-        summary = supervisor.prepopulate_aliases(
-            [str(r) for r in args.search_root],
-            recursive=args.search_root_recursive,
-        )
-        for root, info in summary.items():
-            if info.get("error"):
-                logger.warning(
-                    "--search-root %s skipped: %s", root, info["error"]
-                )
-            else:
-                logger.info(
-                    "--search-root %s: registered %d PE image(s)",
-                    root,
-                    info["count"],
-                )
 
     if args.input_path is not None:
-        startup_context_id = STDIO_DEFAULT_CONTEXT_ID if args.isolated_contexts else SHARED_FALLBACK_CONTEXT_ID
         try:
-            supervisor.open_session(str(args.input_path), context_id=startup_context_id)
+            supervisor.open_session(str(args.input_path))
         except Exception as e:
             raise SystemExit(f"Failed to open initial binary: {e}")
 
@@ -3179,7 +1532,9 @@ def main() -> None:
         if args.stdio:
             mcp.stdio()
         else:
-            mcp.serve(host=args.host, port=args.port, background=False)
+            # Threaded: a call to one busy worker must not block requests
+            # aimed at a different, idle one.
+            mcp.serve(host=args.host, port=args.port, background=False, threaded=True)
     finally:
         if supervisor is not None:
             supervisor.shutdown()

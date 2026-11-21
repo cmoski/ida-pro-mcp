@@ -12,6 +12,7 @@ import ida_bytes
 import idaapi
 import ida_funcs
 import ida_hexrays
+import ida_kernwin
 import ida_lines
 import ida_search
 import ida_segment
@@ -23,9 +24,11 @@ import idc
 
 from . import _objdump_search
 from . import jobs
+from .mainthread import get_pump
 from .rpc import tool, MCP_SERVER
 from .sync import (
     idasync,
+    get_tool_deadline,
     inflight_snapshot,
     tool_timeout,
     set_thread_timeout_override,
@@ -54,7 +57,7 @@ from .utils import (
 logger = logging.getLogger(__name__)
 
 
-class ServerHealthResult(TypedDict):
+class ServerHealthResult(TypedDict, total=False):
     status: str
     uptime_sec: float
     idb_path: str | None
@@ -65,6 +68,9 @@ class ServerHealthResult(TypedDict):
     hexrays_ready: bool
     strings_cache_ready: bool
     strings_cache_size: int
+    busy_tool: str
+    busy_sec: float
+    queued_calls: int
 
 
 class ServerWarmupStep(TypedDict, total=False):
@@ -157,10 +163,19 @@ _server_started_at = time.time()
 
 
 def _get_strings_cache() -> list[tuple[int, str]]:
-    """Get cached strings, building cache on first access."""
+    """Get cached strings, building cache on first access.
+
+    Both ASCII (C-style) and UTF-16 (wide) strings are scanned so that
+    ``find_regex`` can locate wide-char strings, which are common in Unreal
+    Engine and Windows binaries. ``idautils.Strings()`` defaults to
+    ``strtypes=[0]`` (C strings only), missing UTF-16 content — see #263.
+    """
     global _strings_cache
     if _strings_cache is None:
-        _strings_cache = [(s.ea, str(s)) for s in idautils.Strings() if s is not None]
+        strings = idautils.Strings()
+        # strtype 0 = C (ASCII/UTF-8), strtype 1 = Unicode C-Style (UTF-16).
+        strings.setup(strtypes=[0, 1])
+        _strings_cache = [(s.ea, str(s)) for s in strings if s is not None]
     return _strings_cache
 
 
@@ -385,15 +400,8 @@ def _build_health_payload() -> dict:
     }
 
 
-@tool
 @idasync
-def server_health() -> ServerHealthResult:
-    """Health/ready probe for MCP server and current IDB state.
-
-    Note: this is @idasync, so it queues behind any in-flight tool on the IDA
-    main thread. For a liveness signal that answers instantly even while the
-    worker is busy, use server_liveness() instead.
-    """
+def _server_health_full() -> ServerHealthResult:
     return _build_health_payload()
 
 
@@ -552,13 +560,29 @@ def job_cancel(
 
 
 @tool
+def server_health() -> ServerHealthResult:
+    """Health/ready probe for MCP server and current IDB state."""
+    # Every field below needs the IDA main thread. Report the busy state
+    # rather than queueing behind the very call we are meant to observe.
+    busy = get_pump().busy_status()
+    if busy is not None:
+        return {
+            "status": "busy",
+            "uptime_sec": round(time.time() - _server_started_at, 3),
+            "busy_tool": busy["tool"],
+            "busy_sec": busy["elapsed_sec"],
+            "queued_calls": busy["queued"],
+        }
+    return _server_health_full()
+
+
 @idasync
 def server_warmup(
-    wait_auto_analysis: Annotated[bool, "Wait for auto analysis queue"] = True,
-    build_caches: Annotated[bool, "Build core caches (currently strings)"] = True,
-    init_hexrays: Annotated[bool, "Initialize Hex-Rays decompiler plugin"] = True,
+    wait_auto_analysis: bool = True,
+    build_caches: bool = True,
+    init_hexrays: bool = True,
 ) -> ServerWarmupResult:
-    """Warm up IDA subsystems to reduce first-call latency and transient failures."""
+    """Warm up IDA subsystems. Called by idb_open; no longer exposed as an MCP tool."""
     steps = []
 
     if wait_auto_analysis:
@@ -932,7 +956,7 @@ def entity_query(
             rows.sort(key=lambda row: str(row.get(sort_by, "")).lower(), reverse=descending)
 
         offset = int(query.get("offset", 0) or 0)
-        count = int(query.get("count", 100) or 100)
+        count = int(query["count"]) if query.get("count") is not None else 100
         page = paginate(rows, offset, count)
         data = [{k: v for k, v in item.items() if k != "size_int"} for item in page["data"]]
 
@@ -1005,15 +1029,27 @@ def imports_query(
 def idb_save(
     path: Annotated[str, "Optional destination path (default: current IDB path)"] = "",
 ) -> IdbSaveResult:
-    """Save active IDB to disk, optionally to a provided path."""
+    """Save active IDB to disk, optionally to a provided path.
+
+    The open database is backed by loose working files (.id0/.id1/.id2/.nam/.til)
+    that IDA actively manages, headless included. Killing them out from under the
+    open database corrupts it (issues #446, #498), so DBFL_KILL is never used
+    here: an in-place save uses IDA's native save (Ctrl+W), and an explicit
+    different destination gets a compressed copy while the working files stay.
+    """
     try:
         save_path = path.strip() if path else ""
+        current = ida_loader.get_path(ida_loader.PATH_TYPE_IDB)
         if not save_path:
-            save_path = ida_loader.get_path(ida_loader.PATH_TYPE_IDB)
+            save_path = current
         if not save_path:
             return {"ok": False, "path": None, "error": "Could not resolve IDB path"}
 
-        ok = bool(ida_loader.save_database(save_path, 0))
+        if save_path != current:
+            ok = bool(ida_loader.save_database(save_path, ida_loader.DBFL_COMP))
+        else:
+            ok = bool(ida_loader.save_database(None, 0))
+
         result: dict = {"ok": ok, "path": save_path}
         if not ok:
             result["error"] = "save_database returned false"
@@ -1281,8 +1317,9 @@ def _maybe_search_text_fast(
 def search_text(
     pattern: Annotated[str, "Text to search for in the rendered listing (literal substring by default)"],
     limit: Annotated[int, "Max hits per page (default: 30, max: 500)"] = 30,
-    start: Annotated[str, "Cursor: address to resume from (hex or symbol). Empty = first segment."] = "",
-    regex: Annotated[bool, "Treat pattern as a regex (uses IDA's SEARCH_REGEX)"] = False,
+    start: Annotated[str, "Lower bound (hex or symbol). Empty = first segment."] = "",
+    end: Annotated[str, "Upper bound (hex or symbol, exclusive). Empty = last segment."] = "",
+    regex: Annotated[bool, "Treat pattern as a Python regex"] = False,
     case_sensitive: Annotated[bool, "Case-sensitive match (default: false)"] = False,
     include: Annotated[str, "'disasm' | 'comments' | 'all' (default: all)"] = "all",
     code_only: Annotated[bool, "Restrict search to executable segments (default: true)"] = True,
@@ -1290,25 +1327,24 @@ def search_text(
         float, "Wall-clock budget for the scan; 0 disables. Returns partial on hit."
     ] = 30.0,
 ) -> SearchTextResult:
-    """Search the rendered listing using IDA's native text search (fast C++ scan).
+    """Search the rendered listing for `pattern` over [start, end).
 
-    Discovers candidate EAs with `ida_search.find_text()`, then renders each hit
-    once via `ida_lines.generate_disassembly()` to extract matching lines and
-    classify them as disasm or comment. One hit per EA. If the wall-clock budget
-    is exceeded mid-scan, returns the hits found so far with cursor.truncated=True
-    and cursor.limit_hit="time_budget"; resume from cursor.next.
+    Walks heads in Python and renders each line, so the tool deadline and UI
+    Cancel interrupt it reliably. Scope with `start`/`end` on large binaries.
+    If the time budget or deadline is hit, partial hits come back with
+    cursor.truncated / cursor.cancelled; resume from cursor.next.
 
-    Fast path: when the IDA main thread is busy, disasm-only code searches are
-    served off-thread via objdump on the on-disk file. Those results carry
-    engine="objdump" and see raw disassembly only (no IDA names/comments).
+    When IDA is busy, disasm-only code searches without `end` are served
+    off-thread via objdump (engine="objdump"; raw disassembly, no IDA names).
     """
-    fast = _maybe_search_text_fast(
-        pattern, limit, start, regex, case_sensitive, include, code_only, time_budget_sec
-    )
-    if fast is not None:
-        return fast
+    if not end:
+        fast = _maybe_search_text_fast(
+            pattern, limit, start, regex, case_sensitive, include, code_only, time_budget_sec
+        )
+        if fast is not None:
+            return fast
     return _search_text_ida(
-        pattern, limit, start, regex, case_sensitive, include, code_only, time_budget_sec
+        pattern, limit, start, end, regex, case_sensitive, include, code_only, time_budget_sec
     )
 
 
@@ -1318,6 +1354,7 @@ def _search_text_ida(
     pattern: str,
     limit: int,
     start: str,
+    end: str,
     regex: bool,
     case_sensitive: bool,
     include: str,
@@ -1339,7 +1376,7 @@ def _search_text_ida(
     want_disasm = include in ("disasm", "all")
     want_comments = include in ("comments", "all")
 
-    # Build a Python-side matcher for per-line filtering after the C++ find.
+    # Per-line matcher (Python re or substring; case folding done here).
     if regex:
         try:
             flags = 0 if case_sensitive else re.IGNORECASE
@@ -1347,90 +1384,104 @@ def _search_text_ida(
         except re.error as e:
             return {"n": 0, "hits": [], "cursor": {"done": True}, "error": f"invalid regex: {e}"}
         matcher = lambda s: bool(rx.search(s))
+    elif case_sensitive:
+        needle = pattern
+        matcher = lambda s: needle in s
     else:
-        if case_sensitive:
-            needle = pattern
-            matcher = lambda s: needle in s
-        else:
-            needle = pattern.lower()
-            matcher = lambda s: needle in s.lower()
+        needle = pattern.lower()
+        matcher = lambda s: needle in s.lower()
 
-    # Build IDA search flags.
-    sflag = ida_search.SEARCH_DOWN | ida_search.SEARCH_NOSHOW
-    if case_sensitive:
-        sflag |= ida_search.SEARCH_CASE
-    if regex:
-        sflag |= ida_search.SEARCH_REGEX
-
-    # Resolve cursor.
     segments = _exec_segments() if code_only else _all_segments()
     if not segments:
         return {"n": 0, "hits": [], "cursor": {"done": True}}
 
     if start:
         try:
-            cursor_ea = parse_address(start)
+            start_ea = parse_address(start)
         except Exception as e:
             return {"n": 0, "hits": [], "cursor": {"done": True}, "error": f"invalid start: {e}"}
     else:
-        cursor_ea = segments[0][0]
+        start_ea = segments[0][0]
+
+    if end:
+        try:
+            end_ea = parse_address(end)
+        except Exception as e:
+            return {"n": 0, "hits": [], "cursor": {"done": True}, "error": f"invalid end: {e}"}
+    else:
+        end_ea = segments[-1][1]
+
+    if end_ea <= start_ea:
+        return {"n": 0, "hits": [], "cursor": {"done": True}}
 
     hits: list[SearchTextHit] = []
     next_cursor: int | None = None
-    timed_out = False
-    deadline = time.monotonic() + time_budget_sec if time_budget_sec > 0 else None
-    seg_idx = 0
-    # Skip ahead to the segment that contains/follows cursor_ea.
-    while seg_idx < len(segments) and segments[seg_idx][1] <= cursor_ea:
-        seg_idx += 1
-    if seg_idx < len(segments) and cursor_ea < segments[seg_idx][0]:
-        cursor_ea = segments[seg_idx][0]
+    cancelled = False
+    # Chunk the address space into fixed-size windows and call Heads() per
+    # chunk. This bounds each Heads()/next_head() C call to one CHUNK_BYTES
+    # scan — without it, a single next_head over a huge undefined gap can
+    # run for tens of seconds without yielding to Python, so neither the
+    # tool deadline nor the cancel flag can interrupt it.
+    #
+    # Between chunks we check (a) our own monotonic deadline directly
+    # (independent of sync.py's Timer, which can be starved by GIL contention
+    # on big binaries), and (b) the global cancel flag for UI-driven cancels.
+    # Either path returns a partial result with cursor.cancelled=True.
+    CHUNK_BYTES = 65536
+    deadline = get_tool_deadline()
+    if time_budget_sec > 0:
+        budget_deadline = time.monotonic() + time_budget_sec
+        deadline = budget_deadline if deadline is None else min(deadline, budget_deadline)
 
-    while seg_idx < len(segments) and len(hits) < limit:
-        if deadline is not None and time.monotonic() >= deadline:
-            next_cursor = cursor_ea
-            timed_out = True
+    for seg_start, seg_end in segments:
+        if cancelled or len(hits) >= limit:
             break
-        seg_start, seg_end = segments[seg_idx]
-        ea = ida_search.find_text(cursor_ea, 0, 0, pattern, sflag)
-        if ea == idaapi.BADADDR or ea >= seg_end:
-            seg_idx += 1
-            if seg_idx < len(segments):
-                cursor_ea = segments[seg_idx][0]
+        if seg_end <= start_ea:
             continue
-        if ea < seg_start:
-            # Match landed in a segment we already passed; skip.
-            cursor_ea = ea + 1
-            continue
-
-        lines = _classify_hit_lines(ea, matcher, want_disasm, want_comments)
-        if lines:
-            entry: SearchTextHit = {"addr": hex(ea), "matches": lines}
-            func = idaapi.get_func(ea)
-            if func is not None:
-                fname = ida_funcs.get_func_name(func.start_ea)
-                if fname:
-                    entry["function"] = fname
-            seg = idaapi.getseg(ea)
-            if seg is not None:
-                sname = ida_segment.get_segm_name(seg)
-                if sname:
-                    entry["segment"] = sname
-            hits.append(entry)
-            if len(hits) >= limit:
-                # Compute resume cursor: just past this hit.
-                size = max(1, idaapi.get_item_size(ea))
-                next_cursor = ea + size
+        if seg_start >= end_ea:
+            break
+        walk_start = max(seg_start, start_ea)
+        walk_end = min(seg_end, end_ea)
+        chunk_ea = walk_start
+        while chunk_ea < walk_end:
+            if cancelled or len(hits) >= limit:
                 break
-
-        # Advance past this match. Use item size if known to avoid re-hitting
-        # the same head's listing on the next iteration.
-        size = idaapi.get_item_size(ea)
-        cursor_ea = ea + (size if size > 0 else 1)
+            if (deadline is not None and time.monotonic() >= deadline) \
+                    or ida_kernwin.user_cancelled():
+                cancelled = True
+                next_cursor = chunk_ea
+                break
+            chunk_end = min(chunk_ea + CHUNK_BYTES, walk_end)
+            for head_ea in idautils.Heads(chunk_ea, chunk_end):
+                lines = _classify_hit_lines(head_ea, matcher, want_disasm, want_comments)
+                if not lines:
+                    continue
+                entry: SearchTextHit = {"addr": hex(head_ea), "matches": lines}
+                func = idaapi.get_func(head_ea)
+                if func is not None:
+                    fname = ida_funcs.get_func_name(func.start_ea)
+                    if fname:
+                        entry["function"] = fname
+                seg = idaapi.getseg(head_ea)
+                if seg is not None:
+                    sname = ida_segment.get_segm_name(seg)
+                    if sname:
+                        entry["segment"] = sname
+                hits.append(entry)
+                if len(hits) >= limit:
+                    size = max(1, idaapi.get_item_size(head_ea))
+                    next_cursor = head_ea + size
+                    break
+            chunk_ea = chunk_end
 
     cursor: dict[str, Any]
-    if timed_out and next_cursor is not None:
-        cursor = {"next": hex(next_cursor), "truncated": True, "limit_hit": "time_budget"}
+    if cancelled:
+        cursor = {
+            "next": hex(next_cursor),
+            "cancelled": True,
+            "truncated": True,
+            "limit_hit": "time_budget",
+        }
     elif next_cursor is not None:
         cursor = {"next": hex(next_cursor)}
     else:

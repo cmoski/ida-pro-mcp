@@ -1,6 +1,7 @@
 import pathlib
 import sys
 import unittest
+import http.client
 import http.server  # Preload stdlib http before adding local ida_mcp paths.
 
 
@@ -29,6 +30,7 @@ def _make_handler(
     host: str | None,
     origin: str | None,
     bound_host: str = "127.0.0.1",
+    request_version: str = "HTTP/1.1",
     allowed=None,
 ):
     mcp_server = McpServer("test")
@@ -46,12 +48,13 @@ def _make_handler(
     )()
     handler = _DummyHandler.__new__(_DummyHandler)
     handler.server = server
+    handler.request_version = request_version
     handler.mcp_server = mcp_server
-    headers = {}
+    headers = http.client.HTTPMessage()
     if host is not None:
-        headers["Host"] = host
+        headers.add_header("Host", host)
     if origin is not None:
-        headers["Origin"] = origin
+        headers.add_header("Origin", origin)
     handler.headers = headers
     errors = []
     handler.send_error = lambda code, message=None, explain=None: errors.append(
@@ -91,6 +94,29 @@ class BrowserTransportGuardTests(unittest.TestCase):
         self.assertFalse(handler._check_api_request())
         self.assertEqual(errors, [(403, "Invalid Host")])
 
+    def test_check_api_request_rejects_missing_host(self):
+        handler, errors = _make_handler(host=None, origin=None)
+        self.assertFalse(handler._check_api_request())
+        self.assertEqual(errors, [(400, "Invalid Host")])
+
+    def test_check_api_request_allows_missing_host_for_http10(self):
+        handler, errors = _make_handler(
+            host=None,
+            origin=None,
+            request_version="HTTP/1.0",
+        )
+        self.assertTrue(handler._check_api_request())
+        self.assertEqual(errors, [])
+
+    def test_check_api_request_rejects_duplicate_host(self):
+        handler, errors = _make_handler(
+            host="127.0.0.1:13337",
+            origin=None,
+        )
+        handler.headers.add_header("Host", "evil.example:13337")
+        self.assertFalse(handler._check_api_request())
+        self.assertEqual(errors, [(400, "Invalid Host")])
+
     def test_check_api_request_rejects_browser_origin_in_direct_mode(self):
         handler, errors = _make_handler(
             host="127.0.0.1:13337",
@@ -117,6 +143,44 @@ class BrowserTransportGuardTests(unittest.TestCase):
         )
         self.assertTrue(handler._check_api_request())
         self.assertEqual(errors, [])
+
+    # -- LAN connectivity tests (bound to 0.0.0.0) --
+
+    def test_nonloopback_bind_allows_lan_host(self):
+        self.assertTrue(
+            _host_header_allowed_for_bind("0.0.0.0", "192.168.1.10:13337")
+        )
+        self.assertTrue(
+            _host_header_allowed_for_bind("0.0.0.0", "10.0.0.5:13337")
+        )
+
+    def test_check_api_request_allows_lan_client_without_origin(self):
+        handler, errors = _make_handler(
+            host="192.168.1.10:13337",
+            origin=None,
+            bound_host="0.0.0.0",
+        )
+        self.assertTrue(handler._check_api_request())
+        self.assertEqual(errors, [])
+
+    def test_check_api_request_allows_lan_origin_with_wildcard_cors(self):
+        handler, errors = _make_handler(
+            host="192.168.1.10:13337",
+            origin="http://192.168.1.20:3000",
+            bound_host="0.0.0.0",
+            allowed="*",
+        )
+        self.assertTrue(handler._check_api_request())
+        self.assertEqual(errors, [])
+
+    def test_check_api_request_rejects_lan_origin_with_local_cors(self):
+        handler, errors = _make_handler(
+            host="192.168.1.10:13337",
+            origin="http://192.168.1.20:3000",
+            bound_host="0.0.0.0",
+        )
+        self.assertFalse(handler._check_api_request())
+        self.assertEqual(errors, [(403, "Invalid Origin")])
 
     def test_derive_external_base_url_prefers_forwarded_headers(self):
         base = _derive_external_base_url(

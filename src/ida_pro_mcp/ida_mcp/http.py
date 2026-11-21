@@ -65,15 +65,6 @@ def handle_enabled_tools(registry: McpRpcRegistry, config_key: str):
     if new_tools:
         enabled_tools.update({name: True for name in new_tools})
 
-    try:
-        from .api_discovery import _LOCAL_TOOL_NAMES as PROTECTED_TOOLS
-    except Exception:
-        PROTECTED_TOOLS = set()
-
-    for name in PROTECTED_TOOLS:
-        if name in original_tools:
-            enabled_tools[name] = True
-
     if enabled_tools != original_enabled_tools:
         config_json_set(config_key, enabled_tools)
 
@@ -123,46 +114,34 @@ class IdaMcpHttpRequestHandler(McpHttpRequestHandler):
                 return
             self._handle_config_post()
         else:
-            # Mark proxied requests so _redirecting_dispatch won't re-proxy (loop prevention)
-            from .api_discovery import PROXY_HEADER, set_request_proxied
-            set_request_proxied(self.headers.get(PROXY_HEADER) == "1")
-            try:
-                super().do_POST()
-            finally:
-                set_request_proxied(False)
+            super().do_POST()
 
     def do_GET(self):
         """Handles GET requests."""
-        from .api_discovery import PROXY_HEADER, set_request_proxied
+        parsed = urlparse(self.path)
+        path = parsed.path
 
-        set_request_proxied(self.headers.get(PROXY_HEADER) == "1")
-        try:
-            parsed = urlparse(self.path)
-            path = parsed.path
-
-            if path == "/config.html":
-                if not self._check_host():
-                    return
-                self._handle_config_get()
+        if path == "/config.html":
+            if not self._check_host():
                 return
+            self._handle_config_get()
+            return
 
-            if path == "/profile.txt":
-                if not self._check_host():
-                    return
-                self._handle_profile_export()
+        if path == "/profile.txt":
+            if not self._check_host():
                 return
+            self._handle_profile_export()
+            return
 
-            # Handle output download requests
-            output_match = re.match(r"^/output/([a-f0-9-]+)\.(\w+)$", path)
-            if output_match:
-                if not self._check_api_request():
-                    return
-                self._handle_output_download(output_match.group(1), output_match.group(2))
+        # Handle output download requests
+        output_match = re.match(r"^/output/([a-f0-9-]+)\.(\w+)$", path)
+        if output_match:
+            if not self._check_api_request():
                 return
+            self._handle_output_download(output_match.group(1), output_match.group(2))
+            return
 
-            super().do_GET()
-        finally:
-            set_request_proxied(False)
+        super().do_GET()
 
     def _handle_profile_export(self):
         """Return the currently enabled tools as a profile file."""
@@ -184,31 +163,7 @@ class IdaMcpHttpRequestHandler(McpHttpRequestHandler):
         """Handle download of cached output data."""
         data = get_cached_output(output_id)
         if data is None:
-            from .api_discovery import (
-                get_output_proxy_target,
-                is_request_proxied,
-                proxy_output_to_instance,
-            )
-
-            target = get_output_proxy_target(output_id)
-            if target is None or is_request_proxied():
-                self.send_error(404, "Output not found or expired")
-                return
-            try:
-                status, _, response_headers, body = proxy_output_to_instance(
-                    target[0], target[1], f"/output/{output_id}.{extension}"
-                )
-            except Exception as e:
-                self.send_error(502, f"Failed to proxy output download: {e}")
-                return
-
-            self.send_response(status)
-            for header, value in response_headers:
-                if header.lower() == "transfer-encoding":
-                    continue
-                self.send_header(header, value)
-            self.end_headers()
-            self.wfile.write(body)
+            self.send_error(404, "Output not found or expired")
             return
 
         if extension == "json":
@@ -239,28 +194,25 @@ class IdaMcpHttpRequestHandler(McpHttpRequestHandler):
         return cast(HTTPServer, self.server).server_port
 
     def _check_origin(self) -> bool:
+        """Validate Origin for config POST requests.
+
+        Delegates to the zeromcp ``_check_api_request`` which already
+        handles non-loopback bindings (LAN) and respects the configured
+        CORS policy.  When the server is bound to 0.0.0.0 the Host
+        check passes for any client; the Origin check still enforces
+        the CORS policy so ``unrestricted`` is needed for browser-based
+        LAN config access.
         """
-        Prevents CSRF and DNS rebinding attacks by ensuring POST requests
-        originate from pages served by this server, not external websites.
-        """
-        origin = self.headers.get("Origin")
-        port = self.server_port
-        if origin not in (f"http://127.0.0.1:{port}", f"http://localhost:{port}"):
-            self.send_error(403, "Invalid Origin")
-            return False
-        return True
+        return self._check_api_request()
 
     def _check_host(self) -> bool:
+        """Validate Host header for config page access.
+
+        Delegates to ``_check_api_request`` so the same rules apply as
+        for MCP API calls: loopback-bound servers only accept loopback
+        Host headers; non-loopback servers (0.0.0.0) accept any Host.
         """
-        Prevents DNS rebinding attacks where an attacker's domain (e.g., evil.com)
-        resolves to 127.0.0.1, allowing their page to read localhost resources.
-        """
-        host = self.headers.get("Host")
-        port = self.server_port
-        if host not in (f"127.0.0.1:{port}", f"localhost:{port}"):
-            self.send_error(403, "Invalid Host")
-            return False
-        return True
+        return self._check_api_request()
 
     def _send_html(self, status: int, text: str):
         """
@@ -467,25 +419,26 @@ input[type="submit"]:hover {
             self.send_error(400, f"Unsupported Content-Type: {content_type}")
             return
 
-        # Parse the form data
-        length = int(self.headers.get("content-length", "0"))
-        postvars = parse_qs(self.rfile.read(length).decode("utf-8"))
+        body = self._read_body()
+        if body is None:
+            return
+        try:
+            postvars = parse_qs(body.decode("utf-8"))
+        except UnicodeDecodeError:
+            self.send_error(400, "Invalid form encoding")
+            return
 
         # Update CORS policy
         cors_policy = postvars.get("cors_policy", [DEFAULT_CORS_POLICY])[0]
         config_json_set("cors_policy", cors_policy)
         self.update_cors_policy()
 
-        # Update the server's tools (discovery tools cannot be disabled)
-        from .api_discovery import _LOCAL_TOOL_NAMES as PROTECTED_TOOLS
-
+        # Update the server's tools
         if "apply_profile" in postvars:
             whitelist = parse_profile(postvars.get("profile_text", [""])[0])
             enabled_tools = {name: name in whitelist for name in ORIGINAL_TOOLS.keys()}
         else:
             enabled_tools = {name: name in postvars for name in ORIGINAL_TOOLS.keys()}
-        for name in PROTECTED_TOOLS:
-            enabled_tools[name] = True
         self.mcp_server.tools.methods = {
             name: func
             for name, func in ORIGINAL_TOOLS.items()
@@ -493,7 +446,11 @@ input[type="submit"]:hover {
         }
         config_json_set("enabled_tools", enabled_tools)
 
-        # Redirect back to the config page
+        # Redirect back to the config page. No body follows, but under
+        # keep-alive that must be signalled explicitly (Content-Length: 0) -
+        # under the prior HTTP/1.0-only behavior the connection just closed,
+        # which made this ambiguous framing harmless.
         self.send_response(302)
         self.send_header("Location", "/config.html")
+        self.send_header("Content-Length", "0")
         self.end_headers()
