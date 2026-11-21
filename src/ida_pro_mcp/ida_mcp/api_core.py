@@ -78,6 +78,7 @@ class ServerWarmupStep(TypedDict, total=False):
     ok: bool
     ms: float
     error: str
+    skipped: str
 
 
 class ServerWarmupResult(TypedDict):
@@ -587,14 +588,24 @@ def server_warmup(
 
     if wait_auto_analysis:
         t0 = time.perf_counter()
-        ida_auto.auto_wait()
-        steps.append(
-            {
-                "step": "auto_wait",
-                "ok": True,
-                "ms": round((time.perf_counter() - t0) * 1000, 2),
-            }
-        )
+        # auto_wait() only drains queued work: with analysis disabled or the
+        # queue already empty it returns immediately. Say so instead of
+        # reporting an apparent 1 ms "analysis".
+        skipped = None
+        if not ida_auto.is_auto_enabled():
+            skipped = "auto analysis disabled; call analyze() to run it"
+        elif ida_auto.auto_is_ok():
+            skipped = "analysis queue already empty"
+        if skipped is None:
+            ida_auto.auto_wait()
+        step = {
+            "step": "auto_wait",
+            "ok": True,
+            "ms": round((time.perf_counter() - t0) * 1000, 2),
+        }
+        if skipped is not None:
+            step["skipped"] = skipped
+        steps.append(step)
 
     if build_caches:
         t0 = time.perf_counter()

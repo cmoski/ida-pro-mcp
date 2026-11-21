@@ -20,6 +20,7 @@ was loaded at.
 """
 
 import os
+import time
 
 from typing import Annotated, NotRequired, TypedDict
 
@@ -28,7 +29,9 @@ import idautils
 import ida_auto
 import ida_bytes
 import ida_diskio
+import ida_funcs
 import ida_ida
+import ida_kernwin
 import ida_idp
 import ida_loader
 import ida_segment
@@ -186,6 +189,158 @@ def _apply_addressing(segments: list, bits: int) -> list[SegmentBitness]:
     return results
 
 
+class AnalyzeRange(TypedDict):
+    start: str
+    end: str
+    name: NotRequired[str]
+
+
+class AnalyzeResult(TypedDict):
+    mode: str
+    ms: float
+    queued_ranges: list[AnalyzeRange]
+    auto_was_enabled: bool
+    auto_is_ok: bool
+    cancelled: bool
+    funcs_before: int
+    funcs_after: int
+    errors: NotRequired[list[str]]
+    notes: NotRequired[list[str]]
+
+
+def plan_and_wait(ranges: list[tuple[int, int]]) -> dict:
+    """Queue ``ranges`` for re-analysis and block until the auto-analyzer is idle.
+
+    ``ida_auto.auto_wait()`` alone only drains work that is already queued, and
+    returns at once when auto-analysis is disabled (idalib opened with
+    run_auto_analysis=False) -- which is why a bare wait could "finish" in 1 ms
+    having analyzed nothing. This enables the analyzer for the duration, queues
+    each range with ``plan_range``, waits, then restores the previous enabled
+    state. Shared by analyze, set_bitness, load_raw_file and function import.
+    """
+    was_enabled = bool(ida_auto.is_auto_enabled())
+    ida_auto.enable_auto(True)
+    funcs_before = ida_funcs.get_func_qty()
+    t0 = time.perf_counter()
+    completed = None
+    try:
+        for start, end in ranges:
+            if end > start:
+                ida_auto.plan_range(start, end)
+        completed = ida_auto.auto_wait()
+    finally:
+        if not was_enabled:
+            ida_auto.enable_auto(False)
+    cancelled = (completed is False) or bool(ida_kernwin.user_cancelled())
+    return {
+        "ms": round((time.perf_counter() - t0) * 1000, 2),
+        "auto_was_enabled": was_enabled,
+        "auto_is_ok": bool(ida_auto.auto_is_ok()),
+        "cancelled": cancelled,
+        "funcs_before": funcs_before,
+        "funcs_after": ida_funcs.get_func_qty(),
+    }
+
+
+def _parse_range_token(token: str) -> tuple[int, int] | None:
+    """Parse 'start-end' or 'start:size' (hex/dec/symbols). None if not a range."""
+    text = token.strip()
+    for sep, is_size in (("-", False), (":", True)):
+        if sep in text[1:]:
+            left, right = text.split(sep, 1)
+            try:
+                start = parse_address(left.strip())
+                rhs = parse_address(right.strip())
+            except Exception:
+                continue
+            end = start + rhs if is_size else rhs
+            if end <= start:
+                raise IDAError(f"Empty or inverted range: {token}")
+            return start, end
+    return None
+
+
+def _segment_span(seg) -> AnalyzeRange:
+    return {
+        "start": hex(seg.start_ea),
+        "end": hex(seg.end_ea),
+        "name": ida_segment.get_segm_name(seg),
+    }
+
+
+@tool
+@idasync
+@tool_timeout(600.0)
+def analyze(
+    ranges: Annotated[
+        list[str] | str | None,
+        "What to (re)analyze: 'start-end', 'start:size', segment names or "
+        "addresses (selects their segment). Omit for every segment.",
+    ] = None,
+    mode: Annotated[
+        str,
+        "'plan' (default): queue the ranges, then wait. 'wait': queue nothing, "
+        "just drain pending analysis.",
+    ] = "plan",
+) -> AnalyzeResult:
+    """Run auto-analysis and block until it finishes, even if analysis was off.
+
+    Reports elapsed ms, function counts before/after, and whether the wait was
+    cancelled by the tool deadline. For whole-database runs on large binaries,
+    wrap in submit_job to avoid client timeouts.
+    """
+    mode = (mode or "plan").lower()
+    if mode not in ("plan", "wait"):
+        raise IDAError(f"mode must be 'plan' or 'wait', got {mode!r}")
+
+    queued: list[AnalyzeRange] = []
+    spans: list[tuple[int, int]] = []
+    errors: list[str] = []
+    if mode == "plan":
+        if ranges is None:
+            for seg in _all_segments():
+                spans.append((seg.start_ea, seg.end_ea))
+                queued.append(_segment_span(seg))
+        else:
+            for token in normalize_list_input(ranges):
+                text = str(token)
+                try:
+                    span = _parse_range_token(text)
+                except IDAError as e:
+                    errors.append(str(e))
+                    continue
+                if span is not None:
+                    spans.append(span)
+                    queued.append({"start": hex(span[0]), "end": hex(span[1])})
+                    continue
+                segs, seg_errors = _resolve_segments(text)
+                errors.extend(e["error"] for e in seg_errors if "error" in e)
+                for seg in segs:
+                    spans.append((seg.start_ea, seg.end_ea))
+                    queued.append(_segment_span(seg))
+        if not spans:
+            raise IDAError("Nothing to analyze: " + ("; ".join(errors) or "no ranges"))
+
+    stats = plan_and_wait(spans)
+    result: AnalyzeResult = {"mode": mode, "queued_ranges": queued, **stats}
+    notes: list[str] = []
+    if not stats["auto_was_enabled"]:
+        notes.append(
+            "Auto-analysis was disabled (database opened without analysis); it was "
+            "enabled for this call and disabled again afterwards."
+        )
+    if stats["cancelled"]:
+        notes.append(
+            "Analysis was interrupted (tool deadline or cancel) and may be "
+            "incomplete; call analyze(mode='wait') to finish, or run via submit_job."
+        )
+    if errors:
+        result["errors"] = errors
+    if notes:
+        result["notes"] = notes
+    return result
+
+
 def _load_fixup(
     bits: int | None,
     segments: str | list[str] | None,
@@ -236,9 +391,7 @@ def _load_fixup(
 
     reanalyzed = False
     if reanalyze and changed:
-        for seg in changed:
-            ida_auto.plan_range(seg.start_ea, seg.end_ea)
-        ida_auto.auto_wait()
+        plan_and_wait([(seg.start_ea, seg.end_ea) for seg in changed])
         reanalyzed = True
         # Re-read state after analysis so the caller sees the settled bitness.
         for entry in results:
@@ -445,9 +598,7 @@ def load_raw_file(
 
     reanalyzed = False
     if reanalyze and created:
-        for seg in created:
-            ida_auto.plan_range(seg.start_ea, seg.end_ea)
-        ida_auto.auto_wait()
+        plan_and_wait([(seg.start_ea, seg.end_ea) for seg in created])
         reanalyzed = True
 
     if not created:

@@ -312,3 +312,120 @@ def test_decompile_explains_16bit_failure():
         assert "disassemble_function" in result["error"]
     finally:
         _drop_segment(SCRATCH_BASE)
+
+
+# ---------------------------------------------------------------------------
+# analyze / plan_and_wait
+# ---------------------------------------------------------------------------
+
+
+def _called_function():
+    """(callee_func, caller_func) for some direct call inside the image, or None."""
+    import ida_funcs
+    import idautils
+    import ida_xref
+
+    for callee_ea in idautils.Functions():
+        callee = ida_funcs.get_func(callee_ea)
+        if callee is None or callee.flags & (ida_funcs.FUNC_LIB | ida_funcs.FUNC_THUNK):
+            continue
+        for xref in idautils.XrefsTo(callee_ea):
+            if xref.type not in (ida_xref.fl_CN, ida_xref.fl_CF):
+                continue
+            caller = ida_funcs.get_func(xref.frm)
+            if caller is not None and caller.start_ea != callee.start_ea:
+                return callee, caller
+    return None
+
+
+@test()
+def test_analyze_wait_mode_is_a_quiet_no_op():
+    from ..api_load import analyze
+
+    result = analyze(mode="wait")
+    assert_has_keys(result, "ms", "funcs_before", "funcs_after", "auto_is_ok", "cancelled")
+    assert result["queued_ranges"] == []
+    assert result["cancelled"] is False
+    assert result["auto_is_ok"] is True
+    assert result["funcs_after"] == result["funcs_before"]
+
+
+@test()
+def test_analyze_rejects_bad_input():
+    from ..api_load import analyze
+
+    try:
+        analyze(mode="nope")
+        assert False, "invalid mode must raise"
+    except IDAError as e:
+        assert "mode" in str(e)
+    try:
+        analyze(ranges="0x2000-0x1000")
+        assert False, "inverted range must raise"
+    except IDAError as e:
+        assert "inverted" in str(e).lower()
+
+
+@test()
+def test_analyze_parses_size_ranges():
+    from ..api_load import _parse_range_token
+
+    assert _parse_range_token("0x1000:0x20") == (0x1000, 0x1020)
+    assert _parse_range_token("0x1000-0x1020") == (0x1000, 0x1020)
+    assert _parse_range_token(".text") is None
+
+
+@test()
+def test_analyze_runs_even_when_auto_analysis_is_disabled():
+    """The 1 ms warmup bug: with analysis off, a bare auto_wait did nothing.
+
+    Delete a called function, disable auto-analysis, then analyze the caller:
+    re-planning the call site must recreate the callee, and the previous
+    (disabled) analyzer state must be restored afterwards.
+    """
+    import ida_auto
+    import ida_funcs
+    from ..api_load import analyze
+
+    pair = _called_function()
+    if pair is None:
+        skip_test("no direct call between two functions in this binary")
+    callee, caller = pair
+    start, end = callee.start_ea, callee.end_ea
+    caller_range = f"{caller.start_ea:#x}-{caller.end_ea:#x}"
+
+    was_enabled = ida_auto.is_auto_enabled()
+    try:
+        assert ida_funcs.del_func(start)
+        assert ida_funcs.get_func(start) is None
+        ida_auto.enable_auto(False)
+
+        result = analyze(ranges=caller_range)
+
+        assert result["auto_was_enabled"] is False
+        assert any("disabled" in n for n in result.get("notes", []))
+        assert ida_auto.is_auto_enabled() is False, "previous state not restored"
+        assert result["cancelled"] is False
+        recreated = ida_funcs.get_func(start)
+        assert recreated is not None, "callee was not recreated by analysis"
+        assert recreated.start_ea == start
+        assert result["funcs_after"] == result["funcs_before"] + 1
+    finally:
+        ida_auto.enable_auto(was_enabled)
+        if ida_funcs.get_func(start) is None:
+            ida_funcs.add_func(start, end)
+
+
+@test()
+def test_server_warmup_reports_skipped_wait_when_auto_disabled():
+    import ida_auto
+    from ..api_core import server_warmup
+
+    was_enabled = ida_auto.is_auto_enabled()
+    try:
+        ida_auto.enable_auto(False)
+        result = server_warmup(wait_auto_analysis=True, build_caches=False, init_hexrays=False)
+        step = next(s for s in result["steps"] if s["step"] == "auto_wait")
+        assert "disabled" in step.get("skipped", ""), step
+    finally:
+        ida_auto.enable_auto(was_enabled)
