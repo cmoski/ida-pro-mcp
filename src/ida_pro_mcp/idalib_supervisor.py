@@ -181,6 +181,7 @@ class IdalibOpenResult(TypedDict, total=False):
     suggestions: list[str]
     candidates: list[IdalibOpenCandidate]
     load_fixup: dict[str, Any]
+    autosave: dict[str, Any]
 
 
 class IdalibListResult(TypedDict, total=False):
@@ -1320,7 +1321,11 @@ def _handle_stale_components(
     another process (an unregistered IDA). Live components are never touched.
     """
     with sup._lock:
-        if sup._path_key(resolved) in sup.path_to_session:
+        existing_id = sup.path_to_session.get(sup._path_key(resolved))
+        existing = sup.sessions.get(existing_id) if existing_id else None
+        # A mapped session only counts as an owner while it is alive; a worker
+        # that was killed leaves its mapping behind until the next open.
+        if existing is not None and sup._session_is_usable(existing):
             return
     if sup._find_instance_for_path(resolved) is not None:
         return
@@ -1387,6 +1392,12 @@ def idb_open(
         "Open unsaved .id0/.id1/... left by a dead worker instead of moving them "
         "to .ida_stale/ (default false).",
     ] = False,
+    autosave: Annotated[
+        bool, "Save automatically while idle (default true; headless sessions)"
+    ] = True,
+    autosave_idle_sec: Annotated[
+        float, "Idle seconds before an auto-save (default 60, min 5)"
+    ] = 60.0,
 ) -> IdalibOpenResult:
     """Open a binary and warm it up; returns its session (reused if already open).
 
@@ -1462,6 +1473,20 @@ def idb_open(
             result["sha256"], result["md5"] = _paths.hash_file_verify(Path(resolved))
         except OSError:
             pass
+        if session.backend == "worker":
+            try:
+                result["autosave"] = sup.call_worker_tool(
+                    session,
+                    "idb_autosave",
+                    {"enabled": autosave, "idle_sec": autosave_idle_sec},
+                )
+            except Exception as e:
+                notes.append(f"Could not configure idle auto-save: {e}")
+        elif autosave:
+            notes.append(
+                "Idle auto-save applies to headless sessions only; this GUI session "
+                "uses IDA's own autosave settings."
+            )
         if bitness is not None or processor:
             fixup_args: dict[str, Any] = {}
             if bitness is not None:

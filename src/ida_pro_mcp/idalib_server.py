@@ -9,6 +9,8 @@ from typing import Annotated, Any, TypedDict
 
 # idapro must go first to initialize idalib
 import idapro
+import ida_idp
+import ida_loader
 
 from ida_pro_mcp.ida_mcp import MCP_SERVER, MCP_UNSAFE
 from ida_pro_mcp.ida_mcp.api_core import (
@@ -24,6 +26,7 @@ from ida_pro_mcp.ida_mcp.rpc import (
     set_download_base_url,
     tool,
 )
+from ida_pro_mcp.autosave import IdleAutosave
 from ida_pro_mcp.idalib_session_manager import get_session_manager
 from ida_pro_mcp.worker_lifecycle import WorkerLifecycle
 
@@ -50,6 +53,18 @@ class IdalibOpenResult(TypedDict, total=False):
     error: str
 
 
+class IdbAutosaveResult(TypedDict, total=False):
+    enabled: bool
+    idle_sec: float
+    dirty: bool
+    saves: int
+    last_save_age_sec: float | None
+    last_save_ok: bool | None
+    last_error: str | None
+    saved_now: bool
+    error: str
+
+
 class IdalibListResult(TypedDict, total=False):
     sessions: list[IdalibSessionListInfo]
     count: int
@@ -61,11 +76,112 @@ logger = logging.getLogger(__name__)
 IDB_MANAGEMENT_TOOLS = {
     "idb_open",
     "idb_list",
+    "idb_autosave",
 }
 
 
 _LIFECYCLE = WorkerLifecycle()
 _PUMP = get_pump()
+# Idle auto-save: on by default, configurable per session via idb_open /
+# idb_autosave. Saves while the worker sits idle so a crash or kill loses at
+# most the work since the last idle period, not everything since open.
+_AUTOSAVE = IdleAutosave()
+_AUTOSAVE_TIMEOUT_SEC = 300.0
+
+# IDB events that mean the database content changed. Any of them marks the
+# database dirty for the idle auto-saver.
+_DIRTY_EVENTS = (
+    "renamed",
+    "cmt_changed",
+    "extra_cmt_changed",
+    "range_cmt_changed",
+    "func_added",
+    "func_updated",
+    "deleting_func",
+    "set_func_start",
+    "set_func_end",
+    "func_tail_appended",
+    "func_tail_deleted",
+    "func_noret_changed",
+    "ti_changed",
+    "op_ti_changed",
+    "op_type_changed",
+    "local_types_changed",
+    "byte_patched",
+    "make_code",
+    "make_data",
+    "destroyed_items",
+    "segm_added",
+    "segm_deleted",
+    "segm_moved",
+    "segm_name_changed",
+    "sgr_changed",
+    "bookmark_changed",
+    "frame_udm_created",
+    "frame_udm_deleted",
+    "frame_udm_renamed",
+    "frame_udm_changed",
+    "lt_udm_created",
+    "lt_udm_deleted",
+    "lt_udm_renamed",
+    "lt_udm_changed",
+    "lt_edm_created",
+    "lt_edm_deleted",
+    "lt_edm_renamed",
+    "lt_edm_changed",
+)
+
+
+class _DirtyHooks(ida_idp.IDB_Hooks):
+    pass
+
+
+def _mark_dirty_handler(self, *args):
+    _AUTOSAVE.mark_dirty()
+    return 0
+
+
+for _event in _DIRTY_EVENTS:
+    if hasattr(ida_idp.IDB_Hooks, _event):
+        setattr(_DirtyHooks, _event, _mark_dirty_handler)
+
+_DIRTY_HOOKS: _DirtyHooks | None = None
+
+
+def _install_dirty_hooks() -> None:
+    global _DIRTY_HOOKS
+    if _DIRTY_HOOKS is not None:
+        return
+    hooks = _DirtyHooks()
+    if hooks.hook():
+        _DIRTY_HOOKS = hooks
+    else:
+        logger.warning("Could not install IDB hooks; idle auto-save disabled")
+        _AUTOSAVE.configure(enabled=False)
+
+
+def _save_database_now() -> tuple[bool, str | None]:
+    """In-place native save (same as idb_save with no path). Main thread only."""
+    if get_session_manager()._active_session_id is None:
+        return False, "no database open"
+    ok = bool(ida_loader.save_database(None, 0))
+    return ok, None if ok else "save_database returned false"
+
+
+def _save_via_pump() -> tuple[bool, str | None]:
+    if _PUMP.active and not _PUMP.on_main_thread():
+        return _PUMP.submit(_save_database_now, label="autosave", timeout=_AUTOSAVE_TIMEOUT_SEC)
+    return _save_database_now()
+
+
+def _autosave_tick() -> None:
+    """Watchdog poll: save if dirty, enabled, and idle long enough."""
+    if _AUTOSAVE.maybe_save(
+        idle_for_sec=_LIFECYCLE.idle_for_sec(),
+        busy=_LIFECYCLE.is_busy(),
+        save=_save_via_pump,
+    ):
+        logger.info("Idle auto-save completed")
 _REGISTERED_PORT: int | None = None
 _BOUND_HOST: str = ""
 _BOUND_PORT: int = 0
@@ -113,6 +229,10 @@ def idb_open(
         str,
         "Preferred session ID (auto-generated if empty). Ignored if the file is already open.",
     ] = "",
+    autosave: Annotated[bool, "Save automatically while idle (default true)"] = True,
+    autosave_idle_sec: Annotated[
+        float, "Idle seconds before an auto-save (default 60, min 5)"
+    ] = IdleAutosave.DEFAULT_IDLE_SEC,
 ) -> IdalibOpenResult:
     """Open a binary, activate it, and warm up subsystems in one call."""
 
@@ -126,6 +246,8 @@ def idb_open(
                 init_hexrays,
                 idle_ttl_sec,
                 preferred_session_id,
+                autosave,
+                autosave_idle_sec,
             ),
             label="idb_open",
         )
@@ -148,6 +270,7 @@ def idb_open(
                 init_hexrays=init_hexrays,
             )
         _LIFECYCLE.set_idle_ttl(float(idle_ttl_sec), time.monotonic() - load_started_at)
+        _AUTOSAVE.configure(enabled=autosave, idle_sec=autosave_idle_sec)
         if _REGISTERED_PORT is None and _BOUND_HOST and _BOUND_PORT:
             _register_in_discovery(_BOUND_HOST, _BOUND_PORT, session.input_path)
         return {
@@ -174,6 +297,28 @@ def idb_list() -> IdalibListResult:
         return {"sessions": sessions, "count": len(sessions)}
     except Exception as e:
         return {"error": f"Failed to list sessions: {e}"}
+
+
+@tool
+def idb_autosave(
+    enabled: Annotated[bool | None, "Turn idle auto-save on/off (omit to keep)"] = None,
+    idle_sec: Annotated[
+        float | None, "Idle seconds before saving (min 5; omit to keep)"
+    ] = None,
+    save_now: Annotated[bool, "Also save immediately"] = False,
+) -> IdbAutosaveResult:
+    """Show or change idle auto-save for this database (on by default).
+
+    While enabled, a changed database is saved once no request has arrived for
+    idle_sec seconds, so a crash loses at most the work since the last idle
+    period. Disable it for scratch experiments you don't want persisted.
+    """
+    _AUTOSAVE.configure(enabled=enabled, idle_sec=idle_sec)
+    result: IdbAutosaveResult = {}
+    if save_now:
+        result["saved_now"] = _AUTOSAVE.run_save(_save_via_pump)
+    result.update(_AUTOSAVE.snapshot())  # type: ignore[typeddict-item]
+    return result
 
 
 def _install_dispatch_hook() -> None:
@@ -266,6 +411,8 @@ def main():
             logger.exception("MCP_SERVER.stop() failed during lifecycle shutdown")
 
     _LIFECYCLE.set_busy_probe(lambda: _PUMP.busy_status() is not None)
+    _install_dirty_hooks()
+    _LIFECYCLE.set_tick(_autosave_tick)
     _LIFECYCLE.start(on_shutdown=_on_lifecycle_exit)
     _install_dispatch_hook()
 

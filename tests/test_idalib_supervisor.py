@@ -2787,3 +2787,22 @@ def test_components_lock_state_classifies(tmp_path):
     state = paths.components_lock_state([comp])
     # Unlocked on Windows -> stale; on POSIX a just-written file is "possibly_open".
     assert state in ("stale", "possibly_open")
+
+
+def test_idb_open_enables_idle_autosave_by_default(tmp_path):
+    sample = tmp_path / "a.exe"
+    sample.write_bytes(b"MZ")
+    sup, result = _open_with_fake_supervisor(sample)
+    assert result["success"] is True, result
+    calls = [args for name, args in sup.tool_calls if name == "idb_autosave"]
+    assert calls == [{"enabled": True, "idle_sec": 60.0}]
+    assert "autosave" in result
+
+
+def test_idb_open_can_disable_idle_autosave(tmp_path):
+    sample = tmp_path / "a.exe"
+    sample.write_bytes(b"MZ")
+    sup, result = _open_with_fake_supervisor(sample, autosave=False, autosave_idle_sec=15)
+    assert result["success"] is True, result
+    calls = [args for name, args in sup.tool_calls if name == "idb_autosave"]
+    assert calls == [{"enabled": False, "idle_sec": 15}]

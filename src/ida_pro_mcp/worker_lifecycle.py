@@ -42,6 +42,7 @@ class WorkerLifecycle:
         self._thread: threading.Thread | None = None
         self._on_shutdown: Callable[[str], None] | None = None
         self._busy_probe: Callable[[], bool] | None = None
+        self._tick: Callable[[], None] | None = None
 
     def set_busy_probe(self, probe: Callable[[], bool]) -> None:
         """Register a callback reporting whether a call is currently running.
@@ -50,6 +51,18 @@ class WorkerLifecycle:
         would otherwise look idle and be shut down mid-work.
         """
         self._busy_probe = probe
+
+    def set_tick(self, tick: Callable[[], None]) -> None:
+        """Register a callback run on every watchdog poll (e.g. idle auto-save)."""
+        self._tick = tick
+
+    def is_busy(self) -> bool:
+        return bool(self._busy_probe is not None and self._busy_probe())
+
+    def idle_for_sec(self) -> float:
+        """Seconds since the last request reached the dispatcher."""
+        with self._lock:
+            return time.monotonic() - self._last_request_at
 
     def start(self, on_shutdown: Callable[[str], None]) -> None:
         if self._thread is not None:
@@ -100,6 +113,11 @@ class WorkerLifecycle:
 
     def _run(self) -> None:
         while not self._stop_event.wait(self.poll_interval_sec):
+            if self._tick is not None:
+                try:
+                    self._tick()
+                except Exception:
+                    logger.exception("Lifecycle tick raised")
             reason = self.check_shutdown_reason()
             if reason is None:
                 continue
