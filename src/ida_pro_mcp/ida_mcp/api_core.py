@@ -102,6 +102,9 @@ class IntConvertResult(TypedDict):
 class FunctionQueryRow(Function, total=False):
     has_type: bool
     size_int: int
+    noreturn: bool
+    thunk: bool
+    lib: bool
 
 
 class FunctionQueryPage(TypedDict, total=False):
@@ -796,6 +799,7 @@ def func_query(
         size_int = fn.end_ea - fn.start_ea
         fn_name = ida_funcs.get_func_name(fn.start_ea) or "<unnamed>"
         has_type = ida_nalt.get_tinfo(ida_typeinf.tinfo_t(), fn.start_ea)
+        flags = int(fn.flags)
         all_functions.append(
             {
                 "addr": hex(fn.start_ea),
@@ -803,6 +807,9 @@ def func_query(
                 "size": hex(size_int),
                 "size_int": size_int,
                 "has_type": has_type,
+                "noreturn": bool(flags & ida_funcs.FUNC_NORET),
+                "thunk": bool(flags & ida_funcs.FUNC_THUNK),
+                "lib": bool(flags & ida_funcs.FUNC_LIB),
             }
         )
 
@@ -844,6 +851,11 @@ def func_query(
         if "has_type" in query:
             require_type = bool(query.get("has_type"))
             filtered = [f for f in filtered if bool(f["has_type"]) is require_type]
+
+        for flag_key in ("noreturn", "thunk", "lib"):
+            if flag_key in query:
+                want = bool(query.get(flag_key))
+                filtered = [f for f in filtered if f[flag_key] is want]
 
         if sort_by == "name":
             filtered.sort(key=lambda f: f["name"].lower(), reverse=descending)

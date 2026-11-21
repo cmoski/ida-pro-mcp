@@ -10,6 +10,7 @@ from . import test_api_analysis
 from . import test_api_memory
 from . import test_api_modify
 from . import test_api_load
+from . import test_api_functions
 from . import test_api_types
 from . import test_api_stack
 from . import test_api_resources
