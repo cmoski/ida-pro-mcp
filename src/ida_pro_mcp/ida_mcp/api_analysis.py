@@ -786,10 +786,14 @@ def _profile_function(
 
 _DECOMPILE_CODE_MAX_CHARS = 30_000
 _DECOMPILE_RESULT_MAX_CHARS = OUTPUT_LIMIT_MAX_CHARS - 5_000
+# Batch decompile: each item gets an equal slice of the result budget, but
+# never less than this, so a page always carries some code.
+_DECOMPILE_MIN_ITEM_CHARS = 1_500
+_DECOMPILE_MAX_BATCH = 50
 
 
 def _paginate_decompile_code(
-    code: str, offset: int, max_lines: int
+    code: str, offset: int, max_lines: int, max_chars: int = _DECOMPILE_CODE_MAX_CHARS
 ) -> tuple[str, int, int, bool]:
     """Return a line page whose JSON-encoded code fits the output budget."""
     lines = code.split("\n")
@@ -803,7 +807,7 @@ def _paginate_decompile_code(
         addition = len(json.dumps(line)) - 2
         if page:
             addition += 2
-        if page and encoded_chars + addition > _DECOMPILE_CODE_MAX_CHARS:
+        if page and encoded_chars + addition > max_chars:
             break
         page.append(line)
         encoded_chars += addition
@@ -813,7 +817,9 @@ def _paginate_decompile_code(
     return "\n".join(page), line_count, total_lines, more
 
 
-def _attach_decompile_refs(result: DecompileResult, refs: list[Ref]) -> None:
+def _attach_decompile_refs(
+    result: DecompileResult, refs: list[Ref], max_chars: int = _DECOMPILE_RESULT_MAX_CHARS
+) -> None:
     """Attach as many refs as fit without pushing the result into RPC truncation."""
     if not refs:
         return
@@ -827,7 +833,7 @@ def _attach_decompile_refs(result: DecompileResult, refs: list[Ref]) -> None:
 
     for ref in refs:
         addition = len(json.dumps(ref)) + (2 if retained else 0)
-        if encoded_chars + addition > _DECOMPILE_RESULT_MAX_CHARS:
+        if encoded_chars + addition > max_chars:
             result["refs_truncated"] = True
             break
         retained.append(ref)
@@ -837,27 +843,14 @@ def _attach_decompile_refs(result: DecompileResult, refs: list[Ref]) -> None:
         result["refs"] = retained
 
 
-@tool
-@idasync
-@tool_timeout(90.0)
-def decompile(
-    addr: Annotated[str, "Function address or name to decompile"],
-    include_addresses: Annotated[
-        bool, "Append /*0xNNNN*/ markers per line (default: true). Set false to save tokens."
-    ] = True,
-    max_lines: Annotated[
-        int,
-        "Max pseudocode lines per page (default: 500, max: 5000); "
-        "pages may be smaller to stay under the output cap",
-    ] = 500,
-    offset: Annotated[int, "Skip first N pseudocode lines (default: 0)"] = 0,
+def _decompile_one(
+    addr: str,
+    include_addresses: bool,
+    max_lines: int,
+    offset: int,
+    result_budget: int,
 ) -> DecompileResult:
-    """Decompile a function. Follow cursor.next for more code; refs appear on the first page."""
-    if max_lines <= 0 or max_lines > 5000:
-        max_lines = 5000
-    if offset < 0:
-        offset = 0
-
+    """Decompile one function into a page that fits ``result_budget`` chars."""
     try:
         start = parse_address(addr)
         code, err = decompile_function_safe(start, include_addresses=include_addresses)
@@ -869,8 +862,9 @@ def decompile(
                 "cursor": {"done": True},
             }
 
+        code_budget = min(_DECOMPILE_CODE_MAX_CHARS, max(500, result_budget - 1_000))
         page, line_count, total_lines, more = _paginate_decompile_code(
-            code, offset, max_lines
+            code, offset, max_lines, code_budget
         )
 
         result: DecompileResult = {
@@ -891,7 +885,7 @@ def decompile(
                     cfunc = ida_hexrays.decompile(start)
                     if cfunc:
                         refs = _collect_decompile_refs(cfunc)
-                        _attach_decompile_refs(result, refs)
+                        _attach_decompile_refs(result, refs, result_budget)
             except Exception:
                 pass
         return result
@@ -902,6 +896,57 @@ def decompile(
             "error": str(e),
             "cursor": {"done": True},
         }
+
+
+@tool
+@idasync
+@tool_timeout(180.0)
+def decompile(
+    addrs: Annotated[
+        list[str] | str,
+        "Function address(es) or name(s): one, a list, or comma-separated (max 50)",
+    ],
+    include_addresses: Annotated[
+        bool, "Append /*0xNNNN*/ markers per line (default: true). Set false to save tokens."
+    ] = True,
+    max_lines: Annotated[
+        int,
+        "Max pseudocode lines per function page (default: 500, max: 5000); "
+        "pages may be smaller to stay under the output cap",
+    ] = 500,
+    offset: Annotated[int, "Skip first N pseudocode lines of each function (default: 0)"] = 0,
+) -> list[DecompileResult]:
+    """Decompile one or more functions; returns one result per address.
+
+    The output cap is shared across the batch, so large functions come back
+    truncated with cursor.next; re-call with that single address and offset to
+    continue. Refs appear on each function's first page. Errors are per item.
+    """
+    if max_lines <= 0 or max_lines > 5000:
+        max_lines = 5000
+    if offset < 0:
+        offset = 0
+
+    items = [str(a) for a in normalize_list_input(addrs)]
+    if not items:
+        raise IDAError("No addresses given")
+    overflow = items[_DECOMPILE_MAX_BATCH:]
+    items = items[:_DECOMPILE_MAX_BATCH]
+
+    per_item = max(_DECOMPILE_MIN_ITEM_CHARS, _DECOMPILE_RESULT_MAX_CHARS // len(items))
+    results: list[DecompileResult] = [
+        _decompile_one(addr, include_addresses, max_lines, offset, per_item) for addr in items
+    ]
+    for addr in overflow:
+        results.append(
+            {
+                "addr": addr,
+                "code": None,
+                "error": f"Batch limit is {_DECOMPILE_MAX_BATCH} functions per call",
+                "cursor": {"done": True},
+            }
+        )
+    return results
 
 
 @tool

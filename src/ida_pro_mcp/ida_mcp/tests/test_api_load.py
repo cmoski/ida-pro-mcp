@@ -306,7 +306,7 @@ def test_decompile_explains_16bit_failure():
         idaapi.create_insn(SCRATCH_BASE)
         assert ida_funcs.add_func(SCRATCH_BASE), "could not create scratch function"
 
-        result = decompile(hex(SCRATCH_BASE))
+        [result] = decompile(hex(SCRATCH_BASE))
         assert result["code"] is None
         assert "16-bit" in result["error"], result
         assert "disassemble_function" in result["error"]

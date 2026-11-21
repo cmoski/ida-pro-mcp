@@ -48,7 +48,7 @@ def test_decompile_valid_function():
     if not fn_addr:
         skip_test("binary has no functions")
 
-    result = decompile(fn_addr)
+    [result] = decompile(fn_addr)
     assert_shape(
         result,
         {
@@ -73,7 +73,7 @@ def test_decompile_valid_function():
 @test(binary="crackme03.elf")
 def test_decompile_main_contains_expected_logic():
     """decompile(main) exposes the core crackme logic in pseudocode."""
-    result = decompile("main")
+    [result] = decompile("main")
     assert_ok(result, "code")
     code = result["code"]
     assert "check_pw" in code
@@ -84,7 +84,7 @@ def test_decompile_main_contains_expected_logic():
 @test()
 def test_decompile_invalid_address():
     """decompile reports an error for an unmapped address."""
-    result = decompile(get_unmapped_address())
+    [result] = decompile(get_unmapped_address())
     assert result["code"] is None
     assert_error(result, contains="Decompilation failed")
 
@@ -98,7 +98,7 @@ def test_decompile_batch_addresses():
     if len(addrs) < 2:
         skip_test("binary has fewer than two functions")
 
-    results = [decompile(addr) for addr in addrs]
+    results = decompile(addrs)
     assert len(results) == len(addrs)
     for result, addr in zip(results, addrs):
         assert result["addr"] == addr
@@ -108,7 +108,7 @@ def test_decompile_batch_addresses():
 @test(binary="crackme03.elf")
 def test_decompile_by_name():
     """decompile accepts a function name and returns crackme pseudocode."""
-    result = decompile("check_pw")
+    [result] = decompile("check_pw")
     assert_ok(result, "code")
     assert "return" in result["code"]
 
@@ -116,7 +116,7 @@ def test_decompile_by_name():
 @test()
 def test_decompile_unknown_name():
     """decompile returns a specific error for an unknown function name."""
-    result = decompile("nonexistent_function_xyz")
+    [result] = decompile("nonexistent_function_xyz")
     assert result["code"] is None
     assert_error(result, contains="Not found")
 
@@ -124,7 +124,7 @@ def test_decompile_unknown_name():
 @test(binary="crackme03.elf")
 def test_decompile_default_includes_address_markers():
     """Default output carries /*0xNNNN*/ markers on at least one line."""
-    result = decompile("main")
+    [result] = decompile("main")
     assert_ok(result, "code")
     assert "/*0x" in result["code"]
 
@@ -132,7 +132,7 @@ def test_decompile_default_includes_address_markers():
 @test(binary="crackme03.elf")
 def test_decompile_include_addresses_false_strips_markers():
     """include_addresses=False drops all /*0xNNNN*/ markers."""
-    result = decompile("main", include_addresses=False)
+    [result] = decompile("main", include_addresses=False)
     assert_ok(result, "code")
     assert "/*0x" not in result["code"]
 
@@ -144,13 +144,13 @@ def test_decompile_pagination():
     if not fn_addr:
         skip_test("binary has no functions")
 
-    full = decompile(fn_addr, max_lines=5000)
+    [full] = decompile(fn_addr, max_lines=5000)
     assert_ok(full, "code")
     total = full["total_lines"]
     if total < 6:
         skip_test("function has fewer than 6 pseudocode lines")
 
-    page1 = decompile(fn_addr, max_lines=3)
+    [page1] = decompile(fn_addr, max_lines=3)
     assert_ok(page1, "code")
     assert page1["line_count"] == 3
     assert page1["total_lines"] == total
@@ -158,7 +158,7 @@ def test_decompile_pagination():
     assert "next" in page1["cursor"]
     assert page1["code"] == "\n".join(full["code"].split("\n")[:3])
 
-    page2 = decompile(fn_addr, max_lines=3, offset=page1["cursor"]["next"])
+    [page2] = decompile(fn_addr, max_lines=3, offset=page1["cursor"]["next"])
     assert_ok(page2, "code")
     assert page2["line_count"] <= 3
     assert page2["code"] != page1["code"]
@@ -168,7 +168,7 @@ def test_decompile_pagination():
 @test(binary="crackme03.elf")
 def test_decompile_refs_only_on_first_page():
     """Refs are attached on offset=0 and omitted on later pages."""
-    first = decompile(CRACKME_MAIN, max_lines=2, offset=0)
+    [first] = decompile(CRACKME_MAIN, max_lines=2, offset=0)
     assert_ok(first, "code")
     assert first.get("refs"), "expected refs on first page"
 
@@ -176,7 +176,7 @@ def test_decompile_refs_only_on_first_page():
     if nxt is None:
         skip_test("main has fewer than 3 pseudocode lines")
 
-    later = decompile(CRACKME_MAIN, max_lines=2, offset=nxt)
+    [later] = decompile(CRACKME_MAIN, max_lines=2, offset=nxt)
     assert_ok(later, "code")
     assert "refs" not in later
 
@@ -303,7 +303,7 @@ def test_disasm_interior_address_preserves_cursor():
 @test(binary="crackme03.elf")
 def test_decompile_refs_include_check_pw():
     """decompile surfaces cot_obj refs, including the check_pw call target."""
-    result = decompile(CRACKME_MAIN)
+    [result] = decompile(CRACKME_MAIN)
     assert_ok(result, "code")
     refs = result.get("refs", [])
     hit = next((r for r in refs if r["name"] == "check_pw"), None)
@@ -314,7 +314,7 @@ def test_decompile_refs_include_check_pw():
 @test(binary="crackme03.elf")
 def test_decompile_refs_decode_usage_string():
     """decompile refs carry decoded bytes for string-literal data targets."""
-    result = decompile(CRACKME_MAIN)
+    [result] = decompile(CRACKME_MAIN)
     assert_ok(result, "code")
     refs = result.get("refs", [])
     hit = next((r for r in refs if r["addr"] == CRACKME_USAGE_STRING), None)
@@ -1012,3 +1012,62 @@ def test_find_orphan_functions_pagination_advances():
     a2 = {o["addr"] for o in page2["data"]}
     assert len(page1["data"]) <= 3
     assert not (a1 & a2), f"pages overlap: {a1 & a2}"
+
+
+@test()
+def test_decompile_batch_mixes_results_and_per_item_errors():
+    """A list with valid functions and a bad address returns one result each, in order."""
+    import idautils
+
+    addrs = [hex(ea) for ea in list(idautils.Functions())[:2]]
+    if len(addrs) < 2:
+        skip_test("binary has fewer than two functions")
+    bad = get_unmapped_address()
+    results = decompile(addrs + [bad])
+    assert [r["addr"] for r in results] == addrs + [bad]
+    for r in results[:2]:
+        assert_ok(r, "code")
+    assert results[2]["code"] is None
+    assert results[2].get("error")
+
+
+@test()
+def test_decompile_accepts_comma_separated_string():
+    import idautils
+
+    addrs = [hex(ea) for ea in list(idautils.Functions())[:2]]
+    if len(addrs) < 2:
+        skip_test("binary has fewer than two functions")
+    results = decompile(",".join(addrs))
+    assert [r["addr"] for r in results] == addrs
+
+
+@test()
+def test_decompile_batch_shares_the_output_budget():
+    """A big batch stays under the RPC cap; truncated items carry a resumable cursor."""
+    import json
+    import idautils
+    from ..rpc import OUTPUT_LIMIT_MAX_CHARS
+
+    addrs = [hex(ea) for ea in list(idautils.Functions())[:50]]
+    results = decompile(addrs)
+    assert len(json.dumps(results)) < OUTPUT_LIMIT_MAX_CHARS
+    for r in results:
+        if r.get("code") and "next" in r["cursor"]:
+            [cont] = decompile(r["addr"], offset=r["cursor"]["next"])
+            assert cont.get("code"), cont
+            break
+
+
+@test()
+def test_decompile_batch_limit_reports_overflow_items():
+    import idautils
+
+    first = next(iter(idautils.Functions()), None)
+    if first is None:
+        skip_test("no functions")
+    addrs = [hex(first)] * 52
+    results = decompile(addrs)
+    assert len(results) == 52
+    assert all("Batch limit" in r["error"] for r in results[50:])
+    assert results[0].get("code")

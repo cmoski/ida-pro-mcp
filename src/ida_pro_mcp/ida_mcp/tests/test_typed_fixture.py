@@ -58,7 +58,7 @@ def test_typed_fixture_core_symbols():
 @test(binary="typed_fixture.elf")
 def test_typed_fixture_decompile_and_disasm():
     """typed fixture decompilation/disassembly exposes the expected string and call structure."""
-    dec = decompile(USE_WRAPPER)
+    [dec] = decompile(USE_WRAPPER)
     assert_ok(dec, "code")
     assert "sum_point" in dec["code"]
     assert "1234" in dec["code"]
