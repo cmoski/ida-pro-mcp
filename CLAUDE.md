@@ -8,7 +8,10 @@ IDA Pro MCP Server: exposes IDA Pro / idalib functionality to MCP clients.
 
 Main pieces:
 - `src/ida_pro_mcp/server.py`: MCP server entrypoint
-- `src/ida_pro_mcp/idalib_server.py`: headless idalib server
+- `src/ida_pro_mcp/idalib_supervisor.py`: `idalib-mcp` entry point; routes calls to per-database workers, GUI attach, open-conflict handling
+- `src/ida_pro_mcp/idalib_server.py`: headless idalib worker (one database per process)
+- `src/ida_pro_mcp/idalib_paths.py`: path resolution, alias registry, PE sniffing, database lock probing (no IDA imports)
+- `src/ida_pro_mcp/autosave.py`: idle auto-save policy for workers (no IDA imports)
 - `src/ida_pro_mcp/ida_mcp/`: IDA/plugin-side APIs
 
 Important API modules:
@@ -17,7 +20,8 @@ Important API modules:
 - `api_memory.py`: bytes/ints/strings, patching
 - `api_types.py`: structs, type inference, type application
 - `api_modify.py`: comments, renaming, asm patching
-- `api_load.py`: segment bitness/processor fixups, raw blob mapping, segment creation, rebasing
+- `api_load.py`: segment bitness/processor fixups, raw blob mapping, segment creation, rebasing, `analyze`/`plan_and_wait`, segment registers (ARM Thumb)
+- `api_functions.py`: function flags (noreturn/thunk/lib), function-list export/import (`docs/func-list-format.md`)
 - `api_stack.py`: stack frame operations
 - `api_sigmaker.py`: signature creation, scanning, xref signatures (uses sigmaker.py)
 - `api_debug.py`: debugger control, unsafe / low priority for tests
@@ -97,6 +101,7 @@ Use the headless test runner:
 ```bash
 uv run ida-mcp-test tests/crackme03.elf -q
 uv run ida-mcp-test tests/typed_fixture.elf -q
+uv run ida-mcp-test tests/thumb_fixture.elf -q
 uv run ida-mcp-test tests/crackme03.elf -c api_analysis
 uv run ida-mcp-test tests/typed_fixture.elf -p "*stack*"
 ```
@@ -112,12 +117,14 @@ Measure coverage across both maintained fixtures:
 uv run coverage erase
 uv run coverage run -m ida_pro_mcp.test tests/crackme03.elf -q
 uv run coverage run --append -m ida_pro_mcp.test tests/typed_fixture.elf -q
+uv run coverage run --append -m ida_pro_mcp.test tests/thumb_fixture.elf -q
 uv run coverage report --show-missing
 ```
 
 Current fixture intent:
 - `tests/crackme03.elf`: compact general regression fixture
 - `tests/typed_fixture.elf`: typed globals / structs / locals / stack coverage fixture
+- `tests/thumb_fixture.elf`: 288-byte ARM ELF with an unreferenced Thumb run (Thumb / segment-register tests); regenerate with `python tests/make_thumb_fixture.py`. Delete a stale `tests/thumb_fixture.elf.i64` after regenerating -- the runner reuses it.
 
 ### Test expectations
 - Prefer semantic assertions, not weak "field exists" checks

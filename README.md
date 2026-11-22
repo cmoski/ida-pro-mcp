@@ -244,11 +244,21 @@ xrefs_to("ImportantExport", database="library")
 
 ### Management tools
 
-- `idb_open(input_path, mode="prefer_headless", run_auto_analysis=True, build_caches=True, init_hexrays=True, preferred_session_id="")`: Open a binary, warm up subsystems (strings cache, Hex-Rays), and return its session ID. If a worker or GUI for this path is already running on the host, that instance is adopted and `preferred_session_id` is ignored.
+- `idb_open(input_path, mode="prefer_headless", run_auto_analysis=True, build_caches=True, init_hexrays=True, preferred_session_id="", directory=None, bitness=None, processor=None, keep_stale_components=False, autosave=True, autosave_idle_sec=60, instance="", on_conflict="error")`: Open a binary, warm up subsystems (strings cache, Hex-Rays), and return its session ID. If a worker for this path is already running on the host, it is adopted and `preferred_session_id` is ignored.
+  - **Path resolution:** `input_path` may be absolute, partial (`system/foo.dll`), a bare filename known from `list_pe_images` / `--search-root`, or the `.i64` itself. Misses return `suggestions`. Duplicate filenames return `candidates` with hashes. Success reports the file's `sha256`/`md5`.
+  - **Attach to a running IDA GUI:** `instance="<port|pid>"` (from `idb_list`) works directly in the GUI's database, with no path needed and no save conflicts.
+  - **Already open elsewhere:** if a GUI, or any other IDA process, holds the database, the open does not create a second writer. It returns a `conflict` and `options`. Re-call with `on_conflict="use_gui"` (attach to the GUI), `"copy"` (private writable copy of the last saved database), or `"read_only"` (private copy, with `idb_save`/autosave refused). idalib has no native read-only mode, hence the copy.
+  - **Load fixups:** `bitness`/`processor` are applied after load via `set_bitness`.
+  - **Stale components:** unsaved `.id0/.id1/...` left by a worker that died are moved to `.ida_stale/`. Components held open by a live process are never touched.
+  - **Idle auto-save:** on by default. A changed database is saved once no request has arrived for `autosave_idle_sec` seconds. Pass `autosave=False` to disable it, or use `idb_autosave` later.
 - `idb_list()`: List open sessions and running GUI IDA instances. Each entry has `adopted` (True if this supervisor manages it, False for GUIs/workers discovered but not yet opened via `idb_open`), `backend` (`worker` or `gui`), `is_active`, and process IDs.
-- `idb_close(database, save=True)`: Save (optionally), unregister the session, and terminate its owned worker, freeing a slot toward `--max-workers`. Adopted GUI/worker instances are detached, not killed.
+- `idb_close(database, save=True)`: Save (optionally), unregister the session, and terminate its owned worker, freeing a slot toward `--max-workers`. Adopted GUI/worker instances are detached, not killed. `save=False` also clears a wedged worker.
 - `idb_save(session_id, path="")`: Save a session's IDB to disk. Forwarded as a regular worker tool (`database=<id>` injected) — same signature in both backends.
+- `idb_autosave(enabled=None, idle_sec=None, save_now=False, database=<id>)`: Show or change idle auto-save for a headless session.
+- `list_pe_images(directory, recursive=False, hash=True, include_non_pe=False)`, `idb_aliases(filename=None)`, `idb_search_roots()`: Discover binaries and inspect the filename alias registry used by `idb_open`. `--search-root DIR` (repeatable, plus `--search-root-recursive`) pre-scans directories at startup.
 - Per-database health: call `server_health(database=<id>)` (forwarded). `idb_list()` reports `is_active` from the supervisor's TCP/RPC probe.
+
+With the GUI proxy (`ida-pro-mcp`), `list_instances()` and `select_instance(port)` switch between several open IDA windows, per MCP session.
 
 Worker controls:
 
@@ -293,7 +303,7 @@ The bundled Codex plugin forwards the runtime's `IDA_MCP_*` configuration variab
 - `list_funcs(queries)`: List functions (paginated, filtered).
 - `list_globals(queries)`: List global variables (paginated, filtered).
 - `imports(offset, count)`: List all imported symbols with module names (paginated).
-- `decompile(addr)`: Decompile function at the given address.
+- `decompile(addrs, include_addresses, max_lines, offset)`: Decompile one or more functions (list or comma-separated, max 50); always returns a list, one result per address, with per-item errors and a resumable `cursor`.
 - `disasm(addr)`: Disassemble function with full details (arguments, stack frame, etc).
 - `xrefs_to(addrs)`: Get all cross-references to address(es).
 - `xrefs_to_field(queries)`: Get cross-references to specific struct field(s).
@@ -305,7 +315,8 @@ The bundled Codex plugin forwards the runtime's `IDA_MCP_*` configuration variab
 - `set_comments(items)`: Set comments at address(es) in both disassembly and decompiler views.
 - `patch_asm(items)`: Patch assembly instructions at address(es).
 - `declare_type(decls)`: Declare C type(s) in the local type library.
-- `define_func(items)`: Define function(s) at address(es). Optionally specify `end` for explicit bounds.
+- `define_func(items)`: Define function(s) at address(es). Optionally specify `end` for explicit bounds, and `thumb` (ARM) to decode as Thumb/ARM.
+- `get_func_flags(addrs)` / `set_func_flags(items, reanalyze_callers=True)`: Read or set function flags (`noreturn`, `thunk`, `lib`, `hidden`, `static`, `far`). Changing `noreturn` re-analyzes every caller so flow after the calls is rebuilt. `func_query` also reports and filters these flags.
 - `define_code(items)`: Convert bytes to code instruction(s) at address(es).
 - `undefine(items)`: Undefine item(s) at address(es), converting back to raw bytes. Optionally specify `end` or `size`.
 
@@ -318,6 +329,8 @@ databases opened earlier too.
 
 - `set_bitness(bitness, segments, processor, undefine, reanalyze)`: Change segment addressing width to 16/32/64-bit, optionally switching processor module. Defaults to every segment plus the database-wide bitness, undefining and re-analyzing what it changed. Raw and extender images load at the host width, so a 32-bit image decodes as 64-bit code until this is called.
 - `load_raw_file(path, base, bitness, file_offset, size, segment_name, as_code, reanalyze)`: Map a headerless blob (extracted overlay, dumped image, extender payload) into the open database at a chosen address. Overlapping an existing segment is refused.
+- `analyze(ranges=None, mode="plan")`: Run auto-analysis over ranges (`start-end`, `start:size`, segment names; default all) and block until it finishes. It works even when the database was opened without analysis, and reports elapsed time and function counts before and after.
+- `set_sreg(items, undefine=False, reanalyze=True)` / `get_sreg(addrs, reg="T")`: Set or read a segment register over ranges. On 32-bit ARM, `reg="T", value=1` marks Thumb code (0 = ARM), bounded to `[start, end)`. Also works for other processors' segment registers.
 - `create_segment(start, end|size, name, sclass, bitness, permissions)`: Create an empty segment -- a BSS range the input file doesn't contain, for instance -- instead of zero-padding the input to fake it.
 - `rebase(new_base|delta)`: Move the whole program to a different load address, letting the loader fix up stored addresses.
 
@@ -404,6 +417,7 @@ http://127.0.0.1:13337/mcp?ext=dbg
 ## Export Operations
 
 - `export_funcs(addrs, format)`: Export function(s) in specified format (json, c_header, or prototypes).
+- `export_func_list(filter, ranges, path, offset)` / `import_func_list(data|path, create_missing, update_bounds, overwrite_names, overwrite_comments, apply_flags, rebase, dry_run)`: Bulk-sync function starts, ends, names, comments, flags and Thumb mode with another database (e.g. Ghidra) in the `ida-mcp-funcs` JSON format; see [docs/func-list-format.md](docs/func-list-format.md).
 
 ## Graph Operations
 
