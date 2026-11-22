@@ -144,3 +144,257 @@ def test_func_query_reports_and_filters_flags():
         assert hex(fn.start_ea) not in {row["addr"] for row in page["data"]}
     finally:
         set_func_flags({"addr": addr, "noreturn": original}, reanalyze_callers=False)
+
+
+# ---------------------------------------------------------------------------
+# export_func_list / import_func_list
+# ---------------------------------------------------------------------------
+
+
+def _plain_function():
+    """A non-thunk, non-library function that is safe to rename/comment."""
+    for ea in idautils.Functions():
+        fn = ida_funcs.get_func(ea)
+        if fn is not None and not fn.flags & (ida_funcs.FUNC_THUNK | ida_funcs.FUNC_LIB):
+            return fn
+    return None
+
+
+class _FuncState:
+    """Snapshot/restore a function's name and comments."""
+
+    def __init__(self, fn):
+        self.ea = fn.start_ea
+        self.name = ida_funcs.get_func_name(fn.start_ea)
+        self.user = bool(ida_bytes.has_user_name(ida_bytes.get_flags(fn.start_ea)))
+        self.cmt = ida_funcs.get_func_cmt(fn, False) or ""
+        self.rcmt = ida_funcs.get_func_cmt(fn, True) or ""
+
+    def restore(self):
+        import ida_name
+
+        fn = ida_funcs.get_func(self.ea)
+        if fn is None:
+            return
+        ida_name.set_name(self.ea, self.name if self.user else "", ida_name.SN_NOWARN)
+        ida_funcs.set_func_cmt(fn, self.cmt, False)
+        ida_funcs.set_func_cmt(fn, self.rcmt, True)
+
+
+def _single_entry_doc(fn, **overrides):
+    from ..api_functions import export_func_list
+
+    doc = export_func_list(ranges=f"{fn.start_ea:#x}-{fn.start_ea + 1:#x}")
+    assert doc["count"] == 1, doc
+    entry = dict(doc["functions"][0])
+    entry.update(overrides)
+    doc = dict(doc)
+    doc["functions"] = [entry]
+    return doc
+
+
+@test()
+def test_export_func_list_pages_every_function():
+    from ..api_functions import export_func_list
+
+    total = ida_funcs.get_func_qty()
+    if total == 0:
+        skip_test("no functions")
+    seen = []
+    offset = 0
+    while True:
+        page = export_func_list(offset=offset)
+        assert page["format"] == "ida-mcp-funcs" and page["version"] == 1
+        assert page["total"] == total
+        seen.extend(e["start"] for e in page["functions"])
+        if page["next_offset"] is None:
+            break
+        offset = page["next_offset"]
+    assert len(seen) == total
+    assert len(set(seen)) == total
+    first = ida_funcs.getn_func(0)
+    entry = next(e for e in export_func_list()["functions"] if e["start"] == hex(first.start_ea))
+    assert entry["end"] == hex(first.end_ea)
+    assert set(entry["flags"]) == {"noreturn", "thunk", "lib"}
+
+
+@test()
+def test_export_func_list_to_file_writes_full_document():
+    import json
+    import os
+    import tempfile
+    from ..api_functions import export_func_list
+
+    fd, path = tempfile.mkstemp(suffix=".json")
+    os.close(fd)
+    try:
+        summary = export_func_list(path=path)
+        assert "functions" not in summary
+        with open(path, encoding="utf-8") as fh:
+            doc = json.load(fh)
+        assert doc["count"] == summary["count"] == ida_funcs.get_func_qty()
+        assert len(doc["functions"]) == doc["count"]
+    finally:
+        os.unlink(path)
+
+
+@test()
+def test_import_func_list_roundtrip_restores_name_and_comment():
+    from ..api_functions import import_func_list
+
+    fn = _plain_function()
+    if fn is None:
+        skip_test("no plain function")
+    state = _FuncState(fn)
+    try:
+        doc = _single_entry_doc(
+            fn, name="mcp_sync_probe", user_name=True, comment="synced from ghidra"
+        )
+        result = import_func_list(data=doc, overwrite_names=True, overwrite_comments=True)
+        assert result["failed"] == 0, result
+        assert result["renamed"] == 1 and result["commented"] == 1, result
+        assert ida_funcs.get_func_name(fn.start_ea) == "mcp_sync_probe"
+        assert ida_funcs.get_func_cmt(ida_funcs.get_func(fn.start_ea), False) == "synced from ghidra"
+        # Re-importing the same document changes nothing.
+        again = import_func_list(data=doc)
+        assert again["renamed"] == 0 and again["commented"] == 0, again
+    finally:
+        state.restore()
+
+
+@test()
+def test_import_func_list_dry_run_changes_nothing():
+    from ..api_functions import import_func_list
+
+    fn = _plain_function()
+    if fn is None:
+        skip_test("no plain function")
+    state = _FuncState(fn)
+    try:
+        doc = _single_entry_doc(fn, name="mcp_dry_run_probe", user_name=True)
+        result = import_func_list(data=doc, overwrite_names=True, dry_run=True)
+        assert result["dry_run"] is True
+        assert result["renamed"] == 1
+        assert ida_funcs.get_func_name(fn.start_ea) == state.name
+    finally:
+        state.restore()
+
+
+@test()
+def test_import_func_list_keeps_user_names_unless_overwrite():
+    import ida_name
+    from ..api_functions import import_func_list
+
+    fn = _plain_function()
+    if fn is None:
+        skip_test("no plain function")
+    state = _FuncState(fn)
+    try:
+        assert ida_name.set_name(fn.start_ea, "mcp_user_named", ida_name.SN_NOWARN)
+        doc = _single_entry_doc(fn, name="mcp_incoming_name", user_name=True)
+        result = import_func_list(data=doc)
+        assert result["renamed"] == 0 and result["skipped"] >= 1, result
+        assert ida_funcs.get_func_name(fn.start_ea) == "mcp_user_named"
+    finally:
+        state.restore()
+
+
+@test()
+def test_import_func_list_recreates_deleted_function():
+    from ..api_functions import import_func_list
+
+    fn = _plain_function()
+    if fn is None:
+        skip_test("no plain function")
+    start, end = fn.start_ea, fn.end_ea
+    doc = _single_entry_doc(fn)
+    try:
+        assert ida_funcs.del_func(start)
+        result = import_func_list(data=doc)
+        assert result["created"] == 1, result
+        again = ida_funcs.get_func(start)
+        assert again is not None and again.start_ea == start and again.end_ea == end
+    finally:
+        if ida_funcs.get_func(start) is None:
+            ida_funcs.add_func(start, end)
+
+
+@test()
+def test_import_func_list_rebases_by_image_base():
+    from ..api_functions import import_func_list
+
+    fn = _plain_function()
+    if fn is None:
+        skip_test("no plain function")
+    state = _FuncState(fn)
+    try:
+        doc = _single_entry_doc(fn, name="mcp_rebased_probe", user_name=True)
+        shift = 0x100000
+        doc["image_base"] = hex(int(doc["image_base"], 16) + shift)
+        entry = doc["functions"][0]
+        entry["start"] = hex(int(entry["start"], 16) + shift)
+        entry["end"] = hex(int(entry["end"], 16) + shift)
+        result = import_func_list(data=doc, overwrite_names=True)
+        assert result["delta"] == hex(-shift), result
+        assert result["renamed"] == 1, result
+        assert ida_funcs.get_func_name(fn.start_ea) == "mcp_rebased_probe"
+    finally:
+        state.restore()
+
+
+@test()
+def test_import_func_list_reports_errors_per_entry():
+    from ..api_functions import import_func_list
+    from ..sync import IDAError
+
+    fn = _plain_function()
+    if fn is None or fn.end_ea - fn.start_ea < 4:
+        skip_test("no plain function")
+    inside = hex(fn.start_ea + 1)
+    result = import_func_list(
+        data={
+            "format": "ida-mcp-funcs",
+            "version": 1,
+            "functions": [{"start": inside}, {"end": "0x10"}],
+        }
+    )
+    assert result["failed"] == 2, result
+    assert "inside" in result["errors"][0]["error"]
+    assert "start" in result["errors"][1]["error"]
+    try:
+        import_func_list(data={"format": "something-else", "functions": []})
+        assert False, "wrong format must raise"
+    except IDAError as e:
+        assert "Unsupported format" in str(e)
+
+
+@test(binary="thumb_fixture.elf")
+def test_func_list_carries_thumb_mode():
+    from ..api_functions import export_func_list, import_func_list
+    from ..api_load import get_sreg, set_sreg_range
+
+    start = 0x8010
+    fn = ida_funcs.get_func(start)
+    if fn is not None:
+        ida_funcs.del_func(start)
+    ida_bytes.del_items(start, ida_bytes.DELIT_SIMPLE, 8)
+    set_sreg_range(start, 0x8018, "T", 0)
+    try:
+        doc = {
+            "format": "ida-mcp-funcs",
+            "version": 1,
+            "functions": [{"start": hex(start), "end": hex(start + 4), "thumb": True}],
+        }
+        result = import_func_list(data=doc, rebase="none")
+        assert result["failed"] == 0 and result["created"] == 1, result
+        assert result["thumb_set"] == 1
+        [val] = get_sreg(hex(start))
+        assert val["value"] == 1
+        assert ida_bytes.get_item_size(start) == 2, "not decoded as Thumb"
+        exported = export_func_list(ranges=f"{start:#x}-{start + 1:#x}")
+        assert exported["functions"][0]["thumb"] is True
+    finally:
+        if ida_funcs.get_func(start) is not None:
+            ida_funcs.del_func(start)
+        ida_bytes.del_items(start, ida_bytes.DELIT_SIMPLE, 8)
+        set_sreg_range(start, 0x8018, "T", 0)
