@@ -1093,7 +1093,33 @@ def define_func(items: list[DefineOp] | DefineOp) -> list[DefineResult]:
                 )
                 continue
 
+            thumb = item.get("thumb")
+            prior_mode = None
+            if thumb is not None:
+                from .api_load import get_sreg_value, set_sreg_range
+
+                # Mode in effect at start before we touch it; restored after
+                # the function when bounds are inferred.
+                prior_mode = get_sreg_value(start_ea, "T")
+                set_sreg_range(
+                    start_ea,
+                    None if end_ea == idaapi.BADADDR else end_ea,
+                    "T",
+                    1 if thumb else 0,
+                )
             success = ida_funcs.add_func(start_ea, end_ea)
+            if success and thumb is not None and end_ea == idaapi.BADADDR:
+                # Bounds were inferred while decoding in the requested mode;
+                # don't let the mode leak past the function.
+                func = idaapi.get_func(start_ea)
+                if func is not None:
+                    set_sreg_range(
+                        start_ea,
+                        func.end_ea,
+                        "T",
+                        1 if thumb else 0,
+                        restore_value=prior_mode if prior_mode is not None else 0,
+                    )
             if success:
                 func = idaapi.get_func(start_ea)
                 results.append(

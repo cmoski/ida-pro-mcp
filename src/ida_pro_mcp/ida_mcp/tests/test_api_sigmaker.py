@@ -31,6 +31,22 @@ from ..api_sigmaker import (
 from ..api_analysis import find_bytes
 
 
+def _signable_functions(min_size: int = 16) -> list[int]:
+    """Functions large enough that a unique byte signature can exist.
+
+    Tiny stubs (e.g. ``mov r0,#0; bx lr``) repeat byte-for-byte in small images.
+    """
+    import idaapi
+    import idautils
+
+    out = []
+    for ea in idautils.Functions():
+        fn = idaapi.get_func(ea)
+        if fn is not None and fn.end_ea - fn.start_ea >= min_size:
+            out.append(ea)
+    return out
+
+
 # ============================================================================
 # make_signature
 # ============================================================================
@@ -72,7 +88,7 @@ def test_make_signature_batch():
     """make_signature handles multiple addresses in one call."""
     import idautils
 
-    addrs = [hex(ea) for ea in list(idautils.Functions())[:3]]
+    addrs = [hex(ea) for ea in _signable_functions()[:3]]
     if len(addrs) < 2:
         skip_test("binary has fewer than two functions")
 
@@ -169,7 +185,7 @@ def test_make_signature_for_function_batch_mixed_input():
     import idautils
 
     # Build a mixed batch: first function as hex, second as its IDA name
-    funcs = list(idautils.Functions())[:2]
+    funcs = _signable_functions()[:2]
     if len(funcs) < 2:
         skip_test("binary has fewer than two functions")
 

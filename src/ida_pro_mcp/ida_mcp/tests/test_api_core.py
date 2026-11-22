@@ -273,6 +273,11 @@ def test_func_query_filters():
 @test()
 def test_list_globals_returns_non_empty_results_for_all_query():
     """list_globals('*') returns at least one global item."""
+    import idaapi
+    import idautils
+
+    if not any(not idaapi.get_func(ea) for ea, _ in idautils.Names()):
+        skip_test("binary has no named non-function items")
     page = list_globals({"filter": "*", "offset": 0, "count": 50})[0]
     assert_shape(
         page,
@@ -296,6 +301,10 @@ def test_list_globals_filter_matches_known_symbol():
 @test()
 def test_imports_returns_non_empty_page():
     """imports returns a non-empty page of typed import objects."""
+    import ida_nalt
+
+    if ida_nalt.get_import_module_qty() == 0:
+        skip_test("binary has no imports (static image)")
     page = imports(0, 50)
     assert_shape(
         page,

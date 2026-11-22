@@ -295,8 +295,11 @@ def test_decompile_explains_16bit_failure():
     a bare 'Decompilation failed'."""
     import ida_bytes
     import ida_funcs
+    import ida_idp
     from ..api_analysis import decompile
 
+    if ida_idp.ph_get_id() != ida_idp.PLFM_386:
+        skip_test("real-mode scratch code is x86-specific")
     _drop_segment(SCRATCH_BASE)
     try:
         create_segment(
@@ -429,3 +432,98 @@ def test_server_warmup_reports_skipped_wait_when_auto_disabled():
         assert "disabled" in step.get("skipped", ""), step
     finally:
         ida_auto.enable_auto(was_enabled)
+
+
+# ---------------------------------------------------------------------------
+# Segment registers / Thumb (semantic checks need tests/thumb_fixture.elf)
+# ---------------------------------------------------------------------------
+
+THUMB_START = 0x8010  # movs r0,#1 / bx lr / nop / nop
+THUMB_END = 0x8018  # ARM code resumes here
+
+
+def _reset_thumb_region():
+    import ida_bytes
+    import ida_funcs
+    from ..api_load import set_sreg_range
+
+    fn = ida_funcs.get_func(THUMB_START)
+    if fn is not None:
+        ida_funcs.del_func(fn.start_ea)
+    ida_bytes.del_items(THUMB_START, ida_bytes.DELIT_SIMPLE, THUMB_END - THUMB_START)
+    set_sreg_range(THUMB_START, THUMB_END, "T", 0)
+
+
+@test()
+def test_set_sreg_thumb_rejected_off_arm():
+    import ida_idp
+    from ..api_load import set_sreg
+
+    if ida_idp.ph_get_id() == ida_idp.PLFM_ARM:
+        skip_test("ARM database")
+    seg = get_first_segment()
+    if seg is None:
+        skip_test("no segments")
+    [res] = set_sreg({"start": seg[0], "size": 4, "reg": "T", "value": 1}, reanalyze=False)
+    assert "32-bit ARM" in res["error"], res
+
+
+@test()
+def test_get_sreg_unknown_register_reports_error():
+    from ..api_load import get_sreg
+
+    addr = get_first_segment()
+    if addr is None:
+        skip_test("no segments")
+    [res] = get_sreg(addr[0], reg="NOSUCHREG")
+    assert "no segment register" in res["error"]
+
+
+@test(binary="thumb_fixture.elf")
+def test_set_sreg_switches_decoding_between_arm_and_thumb():
+    import ida_bytes
+    import idc
+    from ..api_load import get_sreg, set_sreg
+
+    span = {"start": hex(THUMB_START), "end": hex(THUMB_END)}
+    try:
+        [arm] = set_sreg({**span, "value": 0}, undefine=True)
+        assert "error" not in arm, arm
+        assert ida_bytes.get_item_size(THUMB_START) == 4, (
+            f"ARM mode should give a 4-byte insn: {idc.GetDisasm(THUMB_START)!r}"
+        )
+
+        [thumb] = set_sreg({**span, "value": 1}, undefine=True)
+        assert "error" not in thumb, thumb
+        assert thumb["previous"] == 0
+        values = {r["addr"]: r["value"] for r in get_sreg([hex(THUMB_START), hex(THUMB_END)])}
+        assert values[hex(THUMB_START)] == 1
+        assert values[hex(THUMB_END)] == 0, "Thumb leaked past the range end"
+        assert ida_bytes.get_item_size(THUMB_START) == 2, (
+            f"Thumb mode should give a 2-byte insn: {idc.GetDisasm(THUMB_START)!r}"
+        )
+        assert "BX" in idc.GetDisasm(THUMB_START + 2).upper(), idc.GetDisasm(THUMB_START + 2)
+        assert "MOVS" in thumb["insn"].upper(), thumb["insn"]
+    finally:
+        _reset_thumb_region()
+
+
+@test(binary="thumb_fixture.elf")
+def test_define_func_thumb_infers_bounds_in_thumb_mode():
+    import ida_funcs
+    from ..api_load import get_sreg
+    from ..api_modify import define_func
+
+    _reset_thumb_region()
+    try:
+        [res] = define_func({"addr": hex(THUMB_START), "thumb": True})
+        assert "error" not in res, res
+        fn = ida_funcs.get_func(THUMB_START)
+        assert fn is not None
+        # movs r0,#1 ; bx lr -> the function ends right after the 2-byte bx lr.
+        assert fn.end_ea == THUMB_START + 4, hex(fn.end_ea)
+        values = {r["addr"]: r["value"] for r in get_sreg([hex(THUMB_START), hex(fn.end_ea)])}
+        assert values[hex(THUMB_START)] == 1
+        assert values[hex(fn.end_ea)] == 0, "Thumb mode leaked past the function"
+    finally:
+        _reset_thumb_region()

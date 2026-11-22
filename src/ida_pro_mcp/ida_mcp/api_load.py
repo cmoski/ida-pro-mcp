@@ -35,6 +35,8 @@ import ida_kernwin
 import ida_idp
 import ida_loader
 import ida_segment
+import ida_segregs
+import idc
 
 from .rpc import tool
 from .sync import idasync, tool_timeout, IDAError
@@ -778,3 +780,195 @@ def rebase(
         "image_base": hex(base),
         "segments": [_segment_state(seg) for seg in segments],
     }
+
+
+# ---------------------------------------------------------------------------
+# Segment registers (ARM Thumb "T", MIPS16, PPC VLE, x86 DS, ...)
+# ---------------------------------------------------------------------------
+
+
+class SregOp(TypedDict, total=False):
+    start: str
+    end: str
+    size: str
+    reg: str
+    value: int
+
+
+class SregChange(TypedDict):
+    start: str
+    end: NotRequired[str]
+    reg: NotRequired[str]
+    value: NotRequired[int]
+    previous: NotRequired[int]
+    insn: NotRequired[str]
+    error: NotRequired[str]
+    notes: NotRequired[list[str]]
+
+
+class SregValue(TypedDict):
+    addr: str
+    reg: NotRequired[str]
+    value: NotRequired[int | None]
+    error: NotRequired[str]
+
+
+def _reg_index(reg: str) -> int:
+    idx = ida_idp.str2reg(reg)
+    if idx is None or idx < 0:
+        raise IDAError(
+            f"Processor {ida_idp.get_idp_name() or '?'} has no segment register {reg!r}"
+        )
+    return idx
+
+
+def _check_thumb_allowed() -> None:
+    if ida_idp.ph_get_id() != ida_idp.PLFM_ARM or ida_ida.inf_is_64bit():
+        raise IDAError(
+            "Thumb mode (T register) exists only on 32-bit ARM; this database is "
+            f"{ida_idp.get_idp_name() or '?'} "
+            f"{'64' if ida_ida.inf_is_64bit() else '32'}-bit"
+        )
+
+
+def _get_sreg_value(ea: int, reg_idx: int) -> int | None:
+    value = ida_segregs.get_sreg(ea, reg_idx)
+    if value is None or value == idaapi.BADSEL or value < 0:
+        return None
+    return int(value)
+
+
+def get_sreg_value(ea: int, reg: str) -> int | None:
+    """Value of segment register ``reg`` at ``ea`` (None if unset)."""
+    return _get_sreg_value(ea, _reg_index(reg))
+
+
+def set_sreg_range(
+    start: int,
+    end: int | None,
+    reg: str,
+    value: int,
+    *,
+    restore_value: int | None = None,
+) -> int | None:
+    """Set ``reg`` to ``value`` over [start, end), restoring the old value at end.
+
+    ``split_sreg_range`` changes the value from ``start`` up to the next change
+    point, so to bound the change we re-assert the value that was in effect at
+    ``end`` (or ``restore_value`` when the caller captured it earlier). ``end``
+    of None leaves the change open-ended. Returns the previous value at
+    ``start`` (None if unset).
+    """
+    if reg.upper() == "T":
+        _check_thumb_allowed()
+    reg_idx = _reg_index(reg)
+    previous = _get_sreg_value(start, reg_idx)
+    prev_at_end = _get_sreg_value(end, reg_idx) if end is not None else None
+    if restore_value is not None:
+        prev_at_end = restore_value
+    if not ida_segregs.split_sreg_range(start, reg_idx, int(value), ida_segregs.SR_user):
+        raise IDAError(f"split_sreg_range failed at {start:#x}")
+    if end is not None and idaapi.getseg(end) is not None:
+        restore = prev_at_end if prev_at_end is not None else 0
+        if restore != int(value):
+            ida_segregs.split_sreg_range(end, reg_idx, restore, ida_segregs.SR_user)
+    return previous
+
+
+@tool
+@idasync
+@tool_timeout(240.0)
+def set_sreg(
+    items: Annotated[
+        list[SregOp] | SregOp,
+        "{start, end|size, reg='T', value=1}; omit end/size to set from start "
+        "to the next change point",
+    ],
+    undefine: Annotated[
+        bool, "Undefine the range first so existing code re-decodes (default false)"
+    ] = False,
+    reanalyze: Annotated[bool, "Decode from start and re-analyze the range"] = True,
+) -> list[SregChange]:
+    """Set a segment register over address ranges, e.g. mark Thumb code on ARM.
+
+    reg 'T' value 1 = Thumb, 0 = ARM (32-bit ARM only). Code already decoded in
+    the other mode stays until re-decoded: pass undefine=true to redo it.
+    """
+    if isinstance(items, dict):
+        items = [items]
+    results: list[SregChange] = []
+    spans: list[tuple[int, int]] = []
+    for item in items:
+        start_s = str(item.get("start", ""))
+        reg = str(item.get("reg") or "T")
+        try:
+            if not start_s:
+                raise IDAError("item is missing 'start'")
+            start = parse_address(start_s)
+            end: int | None = None
+            if item.get("end"):
+                end = parse_address(str(item["end"]))
+            elif item.get("size"):
+                size = item["size"]
+                end = start + (parse_address(size) if isinstance(size, str) else int(size))
+            if end is not None and end <= start:
+                raise IDAError(f"Empty or inverted range at {start_s}")
+            value = int(item.get("value", 1))
+
+            notes: list[str] = []
+            span_end = end if end is not None else (idaapi.getseg(start).end_ea if idaapi.getseg(start) else start)
+            if undefine and span_end > start:
+                ida_bytes.del_items(start, ida_bytes.DELIT_SIMPLE, span_end - start)
+            elif _has_code(start, span_end):
+                notes.append(
+                    "Range already holds code decoded in the previous mode; pass "
+                    "undefine=true to re-decode it."
+                )
+            previous = set_sreg_range(start, end, reg, value)
+            if reanalyze:
+                ida_auto.auto_make_code(start)
+                if span_end > start:
+                    spans.append((start, span_end))
+            if end is None:
+                notes.append("Open-ended: applies until the next change point.")
+            entry: SregChange = {
+                "start": hex(start),
+                "reg": reg,
+                "value": value,
+                "previous": previous if previous is not None else -1,
+            }
+            if end is not None:
+                entry["end"] = hex(end)
+            if notes:
+                entry["notes"] = notes
+            results.append(entry)
+        except Exception as e:
+            results.append({"start": start_s, "error": str(e)})
+
+    if reanalyze:
+        plan_and_wait(spans)
+        for entry in results:
+            if "error" not in entry:
+                entry["insn"] = idc.GetDisasm(int(entry["start"], 16))
+    return results
+
+
+@tool
+@idasync
+def get_sreg(
+    addrs: Annotated[list[str] | str, "Addresses (list or comma-separated)"],
+    reg: Annotated[str, "Segment register name (default 'T' = ARM Thumb)"] = "T",
+) -> list[SregValue]:
+    """Read a segment register's value at addresses (T: 1 = Thumb, 0 = ARM)."""
+    results: list[SregValue] = []
+    try:
+        reg_idx = _reg_index(reg)
+    except IDAError as e:
+        return [{"addr": str(a), "error": str(e)} for a in normalize_list_input(addrs)]
+    for addr in normalize_list_input(addrs):
+        try:
+            ea = parse_address(str(addr))
+            results.append({"addr": str(addr), "reg": reg, "value": _get_sreg_value(ea, reg_idx)})
+        except Exception as e:
+            results.append({"addr": str(addr), "error": str(e)})
+    return results

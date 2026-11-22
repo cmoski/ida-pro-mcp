@@ -408,6 +408,7 @@ class DefineOp(TypedDict, total=False):
         str, "Address to define (hex or decimal). Use 'start:end' for explicit bounds."
     ]
     end: Annotated[str, "Optional end address for explicit bounds"]
+    thumb: Annotated[bool, "ARM only: decode as Thumb (true) or ARM (false)"]
 
 
 class UndefineOp(TypedDict, total=False):
