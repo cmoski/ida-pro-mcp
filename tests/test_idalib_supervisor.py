@@ -582,13 +582,22 @@ def test_open_session_forwards_idle_ttl_sec(tmp_path):
     assert args["idle_ttl_sec"] == 1800
 
 
-def test_open_session_defaults_idle_ttl_sec_to_baseline(tmp_path):
+def test_open_session_defaults_idle_ttl_sec_to_server_default(tmp_path):
     sample = tmp_path / "sample.bin"
     sample.write_bytes(b"x")
     sup = _FakeSupervisor()
     sup.open_session(str(sample), session_id="sample")
-    args = sup.opened[0][1]
-    assert args["idle_ttl_sec"] == 600
+    assert sup.opened[0][1]["idle_ttl_sec"] == supmod.WORKER_IDLE_TTL_SEC
+    assert supmod.WORKER_IDLE_TTL_SEC >= 3600  # agents go quiet for long stretches
+
+
+def test_open_session_server_default_is_configurable(tmp_path, monkeypatch):
+    sample = tmp_path / "sample.bin"
+    sample.write_bytes(b"x")
+    monkeypatch.setattr(supmod, "WORKER_IDLE_TTL_SEC", 0.0)
+    sup = _FakeSupervisor()
+    sup.open_session(str(sample), session_id="sample")
+    assert sup.opened[0][1]["idle_ttl_sec"] == 0.0
 
 
 def test_open_session_skips_warmup_when_flags_disabled(tmp_path):

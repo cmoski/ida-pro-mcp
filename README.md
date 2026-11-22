@@ -215,7 +215,7 @@ _Note_: The `idalib` feature was contributed by [Willi Ballenthin](https://githu
 
 ## Headless idalib Session Model
 
-`idalib-mcp` is a supervisor that keeps each open database in its own idalib worker process. Workers register themselves in a host-local discovery directory and outlive the supervisor that spawned them; any subsequent supervisor that wants the same path adopts the running worker. A worker self-exits when no request has hit it for its idle TTL (default 1 hour). Call `idb_close` to release a worker eagerly (freeing a slot toward `--max-workers`), adopted GUI/worker instances are detached rather than killed.
+`idalib-mcp` is a supervisor that keeps each open database in its own idalib worker process. Workers register themselves in a host-local discovery directory and outlive the supervisor that spawned them; any subsequent supervisor that wants the same path adopts the running worker. A worker self-exits when no request has hit it for its idle TTL (default 4 hours; `0` = never). Set the server default with `--worker-idle-ttl SEC` or `IDA_MCP_WORKER_IDLE_TTL`, or per database with `idb_open(idle_ttl_sec=...)`. Call `idb_close` to release a worker eagerly (freeing a slot toward `--max-workers`), adopted GUI/worker instances are detached rather than killed.
 
 `idb_open` picks the backend via its `mode` parameter:
 
@@ -244,12 +244,13 @@ xrefs_to("ImportantExport", database="library")
 
 ### Management tools
 
-- `idb_open(input_path, mode="prefer_headless", run_auto_analysis=True, build_caches=True, init_hexrays=True, preferred_session_id="", directory=None, bitness=None, processor=None, keep_stale_components=False, autosave=True, autosave_idle_sec=60, instance="", on_conflict="error")`: Open a binary, warm up subsystems (strings cache, Hex-Rays), and return its session ID. If a worker for this path is already running on the host, it is adopted and `preferred_session_id` is ignored.
+- `idb_open(input_path, mode="prefer_headless", run_auto_analysis=True, build_caches=True, init_hexrays=True, idle_ttl_sec=None, preferred_session_id="", directory=None, bitness=None, processor=None, keep_stale_components=False, autosave=True, autosave_idle_sec=60, instance="", on_conflict="error")`: Open a binary, warm up subsystems (strings cache, Hex-Rays), and return its session ID. If a worker for this path is already running on the host, it is adopted and `preferred_session_id` is ignored.
   - **Path resolution:** `input_path` may be absolute, partial (`system/foo.dll`), a bare filename known from `list_pe_images` / `--search-root`, or the `.i64` itself. Misses return `suggestions`. Duplicate filenames return `candidates` with hashes. Success reports the file's `sha256`/`md5`.
   - **Attach to a running IDA GUI:** `instance="<port|pid>"` (from `idb_list`) works directly in the GUI's database, with no path needed and no save conflicts.
   - **Already open elsewhere:** if a GUI, or any other IDA process, holds the database, the open does not create a second writer. It returns a `conflict` and `options`. Re-call with `on_conflict="use_gui"` (attach to the GUI), `"copy"` (private writable copy of the last saved database), or `"read_only"` (private copy, with `idb_save`/autosave refused). idalib has no native read-only mode, hence the copy.
   - **Load fixups:** `bitness`/`processor` are applied after load via `set_bitness`.
   - **Stale components:** unsaved `.id0/.id1/...` left by a worker that died are moved to `.ida_stale/`. Components held open by a live process are never touched.
+  - **Idle shutdown:** `idle_ttl_sec` is how long the worker waits with no requests before saving, closing and exiting. Omitted means the server default (4 hours); `0` means never.
   - **Idle auto-save:** on by default. A changed database is saved once no request has arrived for `autosave_idle_sec` seconds. Pass `autosave=False` to disable it, or use `idb_autosave` later.
 - `idb_list()`: List open sessions and running GUI IDA instances. Each entry has `adopted` (True if this supervisor manages it, False for GUIs/workers discovered but not yet opened via `idb_open`), `backend` (`worker` or `gui`), `is_active`, and process IDs.
 - `idb_close(database, save=True)`: Save (optionally), unregister the session, and terminate its owned worker, freeing a slot toward `--max-workers`. Adopted GUI/worker instances are detached, not killed. `save=False` also clears a wedged worker.

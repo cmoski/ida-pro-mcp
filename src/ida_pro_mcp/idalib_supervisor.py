@@ -104,6 +104,13 @@ PARTIAL_DATABASE_EXTENSIONS = (".id0", ".id1", ".id2", ".nam", ".til")
 # Set IDA_MCP_OPEN_TIMEOUT=0 to wait indefinitely (previous behavior).
 WORKER_OPEN_TIMEOUT_SEC = _env_float("IDA_MCP_OPEN_TIMEOUT", 1800.0)
 
+# How long an open database's worker survives with no requests before it
+# saves, closes and exits. Agents routinely go quiet for long stretches (user
+# experiments, other tools), and a short TTL made sessions "drop" under them.
+# 0 = never self-exit. Per-open override: idb_open(idle_ttl_sec=...).
+# Overridable with --worker-idle-ttl or IDA_MCP_WORKER_IDLE_TTL.
+WORKER_IDLE_TTL_SEC = _env_float("IDA_MCP_WORKER_IDLE_TTL", 14400.0)
+
 
 def _import_zeromcp():
     """Import vendored zeromcp without importing ida_mcp/__init__.py."""
@@ -932,9 +939,11 @@ class IdalibSupervisor:
         run_auto_analysis: bool = True,
         build_caches: bool = True,
         init_hexrays: bool = True,
-        idle_ttl_sec: int = 600,
+        idle_ttl_sec: float | None = None,
         session_id: str | None = None,
     ) -> WorkerSession:
+        if idle_ttl_sec is None:
+            idle_ttl_sec = WORKER_IDLE_TTL_SEC
         if mode not in IDB_OPEN_MODES:
             raise ValueError(
                 f"Unknown mode: {mode!r}. Expected one of: {sorted(IDB_OPEN_MODES)}."
@@ -1503,9 +1512,11 @@ def idb_open(
     build_caches: Annotated[bool, "Build core caches after open"] = True,
     init_hexrays: Annotated[bool, "Initialize Hex-Rays decompiler after open"] = True,
     idle_ttl_sec: Annotated[
-        int,
-        "Minimum idle TTL in seconds before the headless worker self-exits.",
-    ] = 600,
+        Optional[int],
+        "Seconds with no requests before the worker saves, closes and exits. "
+        "Omit for the server default (4h unless the server sets --worker-idle-ttl); "
+        "0 = never self-exit.",
+    ] = None,
     preferred_session_id: Annotated[
         str, "Preferred session ID (auto-generated if empty). Ignored if the file is already open in a GUI or worker session."
     ] = "",
@@ -2211,6 +2222,14 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--worker-idle-ttl",
+        type=float,
+        default=None,
+        metavar="SEC",
+        help="Seconds an idle worker keeps its database open before saving and exiting "
+        "(0 = never; default: IDA_MCP_WORKER_IDLE_TTL or 14400).",
+    )
+    parser.add_argument(
         "--search-root-recursive",
         action="store_true",
         help="Walk --search-root directories recursively. Off by default.",
@@ -2228,7 +2247,9 @@ def main() -> None:
     if args.profile is not None:
         worker_args.extend(["--profile", str(args.profile)])
 
-    global supervisor
+    global supervisor, WORKER_IDLE_TTL_SEC
+    if args.worker_idle_ttl is not None:
+        WORKER_IDLE_TTL_SEC = max(0.0, float(args.worker_idle_ttl))
     supervisor = IdalibSupervisor(
         mcp,
         max_workers=args.max_workers,

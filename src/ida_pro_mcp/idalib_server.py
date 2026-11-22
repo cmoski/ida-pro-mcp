@@ -222,9 +222,9 @@ def idb_open(
     build_caches: Annotated[bool, "Build core caches after open"] = True,
     init_hexrays: Annotated[bool, "Initialize Hex-Rays decompiler after open"] = True,
     idle_ttl_sec: Annotated[
-        int,
-        "Minimum idle TTL in seconds before the headless worker self-exits.",
-    ] = 600,
+        float,
+        "Seconds with no requests before the worker self-exits (0 = never).",
+    ] = 14400,
     preferred_session_id: Annotated[
         str,
         "Preferred session ID (auto-generated if empty). Ignored if the file is already open.",
