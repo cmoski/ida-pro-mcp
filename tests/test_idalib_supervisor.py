@@ -2806,3 +2806,166 @@ def test_idb_open_can_disable_idle_autosave(tmp_path):
     assert result["success"] is True, result
     calls = [args for name, args in sup.tool_calls if name == "idb_autosave"]
     assert calls == [{"enabled": False, "idle_sec": 15}]
+
+
+# ============================================================================
+# Item 1/2: attach to a running GUI, conflict detection on open
+# ============================================================================
+
+
+def _gui_instance(idb_path, port=31337, pid=999):
+    return {
+        "host": "127.0.0.1",
+        "port": port,
+        "pid": pid,
+        "binary": Path(idb_path).name,
+        "idb_path": str(idb_path),
+        "started_at": "now",
+    }
+
+
+def _with_sup(tmp_path, instances, probe=True):
+    old = supmod.supervisor
+    sup = _FakeSupervisor()
+    supmod.supervisor = sup
+    restore = _patch_discovery(instances=instances, probe=probe)
+
+    def done():
+        restore()
+        supmod.supervisor = old
+
+    return sup, done
+
+
+def test_candidate_paths_cover_splitext_and_i64_forms(tmp_path):
+    sup = _FakeSupervisor()
+    exe = tmp_path / "GAME.EXE"
+    keys = sup._candidate_idb_paths(str(exe))
+    assert sup._path_key(str(tmp_path / "GAME.i64")) in keys
+    assert sup._path_key(str(tmp_path / "GAME.EXE.i64")) in keys
+    keys = sup._candidate_idb_paths(str(tmp_path / "GAME.i64"))
+    assert sup._path_key(str(tmp_path / "GAME")) in keys
+
+
+def test_idb_open_reports_gui_conflict_with_options(tmp_path):
+    sample = tmp_path / "GAME.EXE"
+    sample.write_bytes(b"MZ")
+    sup, done = _with_sup(tmp_path, [_gui_instance(tmp_path / "GAME.i64")])
+    try:
+        result = supmod.idb_open(input_path=str(sample))
+        assert result["success"] is False
+        assert result["conflict"]["state"] == "gui"
+        assert result["conflict"]["holder"]["pid"] == 999
+        assert [o["on_conflict"] for o in result["options"]] == ["use_gui", "read_only", "copy"]
+        assert sup.opened == [], "must not open a second writer"
+    finally:
+        done()
+
+
+def test_idb_open_use_gui_attaches_to_the_gui(tmp_path):
+    sample = tmp_path / "GAME.EXE"
+    sample.write_bytes(b"MZ")
+    sup, done = _with_sup(tmp_path, [_gui_instance(tmp_path / "GAME.i64")])
+    try:
+        result = supmod.idb_open(input_path=str(sample), on_conflict="use_gui")
+        assert result["success"] is True, result
+        session = sup.sessions[result["session"]["session_id"]]
+        assert session.backend == "gui" and session.port == 31337
+        assert sup.opened == []
+    finally:
+        done()
+
+
+def test_idb_open_locked_components_offer_copy_not_gui(tmp_path, monkeypatch):
+    sample = tmp_path / "GAME.EXE"
+    sample.write_bytes(b"MZ")
+    (tmp_path / "GAME.EXE.id0").write_bytes(b"x")
+    monkeypatch.setattr(supmod._paths, "components_lock_state", lambda comps: "locked")
+    sup, done = _with_sup(tmp_path, [])
+    try:
+        result = supmod.idb_open(input_path=str(sample))
+        assert result["conflict"]["state"] == "locked"
+        assert "use_gui" not in [o["on_conflict"] for o in result["options"]]
+        refused = supmod.idb_open(input_path=str(sample), on_conflict="use_gui")
+        assert refused["success"] is False and "no MCP plugin" in refused["error"]
+        assert (tmp_path / "GAME.EXE.id0").exists(), "locked files must not be touched"
+    finally:
+        done()
+
+
+def test_idb_open_copy_opens_private_copy_of_saved_database(tmp_path, monkeypatch):
+    sample = tmp_path / "GAME.EXE"
+    sample.write_bytes(b"MZ")
+    (tmp_path / "GAME.EXE.i64").write_bytes(b"saved-db")
+    monkeypatch.setattr(supmod._paths, "components_lock_state", lambda comps: "locked")
+    (tmp_path / "GAME.EXE.id0").write_bytes(b"x")
+    sup, done = _with_sup(tmp_path, [])
+    try:
+        result = supmod.idb_open(input_path=str(sample), on_conflict="copy")
+        assert result["success"] is True, result
+        opened = Path(sup.opened[0][1]["input_path"])
+        assert opened.name == "GAME.EXE.i64"
+        assert opened.parent != tmp_path
+        assert opened.read_bytes() == b"saved-db"
+        session = sup.sessions[result["session"]["session_id"]]
+        assert session.copy_of == str(sample) and session.read_only is False
+        assert any("private" in n for n in result["notes"])
+    finally:
+        done()
+
+
+def test_idb_open_read_only_blocks_saves(tmp_path, monkeypatch):
+    sample = tmp_path / "GAME.EXE"
+    sample.write_bytes(b"MZ")
+    (tmp_path / "GAME.EXE.i64").write_bytes(b"saved-db")
+    monkeypatch.setattr(supmod._paths, "components_lock_state", lambda comps: "locked")
+    (tmp_path / "GAME.EXE.id0").write_bytes(b"x")
+    sup, done = _with_sup(tmp_path, [])
+    try:
+        result = supmod.idb_open(input_path=str(sample), on_conflict="read_only")
+        sid = result["session"]["session_id"]
+        assert sup.sessions[sid].read_only is True
+        autosave_calls = [a for n, a in sup.tool_calls if n == "idb_autosave"]
+        assert autosave_calls and autosave_calls[-1]["enabled"] is False
+
+        resp = supmod._handle_tools_call(
+            {
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "tools/call",
+                "params": {"name": "idb_save", "arguments": {"database": sid}},
+            }
+        )
+        assert resp["result"]["isError"] is True
+        assert "read-only" in resp["result"]["content"][0]["text"]
+        assert not sup.forwarded, "idb_save must not reach the worker"
+
+        sup.tool_calls.clear()
+        closed = sup.close_session(sid, save=True)
+        assert closed["saved"] is None
+        assert ("idb_save", None) not in sup.tool_calls
+    finally:
+        done()
+
+
+def test_idb_open_attaches_gui_by_port_or_pid(tmp_path):
+    idb = tmp_path / "fw.bin.i64"
+    sup, done = _with_sup(tmp_path, [_gui_instance(idb, port=40001, pid=4242)])
+    try:
+        by_port = supmod.idb_open(instance="40001")
+        assert by_port["success"] is True, by_port
+        session = sup.sessions[by_port["session"]["session_id"]]
+        assert session.backend == "gui" and session.port == 40001
+        by_pid = supmod.idb_open(instance="4242")
+        assert by_pid["session"]["session_id"] == session.session_id, "reuses the attachment"
+        missing = supmod.idb_open(instance="1")
+        assert missing["success"] is False and "port 40001" in missing["error"]
+    finally:
+        done()
+
+
+def test_idb_open_requires_path_or_instance():
+    result = supmod.idb_open()
+    assert result["success"] is False and "input_path or instance" in result["error"]
+    bad = supmod.idb_open(input_path="x", on_conflict="nope")
+    assert "on_conflict" in bad["error"]

@@ -13,6 +13,8 @@ import http.client
 import importlib.util
 import json
 import logging
+import shutil
+import tempfile
 import os
 import signal
 import socket
@@ -182,6 +184,8 @@ class IdalibOpenResult(TypedDict, total=False):
     candidates: list[IdalibOpenCandidate]
     load_fixup: dict[str, Any]
     autosave: dict[str, Any]
+    conflict: dict[str, Any]
+    options: list[dict[str, str]]
 
 
 class IdalibListResult(TypedDict, total=False):
@@ -218,6 +222,10 @@ class WorkerSession:
     pid: int | None = None
     last_warmup: dict[str, Any] | None = None
     unresponsive_since: float | None = None
+    # Opened as a private copy because the original was in use (on_conflict).
+    copy_of: str | None = None
+    # Saves are refused (on_conflict="read_only").
+    read_only: bool = False
 
     def to_dict(self) -> IdalibSessionInfo:
         return {
@@ -540,12 +548,22 @@ class IdalibSupervisor:
         return os.path.normcase(str(Path(path).resolve()))
 
     def _candidate_idb_paths(self, resolved_path: str) -> set[str]:
+        """Paths under which the same database may be registered.
+
+        IDA names a database either after the full input name (GAME.EXE.i64)
+        or with the extension replaced (GAME.i64), and a caller may pass the
+        .i64 itself; cover all of them.
+        """
         path = Path(resolved_path)
         candidates = {self._path_key(str(path))}
         lower_name = path.name.lower()
-        if not lower_name.endswith((".i64", ".idb")):
-            candidates.add(self._path_key(str(path) + ".i64"))
-            candidates.add(self._path_key(str(path) + ".idb"))
+        if lower_name.endswith((".i64", ".idb")):
+            candidates.add(self._path_key(str(path.with_suffix(""))))
+        else:
+            for ext in (".i64", ".idb"):
+                candidates.add(self._path_key(str(path) + ext))
+                if path.suffix:
+                    candidates.add(self._path_key(str(path.with_suffix(ext))))
         return candidates
 
     def _find_instance_for_path(
@@ -778,6 +796,71 @@ class IdalibSupervisor:
             owned=False,
             pid=int(instance["pid"]) if instance.get("pid") is not None else None,
         )
+
+    def attach_gui_instance(self, instance_ref: str, session_id: str | None = None) -> WorkerSession:
+        """Attach to a running IDA GUI (MCP plugin) by its port or pid."""
+        ref = str(instance_ref).strip()
+        guis = [
+            inst
+            for inst in _discovery.discover_instances()
+            if _discovered_instance_backend(inst) == "gui"
+        ]
+        match = [
+            inst
+            for inst in guis
+            if ref in (str(inst.get("port")), str(inst.get("pid")))
+        ]
+        if not match:
+            available = ", ".join(
+                f"port {i.get('port')} pid {i.get('pid')} ({i.get('binary')})" for i in guis
+            ) or "none"
+            raise RuntimeError(f"No IDA GUI instance with port or pid {ref}. Running: {available}")
+        inst = match[0]
+        idb_path = str(inst.get("idb_path") or inst.get("binary") or f"gui-{inst.get('port')}")
+        with self._lock:
+            existing = self.path_to_session.get(self._path_key(idb_path))
+            if existing and existing in self.sessions and self.sessions[existing].backend == "gui":
+                return self.sessions[existing]
+            sid = session_id or str(uuid.uuid4())[:8]
+            if sid in self.sessions:
+                raise ValueError(f"Session already exists: {sid}")
+            session = self._make_gui_session(idb_path, sid, inst)
+            self._register_session_locked(session, idb_path)
+            return session
+
+    def open_conflict(self, resolved: str) -> dict[str, Any] | None:
+        """Describe who else holds ``resolved`` open, or None if it is free.
+
+        Our own live sessions and registered headless workers are not conflicts
+        (they are reused/adopted). A GUI with the MCP plugin is reported with
+        its address; components held open by any other process (a GUI without
+        the plugin, idat, another idalib) are reported as locked.
+        """
+        with self._lock:
+            existing_id = self.path_to_session.get(self._path_key(resolved))
+            existing = self.sessions.get(existing_id) if existing_id else None
+        if existing is not None and existing.backend == "worker" and self._session_is_usable(existing):
+            return None
+        gui = self._find_instance_for_path(resolved, backend="gui")
+        if gui is not None:
+            return {
+                "state": "gui",
+                "holder": {
+                    "backend": "gui",
+                    "host": gui.get("host"),
+                    "port": gui.get("port"),
+                    "pid": gui.get("pid"),
+                    "idb_path": gui.get("idb_path"),
+                },
+                "files": [],
+            }
+        if self._find_instance_for_path(resolved, backend="worker") is not None:
+            return None
+        components = _paths.database_component_paths(resolved)
+        state = _paths.components_lock_state(components)
+        if state in ("locked", "possibly_open"):
+            return {"state": state, "holder": None, "files": [c.name for c in components]}
+        return None
 
     def _adopt_worker_instance(
         self, resolved_path: str, session_id: str, instance: dict[str, Any]
@@ -1142,6 +1225,8 @@ class IdalibSupervisor:
         session = self.peek_session(database)
         saved: bool | None = None
         save_error: str | None = None
+        if session.read_only:
+            save = False
         if save and self._session_is_reachable(session):
             try:
                 result = self.call_worker_tool(session, "idb_save")
@@ -1311,6 +1396,54 @@ def _jsonrpc_error(request_id: Any, code: int, message: str) -> dict | None:
     return {"jsonrpc": "2.0", "error": {"code": code, "message": message}, "id": request_id}
 
 
+ON_CONFLICT_CHOICES = ("error", "use_gui", "copy", "read_only")
+
+
+def _conflict_options(conflict: dict[str, Any]) -> list[dict[str, str]]:
+    options = []
+    if conflict["state"] == "gui":
+        options.append({
+            "on_conflict": "use_gui",
+            "effect": "Work in the running IDA GUI on the same database (no save conflicts).",
+        })
+    options.append({
+        "on_conflict": "read_only",
+        "effect": "Open a private copy of the last saved database; saving is disabled.",
+    })
+    options.append({
+        "on_conflict": "copy",
+        "effect": "Open a private writable copy; changes never reach the original.",
+    })
+    return options
+
+
+def _make_database_copy(resolved: str) -> tuple[str, str]:
+    """Copy the saved database (or, failing that, the binary) to a temp dir.
+
+    Returns (path to open, description). The copy reflects the last *saved*
+    state: unsaved changes held by the other IDA are not included.
+    """
+    src = Path(resolved)
+    candidates = []
+    if src.suffix.lower() in (".i64", ".idb"):
+        candidates.append(src)
+    else:
+        candidates += [Path(str(src) + ".i64"), Path(str(src) + ".idb")]
+        if src.suffix:
+            candidates += [src.with_suffix(".i64"), src.with_suffix(".idb")]
+    target_dir = Path(tempfile.mkdtemp(prefix="ida-mcp-copy-")).resolve()
+    for db in candidates:
+        if db.is_file():
+            dest = target_dir / db.name
+            shutil.copy2(db, dest)
+            return str(dest), f"copy of saved database {db}"
+    if src.suffix.lower() in (".i64", ".idb"):
+        raise RuntimeError(f"No saved database at {src} to copy")
+    dest = target_dir / src.name
+    shutil.copy2(src, dest)
+    return str(dest), f"copy of binary {src} (no saved database; analysis starts fresh)"
+
+
 def _handle_stale_components(
     sup: IdalibSupervisor, resolved: str, keep_stale_components: bool, notes: list[str]
 ) -> None:
@@ -1356,9 +1489,9 @@ def _handle_stale_components(
 def idb_open(
     input_path: Annotated[
         str,
-        "Path to the binary. Absolute, partial (e.g. 'system/foo.dll') or a bare "
-        "filename known from list_pe_images / --search-root.",
-    ],
+        "Path to the binary or .i64. Absolute, partial (e.g. 'system/foo.dll') or a "
+        "bare filename known from list_pe_images / --search-root.",
+    ] = "",
     mode: Annotated[
         str,
         "How to open: prefer_headless (default; idalib worker, ignore GUI), "
@@ -1398,17 +1531,37 @@ def idb_open(
     autosave_idle_sec: Annotated[
         float, "Idle seconds before an auto-save (default 60, min 5)"
     ] = 60.0,
+    instance: Annotated[
+        str, "Attach to a running IDA GUI by port or pid (see idb_list) instead of a path"
+    ] = "",
+    on_conflict: Annotated[
+        str,
+        "If the database is already open elsewhere: 'error' (default; returns "
+        "options), 'use_gui', 'copy', or 'read_only'",
+    ] = "error",
 ) -> IdalibOpenResult:
     """Open a binary and warm it up; returns its session (reused if already open).
 
-    Imperfect paths resolve in one call: exact path, unique known filename,
-    best trailing-path match, or a bounded on-disk search; misses return
-    suggestions, duplicates return candidates with hashes. Result carries the
-    file's sha256/md5.
+    Imperfect paths resolve in one call; misses return suggestions. If the
+    database is already open in another IDA, returns a conflict with options
+    (use_gui / read_only / copy) instead of opening a second writer. Pass
+    instance= to work in a running IDA GUI directly.
     """
     sup = _require_supervisor()
     notes: list[str] = []
+    if on_conflict not in ON_CONFLICT_CHOICES:
+        return {"success": False, "error": f"on_conflict must be one of {list(ON_CONFLICT_CHOICES)}"}
     try:
+        if instance:
+            session = sup.attach_gui_instance(instance, preferred_session_id or None)
+            return {
+                "success": True,
+                "session": session.to_dict(),
+                "message": f"Attached to IDA GUI: {session.filename} ({session.session_id})",
+                "notes": ["Changes go straight into the open GUI database; save from IDA or with idb_save."],
+            }
+        if not input_path:
+            return {"success": False, "error": "Pass input_path or instance"}
         outcome = sup.paths.resolve_open_target(input_path, directory_hint=directory)
         status = outcome["status"]
         if status == "miss":
@@ -1452,17 +1605,69 @@ def idb_open(
         if os.path.normcase(resolved) != os.path.normcase(input_path):
             notes.append(f"Resolved '{input_path}' -> '{resolved}' ({outcome['how']}).")
 
-        _handle_stale_components(sup, resolved, keep_stale_components, notes)
+        open_path, open_mode = resolved, mode
+        copy_of: str | None = None
+        read_only = False
+        conflict = None if mode in ("prefer_gui", "force_gui") else sup.open_conflict(resolved)
+        if conflict is not None:
+            holder = conflict.get("holder") or {}
+            where = (
+                f"an IDA GUI (pid {holder.get('pid')}, port {holder.get('port')})"
+                if conflict["state"] == "gui"
+                else "another IDA process (files are locked)"
+                if conflict["state"] == "locked"
+                else "another process (database files were modified moments ago)"
+            )
+            if on_conflict == "error":
+                return {
+                    "success": False,
+                    "error": (
+                        f"{Path(resolved).name} is already open in {where}. Opening it "
+                        "again would create a second writer. Re-call idb_open with "
+                        "on_conflict set to one of the options."
+                    ),
+                    "conflict": conflict,
+                    "options": _conflict_options(conflict),
+                }
+            if on_conflict == "use_gui":
+                if conflict["state"] != "gui":
+                    return {
+                        "success": False,
+                        "error": (
+                            f"The database is held by {where}, which has no MCP plugin "
+                            "to attach to. Use on_conflict='read_only' or 'copy'."
+                        ),
+                        "conflict": conflict,
+                        "options": _conflict_options(conflict),
+                    }
+                open_mode = "prefer_gui"
+            else:
+                open_path, how = _make_database_copy(resolved)
+                copy_of, read_only = resolved, on_conflict == "read_only"
+                open_mode = "force_headless"
+                notes.append(
+                    f"Opened a private {'read-only ' if read_only else ''}{how} at "
+                    f"{open_path}; unsaved changes in the other IDA are not included "
+                    "and nothing here is written back to the original."
+                )
+        else:
+            _handle_stale_components(sup, resolved, keep_stale_components, notes)
 
         session = sup.open_session(
-            resolved,
-            mode=mode,
+            open_path,
+            mode=open_mode,
             run_auto_analysis=run_auto_analysis,
             build_caches=build_caches,
             init_hexrays=init_hexrays,
             idle_ttl_sec=idle_ttl_sec,
             session_id=preferred_session_id or None,
         )
+        if copy_of is not None:
+            session.copy_of = copy_of
+            session.read_only = read_only
+            session.metadata = {**session.metadata, "copy_of": copy_of, "read_only": read_only}
+            if read_only:
+                autosave = False
         result: IdalibOpenResult = {
             "success": True,
             "session": session.to_dict(),
@@ -1876,6 +2081,23 @@ def _handle_tools_call(request_obj: dict[str, Any]) -> dict[str, Any] | None:
         session = sup.resolve_session(database)
     except Exception as e:
         return _jsonrpc_result(request_id, _call_tool_result({"error": str(e)}, is_error=True))
+    if session.read_only and (
+        tool_name == "idb_save"
+        or (tool_name == "idb_autosave" and (arguments.get("enabled") or arguments.get("save_now")))
+    ):
+        return _jsonrpc_result(
+            request_id,
+            _call_tool_result(
+                {
+                    "error": (
+                        f"Session '{database}' is read-only (a private copy of "
+                        f"{session.copy_of}); saving is disabled. Open with "
+                        "on_conflict='copy' if you want a writable copy."
+                    )
+                },
+                is_error=True,
+            ),
+        )
 
     forwarded = copy.deepcopy(request_obj)
     forwarded.setdefault("params", {})["arguments"] = arguments

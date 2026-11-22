@@ -5,7 +5,8 @@ import os
 import re
 import sys
 import traceback
-from typing import TYPE_CHECKING
+import threading
+from typing import TYPE_CHECKING, Annotated
 from urllib.parse import parse_qs, urlparse
 
 if TYPE_CHECKING:
@@ -64,6 +65,65 @@ dispatch_original = mcp.registry.dispatch
 
 _OUTPUT_PATH_RE = re.compile(r"^/output/([a-f0-9-]+)\.(\w+)$")
 
+# ---------------------------------------------------------------------------
+# Multiple IDA GUI instances: list them and pick one per MCP transport session
+# ---------------------------------------------------------------------------
+
+LOCAL_TOOLS = {"list_instances", "select_instance"}
+_session_targets: dict[str, tuple[str, int]] = {}
+_session_targets_lock = threading.Lock()
+
+
+def _current_target() -> tuple[str, int]:
+    """IDA instance for this request: the session's selection, else the default."""
+    sid = mcp.get_current_transport_session_id()
+    if sid:
+        with _session_targets_lock:
+            target = _session_targets.get(sid)
+        if target is not None:
+            return target
+    return IDA_HOST, IDA_PORT
+
+
+@mcp.tool
+def list_instances() -> dict:
+    """List running IDA GUI instances with the MCP plugin; marks the one in use."""
+    host, port = _current_target()
+    items = []
+    for inst in discover_instances():
+        items.append(
+            {
+                "host": inst.get("host", ""),
+                "port": inst.get("port", 0),
+                "pid": inst.get("pid"),
+                "binary": inst.get("binary", ""),
+                "idb_path": inst.get("idb_path", ""),
+                "selected": inst.get("port") == port and inst.get("host") in (host, "0.0.0.0", "::"),
+            }
+        )
+    return {"instances": items, "count": len(items), "current": f"{host}:{port}"}
+
+
+@mcp.tool
+def select_instance(
+    port: Annotated[int, "Port of the instance (from list_instances)"],
+    host: Annotated[str, "Host (default 127.0.0.1)"] = "127.0.0.1",
+) -> dict:
+    """Route this session's IDA tool calls to another running IDA GUI instance."""
+    if not probe_instance(host, port):
+        return {"success": False, "error": f"No IDA instance answering at {host}:{port}"}
+    sid = mcp.get_current_transport_session_id()
+    if sid:
+        with _session_targets_lock:
+            _session_targets[sid] = (host, port)
+    else:
+        global IDA_HOST, IDA_PORT
+        IDA_HOST, IDA_PORT = host, port
+    binary = next(
+        (i.get("binary", "") for i in discover_instances() if i.get("port") == port), ""
+    )
+    return {"success": True, "current": f"{host}:{port}", "binary": binary}
+
 
 def _get_proxy_request_path() -> str:
     """Build the proxied MCP path, preserving enabled extensions."""
@@ -94,7 +154,8 @@ def _proxy_to_ida(payload: bytes | str | dict) -> dict:
     if isinstance(payload, str):
         payload = payload.encode("utf-8")
 
-    conn = http.client.HTTPConnection(IDA_HOST, IDA_PORT, timeout=30)
+    host, port = _current_target()
+    conn = http.client.HTTPConnection(host, port, timeout=30)
     try:
         conn.request(
             "POST",
@@ -115,7 +176,8 @@ def _proxy_to_ida(payload: bytes | str | dict) -> dict:
 
 def _proxy_output_download(path: str) -> tuple[int, str, list[tuple[str, str]], bytes]:
     """Proxy a raw output download from the configured IDA instance."""
-    conn = http.client.HTTPConnection(IDA_HOST, IDA_PORT, timeout=30)
+    host, port = _current_target()
+    conn = http.client.HTTPConnection(host, port, timeout=30)
     try:
         conn.request("GET", path)
         response = conn.getresponse()
@@ -135,9 +197,20 @@ def dispatch_proxy(request: dict | str | bytes | bytearray) -> JsonRpcResponse |
         return dispatch_original(request)
     if request_obj["method"].startswith("notifications/"):
         return dispatch_original(request)
+    if request_obj["method"] == "tools/call":
+        name = (request_obj.get("params") or {}).get("name")
+        if name in LOCAL_TOOLS:
+            return dispatch_original(request)
 
     try:
-        return _proxy_to_ida(request)
+        response = _proxy_to_ida(request)
+        if request_obj["method"] == "tools/list" and isinstance(response, dict):
+            tools = (response.get("result") or {}).get("tools")
+            if isinstance(tools, list):
+                local = mcp._mcp_tools_list().get("tools", [])
+                names = {t.get("name") for t in tools}
+                tools.extend(t for t in local if t.get("name") not in names)
+        return response
     except Exception as e:
         full_info = traceback.format_exc()
         request_id = request_obj.get("id")
