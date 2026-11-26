@@ -2978,3 +2978,71 @@ def test_idb_open_requires_path_or_instance():
     assert result["success"] is False and "input_path or instance" in result["error"]
     bad = supmod.idb_open(input_path="x", on_conflict="nope")
     assert "on_conflict" in bad["error"]
+
+
+class _AnalyzingSupervisor(_FakeSupervisor):
+    """Worker that reports background analysis, then finishes it."""
+
+    def __init__(self):
+        super().__init__()
+        self.open_timeouts: list[float | None] = []
+        self.analysis_state = "running"
+
+    def call_worker_tool(self, worker, name, arguments=None, *, timeout=None):
+        if name == "idb_open":
+            self.open_timeouts.append(timeout)
+            result = super().call_worker_tool(worker, name, arguments, timeout=timeout)
+            background = arguments.get("run_auto_analysis") and not arguments.get("wait_analysis")
+            result["session"]["is_analyzing"] = bool(background)
+            result["analysis"] = {"state": "running" if background else "done", "funcs": 10}
+            return result
+        if name == "analysis_status":
+            self.tool_calls.append((name, arguments))
+            return {"state": self.analysis_state, "funcs": 99}
+        return super().call_worker_tool(worker, name, arguments, timeout=timeout)
+
+
+def test_open_defaults_to_background_analysis_without_open_timeout(tmp_path, monkeypatch):
+    sample = tmp_path / "big.bin"
+    sample.write_bytes(b"x")
+    monkeypatch.setattr(supmod, "WORKER_OPEN_TIMEOUT_SEC", 1800.0)
+    sup = _AnalyzingSupervisor()
+    session = sup.open_session(str(sample), session_id="big")
+    assert sup.opened[0][1]["wait_analysis"] is False
+    # Background open returns after loading, so it is not bounded by the
+    # analysis timeout (which used to kill workers on huge binaries).
+    assert sup.open_timeouts == [None]
+    assert session.is_analyzing is True
+    assert session.analysis == {"state": "running", "funcs": 10}
+
+
+def test_wait_analysis_open_keeps_the_open_timeout(tmp_path, monkeypatch):
+    sample = tmp_path / "big.bin"
+    sample.write_bytes(b"x")
+    monkeypatch.setattr(supmod, "WORKER_OPEN_TIMEOUT_SEC", 1800.0)
+    sup = _AnalyzingSupervisor()
+    session = sup.open_session(str(sample), session_id="big", wait_analysis=True)
+    assert sup.opened[0][1]["wait_analysis"] is True
+    assert sup.open_timeouts == [1800.0]
+    assert session.is_analyzing is False
+
+
+def test_listing_refreshes_analysis_state_until_done(tmp_path):
+    sample = tmp_path / "big.bin"
+    sample.write_bytes(b"x")
+    sup = _AnalyzingSupervisor()
+    sup.open_session(str(sample), session_id="big")
+
+    [entry] = [e for e in sup.list_sessions() if e["session_id"] == "big"]
+    assert entry["is_analyzing"] is True
+    assert entry["analysis"]["state"] == "running"
+
+    sup.analysis_state = "done"
+    [entry] = [e for e in sup.list_sessions() if e["session_id"] == "big"]
+    assert entry["is_analyzing"] is False
+    assert entry["analysis"]["funcs"] == 99
+
+    # Once done, listings stop probing the worker.
+    probes = sum(1 for name, _ in sup.tool_calls if name == "analysis_status")
+    sup.list_sessions()
+    assert sum(1 for name, _ in sup.tool_calls if name == "analysis_status") == probes

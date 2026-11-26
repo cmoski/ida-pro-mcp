@@ -27,7 +27,9 @@ import idautils
 
 from .api_modify import rename_at_ea
 from .rpc import OUTPUT_LIMIT_MAX_CHARS, tool
-from .sync import idasync, tool_timeout, IDAError
+from .sync import idasync, tool_timeout, IDAError, get_tool_deadline
+from .auto_steps import wait_analysis
+from .mainthread import get_pump
 from .utils import normalize_list_input, parse_address
 
 # name -> (bit, settable). Settable flags are the ones whose meaning is a plain
@@ -145,7 +147,10 @@ def apply_func_flags(
             # (dead code removed or fall-through restored).
             ida_auto.reanalyze_callers(fn.start_ea, noret)
             callers = sum(1 for _ in idautils.CodeRefsTo(fn.start_ea, 0))
-            ida_auto.auto_wait()
+            if not get_pump().has_background():
+                # With background analysis running, the re-planned callers are
+                # picked up there; don't block on the whole binary's queue.
+                wait_analysis(get_tool_deadline())
         for ref in idautils.CodeRefsTo(fn.start_ea, 0):
             caller = ida_funcs.get_func(ref)
             if caller is not None:

@@ -168,3 +168,136 @@ def test_job_submitted_before_run_is_queued_not_rejected():
     submitter.join(timeout=5)
     pump.stop()
     assert results == ["late"]
+
+
+class _FakeAnalysis:
+    """Resumable work that honours a sticky cancel flag, like ida_auto.auto_wait."""
+
+    def __init__(self, units: int, unit_sec: float = 0.005):
+        self.remaining = units
+        self.unit_sec = unit_sec
+        self.cancel = threading.Event()
+        self.thread_ids: set[int] = set()
+        self.preempts = 0
+
+    def slice(self) -> bool:
+        self.thread_ids.add(threading.get_ident())
+        while self.remaining > 0:
+            if self.cancel.is_set():
+                return False
+            time.sleep(self.unit_sec)
+            self.remaining -= 1
+        return True
+
+    def preempt(self):
+        self.preempts += 1
+        self.cancel.set()
+
+    def reset(self):
+        self.cancel.clear()
+
+
+def _attach(pump, work, label="auto_analysis"):
+    pump.set_background(work.slice, preempt=work.preempt, reset=work.reset, label=label)
+
+
+def _wait_until(cond, timeout=10.0):
+    end = time.monotonic() + timeout
+    while time.monotonic() < end:
+        if cond():
+            return True
+        time.sleep(0.01)
+    return False
+
+
+def test_background_task_runs_to_completion_on_pump_thread():
+    pump = MainThreadPump()
+    work = _FakeAnalysis(units=50)
+    _attach(pump, work)
+    thread = _run_pump(pump)
+    try:
+        assert _wait_until(lambda: work.remaining == 0)
+        assert _wait_until(lambda: pump.background_status() is None)
+        assert work.thread_ids == {thread.ident}
+    finally:
+        pump.stop()
+
+
+def test_job_preempts_background_and_background_resumes():
+    pump = MainThreadPump()
+    work = _FakeAnalysis(units=2000)  # ~10 s if never interrupted
+    _attach(pump, work)
+    _run_pump(pump)
+    try:
+        assert _wait_until(lambda: (pump.background_status() or {}).get("running_now"))
+        t0 = time.monotonic()
+        seen_cancel = pump.submit(lambda: work.cancel.is_set(), timeout=5)
+        assert time.monotonic() - t0 < 1.0  # served promptly, not after analysis
+        assert seen_cancel is False  # preempt flag does not leak into the job
+        assert work.preempts >= 1
+        left = work.remaining
+        assert left > 0
+        assert _wait_until(lambda: work.remaining < left)  # resumed afterwards
+        status = pump.background_status()
+        assert status is not None and status["task"] == "auto_analysis"
+        assert status["slices"] >= 1
+    finally:
+        pump.stop()
+
+
+def test_many_jobs_during_background_all_complete():
+    pump = MainThreadPump()
+    work = _FakeAnalysis(units=400)
+    _attach(pump, work)
+    _run_pump(pump)
+    try:
+        results = [pump.submit(lambda i=i: i * 2, timeout=5) for i in range(25)]
+        assert results == [i * 2 for i in range(25)]
+        assert _wait_until(lambda: work.remaining == 0)
+    finally:
+        pump.stop()
+
+
+def test_failing_background_task_is_detached_and_pump_keeps_serving():
+    pump = MainThreadPump()
+
+    def boom():
+        raise RuntimeError("analysis blew up")
+
+    pump.set_background(boom, preempt=lambda: None, reset=lambda: None, label="bad")
+    _run_pump(pump)
+    try:
+        assert _wait_until(lambda: pump.background_status() is None)
+        assert pump.submit(lambda: 7, timeout=5) == 7
+    finally:
+        pump.stop()
+
+
+def test_stop_interrupts_a_running_background_slice():
+    pump = MainThreadPump()
+    work = _FakeAnalysis(units=100000)
+    _attach(pump, work)
+    thread = _run_pump(pump)
+    assert _wait_until(lambda: (pump.background_status() or {}).get("running_now"))
+    pump.stop()
+    thread.join(timeout=5)
+    assert not thread.is_alive()
+    assert work.remaining > 0
+
+
+def test_clear_background_detaches_task():
+    pump = MainThreadPump()
+    work = _FakeAnalysis(units=100000)
+    _attach(pump, work)
+    _run_pump(pump)
+    try:
+        assert _wait_until(lambda: (pump.background_status() or {}).get("running_now"))
+        pump.clear_background()
+        assert pump.background_status() is None
+        time.sleep(0.05)  # let the interrupted slice finish its current unit
+        left = work.remaining
+        time.sleep(0.2)
+        assert work.remaining == left  # no further slices
+        assert pump.submit(lambda: "ok", timeout=5) == "ok"
+    finally:
+        pump.stop()

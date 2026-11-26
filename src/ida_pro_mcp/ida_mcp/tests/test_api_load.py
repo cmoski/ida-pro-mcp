@@ -434,6 +434,67 @@ def test_server_warmup_reports_skipped_wait_when_auto_disabled():
         ida_auto.enable_auto(was_enabled)
 
 
+@test()
+def test_step_analysis_recreates_deleted_callee_like_auto_wait():
+    """Stepped analysis (background mode) reaches the same result as auto_wait."""
+    import ida_auto
+    import ida_funcs
+    from ..auto_steps import step_analysis
+
+    pair = _called_function()
+    if pair is None:
+        skip_test("no direct call between two functions in this binary")
+    callee, caller = pair
+    start, end = callee.start_ea, callee.end_ea
+    was_enabled = ida_auto.is_auto_enabled()
+    try:
+        assert ida_funcs.del_func(start)
+        ida_auto.enable_auto(True)
+        ida_auto.plan_range(caller.start_ea, caller.end_ea)
+        assert not ida_auto.auto_is_ok()
+        slices = 0
+        while True:
+            slices += 1
+            result = step_analysis(0.05)
+            assert result["steps"] >= 0 and result["max_step_ms"] >= 0
+            if result["finished"]:
+                break
+            assert slices < 10000, "stepped analysis never finished"
+        assert ida_auto.auto_is_ok()
+        recreated = ida_funcs.get_func(start)
+        assert recreated is not None and recreated.start_ea == start
+    finally:
+        ida_auto.enable_auto(was_enabled)
+        if ida_funcs.get_func(start) is None:
+            ida_funcs.add_func(start, end)
+
+
+@test()
+def test_wait_analysis_honours_an_expired_deadline():
+    """A tool deadline stops the wait instead of being ignored (auto_wait would)."""
+    import time
+    import ida_auto
+    import ida_funcs
+    from ..auto_steps import wait_analysis
+
+    func = next((ida_funcs.getn_func(i) for i in range(ida_funcs.get_func_qty())), None)
+    if func is None:
+        skip_test("no functions")
+    was_enabled = ida_auto.is_auto_enabled()
+    try:
+        ida_auto.enable_auto(True)
+        ida_auto.plan_range(func.start_ea, func.end_ea)
+        t0 = time.monotonic()
+        finished = wait_analysis(time.monotonic() - 1.0)
+        assert time.monotonic() - t0 < 1.0
+        assert finished is bool(ida_auto.auto_is_ok())
+        # Without a deadline it drains the queue.
+        assert wait_analysis(None) is True
+        assert ida_auto.auto_is_ok()
+    finally:
+        ida_auto.enable_auto(was_enabled)
+
+
 # ---------------------------------------------------------------------------
 # Segment registers / Thumb (semantic checks need tests/thumb_fixture.elf)
 # ---------------------------------------------------------------------------

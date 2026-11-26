@@ -39,7 +39,8 @@ import ida_segregs
 import idc
 
 from .rpc import tool
-from .sync import idasync, tool_timeout, IDAError
+from .sync import idasync, tool_timeout, IDAError, get_tool_deadline
+from .auto_steps import wait_analysis
 from .utils import (
     BITNESS_CODE as _BITNESS_CODE,
     normalize_list_input,
@@ -213,6 +214,12 @@ class AnalyzeResult(TypedDict):
 def plan_and_wait(ranges: list[tuple[int, int]]) -> dict:
     """Queue ``ranges`` for re-analysis and block until the auto-analyzer is idle.
 
+    The wait is stepped (``auto_steps.wait_analysis``), not a bare
+    ``auto_wait()``: in idalib auto_wait holds the GIL and ignores cancellation,
+    so it would freeze the worker and overrun the tool deadline on big inputs.
+    A wait cut short by the deadline reports ``cancelled=True``; the remaining
+    queue is processed later (by background analysis, or the next wait).
+
     ``ida_auto.auto_wait()`` alone only drains work that is already queued, and
     returns at once when auto-analysis is disabled (idalib opened with
     run_auto_analysis=False) -- which is why a bare wait could "finish" in 1 ms
@@ -229,7 +236,7 @@ def plan_and_wait(ranges: list[tuple[int, int]]) -> dict:
         for start, end in ranges:
             if end > start:
                 ida_auto.plan_range(start, end)
-        completed = ida_auto.auto_wait()
+        completed = wait_analysis(get_tool_deadline())
     finally:
         if not was_enabled:
             ida_auto.enable_auto(False)

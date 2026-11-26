@@ -169,6 +169,7 @@ class IdalibSessionListInfo(IdalibSessionInfo, total=False):
     adopted: bool
     pid: int | None
     worker_pid: int | None
+    analysis: dict[str, Any]
 
 
 IdalibOpenCandidate = _paths.IdalibOpenCandidate
@@ -181,6 +182,7 @@ class IdalibOpenResult(TypedDict, total=False):
     success: bool
     session: IdalibSessionInfo
     warmup: dict[str, Any] | None
+    analysis: dict[str, Any]
     message: str
     error: str
     # Path resolution / verification extras.
@@ -233,6 +235,8 @@ class WorkerSession:
     copy_of: str | None = None
     # Saves are refused (on_conflict="read_only").
     read_only: bool = False
+    # Worker's auto-analysis status as of open / the last listing.
+    analysis: dict[str, Any] | None = None
 
     def to_dict(self) -> IdalibSessionInfo:
         return {
@@ -941,6 +945,7 @@ class IdalibSupervisor:
         init_hexrays: bool = True,
         idle_ttl_sec: float | None = None,
         session_id: str | None = None,
+        wait_analysis: bool = False,
     ) -> WorkerSession:
         if idle_ttl_sec is None:
             idle_ttl_sec = WORKER_IDLE_TTL_SEC
@@ -998,7 +1003,11 @@ class IdalibSupervisor:
         if break_for_launch:
             return self._launch_gui_and_adopt(resolved, session_id)
 
-        open_timeout = (WORKER_OPEN_TIMEOUT_SEC or None) if run_auto_analysis else None
+        # Only a blocking open runs analysis inside this call. Background
+        # analysis (the default) returns once the file is loaded.
+        open_timeout = (
+            (WORKER_OPEN_TIMEOUT_SEC or None) if (run_auto_analysis and wait_analysis) else None
+        )
         preexisting_parts = self._existing_partial_database_parts(resolved)
         try:
             opened = self.call_worker_tool(
@@ -1009,6 +1018,7 @@ class IdalibSupervisor:
                     "run_auto_analysis": run_auto_analysis,
                     "build_caches": build_caches,
                     "init_hexrays": init_hexrays,
+                    "wait_analysis": wait_analysis,
                     "idle_ttl_sec": idle_ttl_sec,
                     "preferred_session_id": session_id,
                 },
@@ -1025,8 +1035,9 @@ class IdalibSupervisor:
             raise RuntimeError(
                 f"idalib worker timed out after {open_timeout:.0f}s while opening and "
                 f"analyzing {resolved}. The binary may drive auto-analysis into an "
-                f"unbounded loop. Retry with run_auto_analysis=false (open without "
-                f"analysis and decompile on demand), or raise IDA_MCP_OPEN_TIMEOUT."
+                f"unbounded loop. Retry without wait_analysis (analysis then runs in "
+                f"the background while tools stay usable), with run_auto_analysis=false, "
+                f"or raise IDA_MCP_OPEN_TIMEOUT."
             ) from None
         except Exception:
             self._terminate_worker(worker)
@@ -1050,6 +1061,7 @@ class IdalibSupervisor:
             owned=True,
             pid=worker.process.pid if worker.process is not None else None,
             last_warmup=opened.get("warmup") if isinstance(opened, dict) else None,
+            analysis=opened.get("analysis") if isinstance(opened, dict) else None,
         )
         with self._lock:
             existing = self.path_to_session.get(self._path_key(resolved))
@@ -1276,8 +1288,21 @@ class IdalibSupervisor:
             rpc_timeout=WORKER_QUICK_RPC_TIMEOUT_SEC,
         )
         state = self._health_state(health)
+        if session.is_analyzing and session.backend == "worker" and state != "dead":
+            # analysis_status answers off the main thread, so this stays quick.
+            try:
+                status = self.call_worker_tool(
+                    session, "analysis_status", {}, timeout=WORKER_QUICK_RPC_TIMEOUT_SEC
+                )
+                if isinstance(status, dict) and status.get("state"):
+                    session.analysis = status
+                    session.is_analyzing = status.get("state") == "running"
+            except Exception:
+                logger.debug("analysis_status probe failed", exc_info=True)
         entry = session.to_list_dict(active=state != "dead")
         entry["busy"] = state == "busy"
+        if session.analysis is not None:
+            entry["analysis"] = session.analysis
         return entry
 
     def list_sessions(self) -> list[IdalibSessionListInfo]:
@@ -1511,6 +1536,12 @@ def idb_open(
     run_auto_analysis: Annotated[bool, "Run automatic analysis on the binary"] = True,
     build_caches: Annotated[bool, "Build core caches after open"] = True,
     init_hexrays: Annotated[bool, "Initialize Hex-Rays decompiler after open"] = True,
+    wait_analysis: Annotated[
+        bool,
+        "Block until auto-analysis finishes before returning (subject to "
+        "IDA_MCP_OPEN_TIMEOUT). Default false: return once loaded and analyze in "
+        "the background; tools work meanwhile and analysis_status() shows progress.",
+    ] = False,
     idle_ttl_sec: Annotated[
         Optional[int],
         "Seconds with no requests before the worker saves, closes and exits. "
@@ -1552,6 +1583,11 @@ def idb_open(
     ] = "error",
 ) -> IdalibOpenResult:
     """Open a binary and warm it up; returns its session (reused if already open).
+
+    Auto-analysis runs in the background: the call returns once the file is
+    loaded, and every tool works while analysis continues (results may be
+    incomplete until analysis_status(database=...) reports 'done'; idb_list
+    shows it too). analyze(mode='wait') blocks until it finishes.
 
     Imperfect paths resolve in one call; misses return suggestions. If the
     database is already open in another IDA, returns a conflict with options
@@ -1672,6 +1708,7 @@ def idb_open(
             init_hexrays=init_hexrays,
             idle_ttl_sec=idle_ttl_sec,
             session_id=preferred_session_id or None,
+            wait_analysis=wait_analysis,
         )
         if copy_of is not None:
             session.copy_of = copy_of
@@ -1685,6 +1722,10 @@ def idb_open(
             "warmup": session.last_warmup,
             "message": f"Binary opened: {session.filename} ({session.session_id})",
         }
+        if session.analysis is not None:
+            result["analysis"] = session.analysis
+            if session.analysis.get("state") == "running":
+                result["message"] += "; auto-analysis continues in the background"
         try:
             result["sha256"], result["md5"] = _paths.hash_file_verify(Path(resolved))
         except OSError:

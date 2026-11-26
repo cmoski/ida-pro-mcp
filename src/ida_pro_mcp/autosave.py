@@ -75,8 +75,17 @@ class IdleAutosave:
 
     # -- decision + execution -------------------------------------------
 
-    def due(self, *, idle_for_sec: float, busy: bool) -> bool:
+    def due(self, *, idle_for_sec: float, busy: bool, min_interval_sec: float = 0.0) -> bool:
+        """``min_interval_sec`` spaces out saves while the database keeps
+        changing without client requests (background auto-analysis), which
+        would otherwise re-save on every poll."""
         with self._lock:
+            if (
+                min_interval_sec > 0
+                and self.last_save_at is not None
+                and self._clock() - self.last_save_at < min_interval_sec
+            ):
+                return False
             return (
                 self.enabled
                 and not self._saving
@@ -114,8 +123,9 @@ class IdleAutosave:
         idle_for_sec: float,
         busy: bool,
         save: Callable[[], tuple[bool, str | None]],
+        min_interval_sec: float = 0.0,
     ) -> bool:
-        if not self.due(idle_for_sec=idle_for_sec, busy=busy):
+        if not self.due(idle_for_sec=idle_for_sec, busy=busy, min_interval_sec=min_interval_sec):
             return False
         return self.run_save(save)
 

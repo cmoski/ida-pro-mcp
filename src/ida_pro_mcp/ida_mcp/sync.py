@@ -232,12 +232,14 @@ def sync_wrapper(
                 # Native cancellation: clear any stale flag and schedule a
                 # set_cancelled() at the deadline. Many IDA SDK calls
                 # (ida_search.find_*, ida_bytes.find_bytes/bin_search,
-                # ida_hexrays.decompile*, ida_strlist.build_strlist,
-                # ida_auto.auto_wait) poll user_cancelled() and bail with
+                # ida_hexrays.decompile*, ida_strlist.build_strlist) poll
+                # user_cancelled() and bail with
                 # BADADDR / MERR_CANCELED within one poll cycle, freeing the
                 # main thread instead of running to natural completion.
                 # set_cancelled() is THREAD_SAFE so firing it from a Timer
-                # thread is safe.
+                # thread is safe. NOT ida_auto.auto_wait: in idalib it ignores
+                # the flag and holds the GIL, so this Timer can't even run.
+                # Use auto_steps.wait_analysis instead.
                 ida_kernwin.clr_cancelled()
                 cancel_fired_at: list[float | None] = [None]
                 native_timer: threading.Timer | None = None

@@ -102,3 +102,16 @@ def test_snapshot_reports_save_age():
     assert snap["last_save_age_sec"] == 42
     assert snap["saves"] == 1
     assert snap["enabled"] is True
+
+
+def test_min_interval_spaces_out_saves_while_db_keeps_changing():
+    clock = _Clock()
+    a = IdleAutosave(idle_sec=5, clock=clock)
+    a.mark_dirty()
+    assert a.maybe_save(idle_for_sec=60, busy=False, save=_ok, min_interval_sec=900) is True
+    a.mark_dirty()  # background analysis keeps changing the database
+    clock.t += 30
+    assert a.maybe_save(idle_for_sec=90, busy=False, save=_ok, min_interval_sec=900) is False
+    clock.t += 900
+    assert a.maybe_save(idle_for_sec=990, busy=False, save=_ok, min_interval_sec=900) is True
+    assert a.saves == 2

@@ -9,14 +9,18 @@ from typing import Annotated, Any, TypedDict
 
 # idapro must go first to initialize idalib
 import idapro
+import ida_auto
+import ida_funcs
 import ida_idp
 import ida_loader
 
 from ida_pro_mcp.ida_mcp import MCP_SERVER, MCP_UNSAFE
 from ida_pro_mcp.ida_mcp.api_core import (
     ServerWarmupResult,
+    invalidate_strings_cache,
     server_warmup,
 )
+from ida_pro_mcp.ida_mcp.auto_steps import step_analysis
 from ida_pro_mcp.ida_mcp.discovery import register_instance, unregister_instance
 from ida_pro_mcp.ida_mcp.http import IdaMcpHttpRequestHandler
 from ida_pro_mcp.ida_mcp.mainthread import get_pump
@@ -45,10 +49,24 @@ class IdalibSessionListInfo(IdalibSessionInfo, total=False):
     is_active: bool
 
 
+class AnalysisStatus(TypedDict, total=False):
+    state: str  # "running" | "done" | "not_started" | "failed"
+    background: bool
+    elapsed_sec: float
+    steps: int
+    slices: int
+    funcs: int
+    max_step_ms: float
+    finished_age_sec: float | None
+    error: str | None
+    note: str
+
+
 class IdalibOpenResult(TypedDict, total=False):
     success: bool
     session: IdalibSessionInfo
     warmup: ServerWarmupResult | None
+    analysis: AnalysisStatus
     message: str
     error: str
 
@@ -77,6 +95,7 @@ IDB_MANAGEMENT_TOOLS = {
     "idb_open",
     "idb_list",
     "idb_autosave",
+    "analysis_status",
 }
 
 
@@ -87,6 +106,12 @@ _PUMP = get_pump()
 # most the work since the last idle period, not everything since open.
 _AUTOSAVE = IdleAutosave()
 _AUTOSAVE_TIMEOUT_SEC = 300.0
+# While background analysis keeps changing the database, auto-save at most
+# this often (a checkpoint), plus once when analysis finishes.
+_ANALYSIS_CHECKPOINT_SEC = 900.0
+# Length of one background-analysis slice. A queued tool call waits at most
+# about this long (plus the duration of a single analysis step).
+_ANALYSIS_SLICE_SEC = 0.1
 
 # IDB events that mean the database content changed. Any of them marks the
 # database dirty for the idle auto-saver.
@@ -160,6 +185,165 @@ def _install_dirty_hooks() -> None:
         _AUTOSAVE.configure(enabled=False)
 
 
+def _pause_dirty_hooks(paused: bool) -> None:
+    """Analysis fires millions of IDB events; a Python callback for each
+    slows it down noticeably. While background analysis runs, each slice that
+    made progress marks the database dirty instead."""
+    hooks = _DIRTY_HOOKS
+    if hooks is None:
+        return
+    try:
+        if paused:
+            hooks.unhook()
+        else:
+            hooks.hook()
+    except Exception:
+        logger.debug("toggling dirty hooks failed", exc_info=True)
+
+
+# -- background auto-analysis --------------------------------------------
+
+
+class _AnalysisTracker:
+    """Progress of the database's auto-analysis. Read from any thread."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.state = "not_started"
+        self.background = False
+        self.started_at: float | None = None
+        self.finished_at: float | None = None
+        self.steps = 0
+        self.slices = 0
+        self.funcs = 0
+        self.max_step_ms = 0.0
+        self.error: str | None = None
+        self.session = None
+
+    def start(self, session, funcs: int) -> None:
+        with self._lock:
+            self.state = "running"
+            self.background = True
+            self.started_at = time.monotonic()
+            self.finished_at = None
+            self.steps = self.slices = 0
+            self.funcs = funcs
+            self.max_step_ms = 0.0
+            self.error = None
+            self.session = session
+
+    def mark_done_without_background(self) -> None:
+        with self._lock:
+            self.state = "done"
+            self.background = False
+
+    def record(self, steps: int, max_step_ms: float, funcs: int) -> None:
+        with self._lock:
+            self.steps += steps
+            self.slices += 1
+            self.funcs = funcs
+            self.max_step_ms = max(self.max_step_ms, max_step_ms)
+
+    def finish(self, error: str | None = None) -> None:
+        with self._lock:
+            self.state = "failed" if error else "done"
+            self.error = error
+            self.finished_at = time.monotonic()
+            if self.session is not None:
+                self.session.is_analyzing = False
+
+    @property
+    def running(self) -> bool:
+        with self._lock:
+            return self.state == "running"
+
+    def snapshot(self) -> AnalysisStatus:
+        with self._lock:
+            now = time.monotonic()
+            end = self.finished_at if self.finished_at is not None else now
+            out: AnalysisStatus = {
+                "state": self.state,
+                "background": self.background,
+                "elapsed_sec": round(end - self.started_at, 1) if self.started_at else 0.0,
+                "steps": self.steps,
+                "slices": self.slices,
+                "funcs": self.funcs,
+                "max_step_ms": self.max_step_ms,
+                "finished_age_sec": (
+                    round(now - self.finished_at, 1) if self.finished_at is not None else None
+                ),
+                "error": self.error,
+            }
+        if out["state"] == "running":
+            out["note"] = (
+                "Auto-analysis is still running in the background. Tools work now, "
+                "but functions, xrefs, names and types may be incomplete until state "
+                "is 'done'. Call analyze(mode='wait') to block until it finishes."
+            )
+        return out
+
+
+_ANALYSIS = _AnalysisTracker()
+
+
+def _analysis_slice() -> bool:
+    """One background slice on the main thread. True when analysis is done."""
+    try:
+        result = step_analysis(_ANALYSIS_SLICE_SEC)
+    except Exception as e:
+        logger.exception("Background auto-analysis failed")
+        _finish_background_analysis(error=str(e))
+        return True
+    _ANALYSIS.record(result["steps"], result["max_step_ms"], ida_funcs.get_func_qty())
+    if result["steps"]:
+        _AUTOSAVE.mark_dirty()
+    if result["finished"]:
+        _finish_background_analysis()
+        return True
+    return False
+
+
+def _finish_background_analysis(error: str | None = None) -> None:
+    _ANALYSIS.finish(error)
+    _pause_dirty_hooks(False)
+    # Strings defined during analysis were not in any cache built earlier.
+    invalidate_strings_cache()
+    snap = _ANALYSIS.snapshot()
+    logger.info(
+        "Background auto-analysis %s: %.1fs, %d steps, %d functions",
+        snap["state"],
+        snap["elapsed_sec"],
+        snap["steps"],
+        snap["funcs"],
+    )
+    # Checkpoint the finished analysis: losing hours of it to a crash hurts.
+    if error is None and _AUTOSAVE.enabled and _AUTOSAVE.dirty:
+        if _AUTOSAVE.run_save(_save_database_now):
+            logger.info("Saved database after auto-analysis")
+
+
+def _start_background_analysis(session) -> bool:
+    """Attach stepped auto-analysis to the pump. Main thread only."""
+    ida_auto.enable_auto(True)
+    if ida_auto.auto_is_ok():
+        _ANALYSIS.mark_done_without_background()
+        session.is_analyzing = False
+        return False
+    session.is_analyzing = True
+    _ANALYSIS.start(session, ida_funcs.get_func_qty())
+    _pause_dirty_hooks(True)
+    _AUTOSAVE.mark_dirty()
+    if _PUMP.active:
+        _PUMP.set_background(_analysis_slice, label="auto_analysis")
+    else:
+        # No pump yet (initial CLI open before serving): it attaches below.
+        _PENDING_BACKGROUND[0] = True
+    return True
+
+
+_PENDING_BACKGROUND = [False]
+
+
 def _save_database_now() -> tuple[bool, str | None]:
     """In-place native save (same as idb_save with no path). Main thread only."""
     if get_session_manager()._active_session_id is None:
@@ -178,8 +362,10 @@ def _autosave_tick() -> None:
     """Watchdog poll: save if dirty, enabled, and idle long enough."""
     if _AUTOSAVE.maybe_save(
         idle_for_sec=_LIFECYCLE.idle_for_sec(),
-        busy=_LIFECYCLE.is_busy(),
+        # Only a running tool call blocks a save; background analysis yields.
+        busy=_PUMP.busy_status() is not None,
         save=_save_via_pump,
+        min_interval_sec=_ANALYSIS_CHECKPOINT_SEC if _ANALYSIS.running else 0.0,
     ):
         logger.info("Idle auto-save completed")
 _REGISTERED_PORT: int | None = None
@@ -221,6 +407,11 @@ def idb_open(
     run_auto_analysis: Annotated[bool, "Run automatic analysis on the binary"] = True,
     build_caches: Annotated[bool, "Build core caches after open"] = True,
     init_hexrays: Annotated[bool, "Initialize Hex-Rays decompiler after open"] = True,
+    wait_analysis: Annotated[
+        bool,
+        "Block until auto-analysis finishes before returning. Default false: "
+        "return right after loading and analyze in the background.",
+    ] = False,
     idle_ttl_sec: Annotated[
         float,
         "Seconds with no requests before the worker self-exits (0 = never).",
@@ -234,7 +425,12 @@ def idb_open(
         float, "Idle seconds before an auto-save (default 60, min 5)"
     ] = IdleAutosave.DEFAULT_IDLE_SEC,
 ) -> IdalibOpenResult:
-    """Open a binary, activate it, and warm up subsystems in one call."""
+    """Open a binary, activate it, and warm up subsystems in one call.
+
+    Auto-analysis runs in the background by default: the call returns once the
+    file is loaded, and tools work while analysis continues (results may be
+    incomplete until analysis_status() reports 'done').
+    """
 
     if _PUMP.active and not _PUMP.on_main_thread():
         # open_database and everything after it must run on the IDA thread.
@@ -244,6 +440,7 @@ def idb_open(
                 run_auto_analysis,
                 build_caches,
                 init_hexrays,
+                wait_analysis,
                 idle_ttl_sec,
                 preferred_session_id,
                 autosave,
@@ -256,30 +453,47 @@ def idb_open(
         manager = get_session_manager()
         resolved_path = Path(input_path).resolve()
         load_started_at = time.monotonic()
+        background = run_auto_analysis and not wait_analysis
+        already_open = any(
+            s.get("input_path") == str(resolved_path) for s in manager.list_sessions()
+        )
         opened_session_id = manager.open_binary(
             resolved_path,
-            run_auto_analysis=run_auto_analysis,
+            # Background mode loads without the blocking auto_wait (which in
+            # idalib holds the GIL and ignores cancellation) and steps the
+            # analysis queue from the pump instead.
+            run_auto_analysis=run_auto_analysis and not background,
             session_id=preferred_session_id or None,
         )
         session = manager.activate_session(opened_session_id)
+        if not already_open:
+            if background:
+                _start_background_analysis(session)
+            elif run_auto_analysis:
+                _ANALYSIS.mark_done_without_background()
         warmup: ServerWarmupResult | None = None
         if build_caches or init_hexrays:
             warmup = server_warmup(
                 wait_auto_analysis=False,
-                build_caches=build_caches,
+                # The strings list is incomplete mid-analysis; it is built
+                # lazily on first use and rebuilt after analysis finishes.
+                build_caches=build_caches and not _ANALYSIS.running,
                 init_hexrays=init_hexrays,
             )
         _LIFECYCLE.set_idle_ttl(float(idle_ttl_sec), time.monotonic() - load_started_at)
         _AUTOSAVE.configure(enabled=autosave, idle_sec=autosave_idle_sec)
         if _REGISTERED_PORT is None and _BOUND_HOST and _BOUND_PORT:
             _register_in_discovery(_BOUND_HOST, _BOUND_PORT, session.input_path)
+        analysis = _ANALYSIS.snapshot()
+        message = f"Binary opened: {session.input_path.name} ({opened_session_id})"
+        if analysis.get("state") == "running":
+            message += "; auto-analysis continues in the background"
         return {
             "success": True,
             "session": session.to_dict(),
             "warmup": warmup,
-            "message": (
-                f"Binary opened: {session.input_path.name} ({opened_session_id})"
-            ),
+            "analysis": analysis,
+            "message": message,
         }
     except (FileNotFoundError, RuntimeError, ValueError) as e:
         return {"error": str(e)}
@@ -297,6 +511,18 @@ def idb_list() -> IdalibListResult:
         return {"sessions": sessions, "count": len(sessions)}
     except Exception as e:
         return {"error": f"Failed to list sessions: {e}"}
+
+
+@tool
+def analysis_status() -> AnalysisStatus:
+    """Report auto-analysis progress for this database.
+
+    state: 'running' (background analysis in progress: tools work, but results
+    may be incomplete), 'done', 'not_started' (opened with
+    run_auto_analysis=false), or 'failed'. Answers immediately, even while the
+    database is busy.
+    """
+    return _ANALYSIS.snapshot()
 
 
 @tool
@@ -392,8 +618,9 @@ def main():
 
         logger.info("opening initial database: %s", args.input_path)
         resolved = args.input_path.resolve()
-        session_id = session_manager.open_binary(resolved, run_auto_analysis=True)
+        session_id = session_manager.open_binary(resolved, run_auto_analysis=False)
         logger.info("Initial session created: %s", session_id)
+        _start_background_analysis(session_manager.activate_session(session_id))
         _register_in_discovery(args.host, args.port, resolved)
     else:
         logger.info(
@@ -410,7 +637,10 @@ def main():
         except Exception:
             logger.exception("MCP_SERVER.stop() failed during lifecycle shutdown")
 
-    _LIFECYCLE.set_busy_probe(lambda: _PUMP.busy_status() is not None)
+    # Background analysis counts as busy: don't idle-exit mid-analysis.
+    _LIFECYCLE.set_busy_probe(
+        lambda: _PUMP.busy_status() is not None or _PUMP.has_background()
+    )
     _install_dirty_hooks()
     _LIFECYCLE.set_tick(_autosave_tick)
     _LIFECYCLE.start(on_shutdown=_on_lifecycle_exit)
@@ -472,6 +702,9 @@ def main():
         # HTTP on background threads keeps ping/health/cancel answerable while
         # a tool occupies IDA. Arm first: requests may arrive before run().
         _PUMP.arm()
+        if _PENDING_BACKGROUND[0]:
+            _PENDING_BACKGROUND[0] = False
+            _PUMP.set_background(_analysis_slice, label="auto_analysis")
         MCP_SERVER.serve(
             host=args.host,
             port=args.port,
