@@ -24,6 +24,10 @@ from ida_pro_mcp.ida_mcp.auto_steps import step_analysis
 from ida_pro_mcp.ida_mcp.discovery import register_instance, unregister_instance
 from ida_pro_mcp.ida_mcp.http import IdaMcpHttpRequestHandler
 from ida_pro_mcp.ida_mcp.mainthread import get_pump
+from ida_pro_mcp.ida_mcp.sync import (
+    get_thread_timeout_override,
+    set_thread_timeout_override,
+)
 from ida_pro_mcp.ida_mcp.profile import apply_profile, load_profile
 from ida_pro_mcp.ida_mcp.rpc import (
     configured_download_base_url,
@@ -449,6 +453,39 @@ def idb_open(
             label="idb_open",
         )
 
+    # Opening is bounded by the supervisor's open timeout, not the 30s
+    # per-tool deadline: the @idasync helpers it calls (server_warmup's cache
+    # build, health payload) can take minutes on multi-GB databases, and a
+    # deadline hit there failed the whole open and got the worker killed.
+    previous_override = get_thread_timeout_override()
+    set_thread_timeout_override(0)
+    try:
+        return _idb_open_body(
+            input_path,
+            run_auto_analysis,
+            build_caches,
+            init_hexrays,
+            wait_analysis,
+            idle_ttl_sec,
+            preferred_session_id,
+            autosave,
+            autosave_idle_sec,
+        )
+    finally:
+        set_thread_timeout_override(previous_override)
+
+
+def _idb_open_body(
+    input_path: str,
+    run_auto_analysis: bool,
+    build_caches: bool,
+    init_hexrays: bool,
+    wait_analysis: bool,
+    idle_ttl_sec: float,
+    preferred_session_id: str,
+    autosave: bool,
+    autosave_idle_sec: float,
+) -> IdalibOpenResult:
     try:
         manager = get_session_manager()
         resolved_path = Path(input_path).resolve()
