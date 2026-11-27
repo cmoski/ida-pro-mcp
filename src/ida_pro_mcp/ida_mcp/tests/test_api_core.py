@@ -872,3 +872,77 @@ def test_idb_save_keeps_working_files():
         assert not missing, f"save removed working files: {missing}"
 
     assert_non_empty(list_funcs({"offset": 0, "count": 5})[0]["data"])
+
+
+@test()
+def test_deadline_paused_lets_a_cache_build_outlast_the_tool_deadline():
+    """Work inside deadline_paused() doesn't count against the tool deadline."""
+    import time
+    from ..sync import deadline_paused, get_tool_deadline, idasync, tool_timeout
+
+    @idasync
+    @tool_timeout(0.3)
+    def slow_cache_build():
+        before = get_tool_deadline()
+        with deadline_paused():
+            time.sleep(0.8)  # longer than the whole 0.3s budget
+        after = get_tool_deadline()
+        # Plenty of ordinary Python calls after the pause: none may time out.
+        total = sum(len(str(i)) for i in range(2000))
+        return before, after, total
+
+    before, after, total = slow_cache_build()
+    assert total > 0
+    assert after - before >= 0.7, "paused time must be added back to the deadline"
+
+
+@test()
+def test_cancelled_strings_build_is_not_cached():
+    """A cancelled strings-list build is partial: raise, don't cache it."""
+    import ida_kernwin
+    from .. import api_core
+    from ..sync import IDAError
+
+    ida_kernwin.set_cancelled()
+    observable = ida_kernwin.user_cancelled()
+    ida_kernwin.clr_cancelled()
+    if not observable:
+        # idalib: user_cancelled() never reports set_cancelled(), so builds
+        # can't be cut short there (only the GUI can produce a partial list).
+        skip_test("user_cancelled() does not observe set_cancelled() here")
+
+    api_core.invalidate_strings_cache()
+    ida_kernwin.set_cancelled()
+    try:
+        try:
+            api_core._get_strings_cache()
+            raise AssertionError("expected IDAError for a cancelled build")
+        except IDAError:
+            pass
+        assert api_core._strings_cache is None
+    finally:
+        ida_kernwin.clr_cancelled()
+    strings = api_core._get_strings_cache()
+    assert api_core._strings_cache is strings
+
+
+@test()
+def test_entity_query_lazy_columns_match_direct_lookups():
+    """Lazily filled entity columns equal direct IDA lookups, with projection."""
+    import ida_nalt
+    import ida_typeinf
+    import idaapi
+
+    page = entity_query(
+        {"kind": "functions", "count": 3, "fields": ["addr", "segment", "has_type"]}
+    )[0]
+    assert page["error"] is None and page["total"] >= len(page["data"]) > 0
+    for row in page["data"]:
+        assert set(row) == {"kind", "addr", "segment", "has_type"}
+        ea = int(row["addr"], 16)
+        assert row["segment"] == idaapi.get_segm_name(idaapi.getseg(ea))
+        assert row["has_type"] == bool(ida_nalt.get_tinfo(ida_typeinf.tinfo_t(), ea))
+
+    glob = entity_query({"kind": "globals", "count": 20})[0]
+    for row in glob["data"]:
+        assert idaapi.get_func(int(row["addr"], 16)) is None, row

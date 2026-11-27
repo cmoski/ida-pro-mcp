@@ -1,3 +1,4 @@
+import contextlib
 import logging
 import queue
 import functools
@@ -66,6 +67,33 @@ def get_tool_deadline() -> float | None:
     to bail cleanly without depending on the global cancel flag.
     """
     return getattr(_deadline_state, "deadline", None)
+
+
+@contextlib.contextmanager
+def deadline_paused():
+    """Suspend the current tool's deadline (and request cancellation) for a block.
+
+    For one-time, process-wide cache builds (e.g. the strings list) that would
+    otherwise be cut off by the tool deadline, thrown away, and restarted from
+    scratch on every call. The time spent paused is added back to the deadline,
+    so the tool still gets its full budget for its own work afterwards.
+    No-op outside a synchronized tool body.
+    """
+    ctl = getattr(_deadline_state, "ctl", None)
+    if ctl is None:
+        yield
+        return
+    ctl["paused"] += 1
+    started = time.monotonic()
+    try:
+        yield
+    finally:
+        # Push the deadline back *before* unpausing: the watchdog's profile
+        # hook checks the deadline on the very next call.
+        if ctl["deadline"] is not None:
+            ctl["deadline"] += time.monotonic() - started
+            _deadline_state.deadline = ctl["deadline"]
+        ctl["paused"] -= 1
 
 
 def _get_tool_timeout_seconds() -> float:
@@ -242,16 +270,36 @@ def sync_wrapper(
                 # Use auto_steps.wait_analysis instead.
                 ida_kernwin.clr_cancelled()
                 cancel_fired_at: list[float | None] = [None]
-                native_timer: threading.Timer | None = None
-                if deadline is not None:
-                    def _fire_native_cancel():
-                        cancel_fired_at[0] = time.monotonic()
-                        ida_kernwin.set_cancelled()
-                    native_timer = threading.Timer(timeout, _fire_native_cancel)
+                # Shared with deadline_paused(): the deadline can be paused and
+                # pushed back while a one-time cache build runs.
+                ctl = {"deadline": deadline, "paused": 0, "done": False}
+                timers: list[threading.Timer | None] = [None]
+
+                def _arm_native_cancel(delay: float) -> None:
+                    native_timer = threading.Timer(max(delay, 0.05), _check_native_cancel)
                     native_timer.daemon = True
+                    timers[0] = native_timer
                     native_timer.start()
 
+                def _check_native_cancel():
+                    if ctl["done"]:
+                        return
+                    if ctl["paused"]:
+                        _arm_native_cancel(0.5)
+                        return
+                    remaining = ctl["deadline"] - time.monotonic()
+                    if remaining > 0:
+                        _arm_native_cancel(remaining)
+                        return
+                    cancel_fired_at[0] = time.monotonic()
+                    ida_kernwin.set_cancelled()
+
+                if deadline is not None:
+                    _arm_native_cancel(timeout)
+
                 def profilefunc(frame, event, arg):
+                    if ctl["paused"]:
+                        return
                     # Check request-level cancellation first (higher priority)
                     if cancel_event is not None and cancel_event.is_set():
                         raise CancelledError("Request was cancelled")
@@ -262,25 +310,29 @@ def sync_wrapper(
                     fired_at = cancel_fired_at[0]
                     if fired_at is not None and time.monotonic() < fired_at + 5.0:
                         return
-                    if deadline is not None and time.monotonic() >= deadline:
+                    current = ctl["deadline"]
+                    if current is not None and time.monotonic() >= current:
                         raise IDASyncError(f"Tool timed out after {timeout:.2f}s")
 
                 # Expose the deadline so tool bodies can self-monitor and
                 # return partial results gracefully (independent of the Timer).
                 _deadline_state.deadline = deadline
+                _deadline_state.ctl = ctl
                 old_profile = sys.getprofile()
                 sys.setprofile(profilefunc)
                 try:
                     return ff()
                 finally:
                     sys.setprofile(old_profile)
-                    if native_timer is not None:
-                        native_timer.cancel()
+                    ctl["done"] = True
+                    if timers[0] is not None:
+                        timers[0].cancel()
                     # Sticky flag: clear unconditionally so the next tool starts
                     # with a clean state. Without this, every subsequent
                     # user_cancelled() returns True forever.
                     ida_kernwin.clr_cancelled()
                     _deadline_state.deadline = None
+                    _deadline_state.ctl = None
 
             timed_ff.__name__ = ff.__name__
             return _sync_wrapper(timed_ff, keep_batch=keep_batch)

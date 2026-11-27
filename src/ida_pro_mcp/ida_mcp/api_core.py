@@ -27,6 +27,8 @@ from . import jobs
 from .mainthread import get_pump
 from .rpc import tool, MCP_SERVER
 from .sync import (
+    IDAError,
+    deadline_paused,
     idasync,
     get_tool_deadline,
     inflight_snapshot,
@@ -176,11 +178,53 @@ def _get_strings_cache() -> list[tuple[int, str]]:
     """
     global _strings_cache
     if _strings_cache is None:
-        strings = idautils.Strings()
-        # strtype 0 = C (ASCII/UTF-8), strtype 1 = Unicode C-Style (UTF-16).
-        strings.setup(strtypes=[0, 1])
-        _strings_cache = [(s.ea, str(s)) for s in strings if s is not None]
+        # One-time, whole-database build: on huge databases it outlasts the
+        # tool deadline, which used to cancel it, discard it, and start over
+        # on every call (find_regex never succeeded). Pause the deadline for
+        # the build; the tool still gets its full budget afterwards.
+        with deadline_paused():
+            _strings_cache = _build_strings_list()
     return _strings_cache
+
+
+def _build_strings_list() -> list[tuple[int, str]]:
+    import ida_strlist
+
+    if ida_kernwin.user_cancelled():
+        raise IDAError("Cancelled before the strings list was built; retry")
+    # Same options as idautils.Strings().setup(strtypes=[0, 1]), but built once:
+    # Strings() rebuilds in its constructor and again in setup().
+    # strtype 0 = C (ASCII/UTF-8), strtype 1 = Unicode C-Style (UTF-16).
+    opts = ida_strlist.get_strlist_options()
+    opts.strtypes = [0, 1]
+    opts.minlen = 5
+    opts.only_7bit = True
+    opts.display_only_existing_strings = False
+    opts.ignore_heads = False
+    started = time.perf_counter()
+    ida_strlist.build_strlist()
+    if ida_kernwin.user_cancelled():
+        # A cancelled build is partial; never cache it.
+        ida_strlist.clear_strlist()
+        raise IDAError("Strings list build was cancelled; retry")
+
+    out: list[tuple[int, str]] = []
+    append = out.append
+    si = ida_strlist.string_info_t()
+    get_item = ida_strlist.get_strlist_item
+    get_contents = ida_bytes.get_strlit_contents
+    for i in range(ida_strlist.get_strlist_qty()):
+        if not get_item(si, i):
+            continue
+        raw = get_contents(si.ea, si.length, si.type)
+        if raw is not None:
+            append((si.ea, raw.decode("UTF-8", "replace")))
+    logger.info(
+        "[MCP] Built strings list: %d strings in %.1fs",
+        len(out),
+        time.perf_counter() - started,
+    )
+    return out
 
 
 def invalidate_strings_cache():
@@ -259,105 +303,143 @@ def _collect_imports() -> list[Import]:
     return all_imports
 
 
-def _segment_name_for_ea(ea: int) -> str | None:
-    seg = idaapi.getseg(ea)
-    if not seg:
-        return None
-    try:
-        return idaapi.get_segm_name(seg)
-    except Exception:
-        return None
-
-
 def _primary_text_key(kind: str) -> str:
     if kind == "strings":
         return "text"
     return "name"
 
 
+# Output columns per entity kind, in order. Rows are collected with only the
+# cheap columns ("ea" plus the text key); the rest are filled lazily by
+# _EntityFields for rows a filter/sort needs or the returned page. On huge
+# databases (400k+ functions, 1M+ names) computing every column for every
+# row took longer than the tool deadline.
+_ENTITY_COLUMNS: dict[str, tuple[str, ...]] = {
+    "functions": ("kind", "addr", "name", "size", "segment", "has_type"),
+    "globals": ("kind", "addr", "name", "size", "segment"),
+    "imports": ("kind", "addr", "name", "module"),
+    "strings": ("kind", "addr", "text", "length", "segment"),
+    "names": ("kind", "addr", "name", "segment", "is_function", "is_import"),
+}
+
+
+def _all_names() -> list[tuple[int, str]]:
+    """(ea, name) for every named address, like idautils.Names() but direct."""
+    import ida_name
+
+    get_ea = ida_name.get_nlist_ea
+    get_name = ida_name.get_nlist_name
+    return [(get_ea(i), get_name(i)) for i in range(ida_name.get_nlist_size())]
+
+
 def _collect_entities(kind: str) -> list[dict]:
+    """Lightweight rows: kind, ea, the primary text key, and other cheap columns."""
     if kind == "functions":
         rows: list[dict] = []
-        for ea in idautils.Functions():
-            fn = idaapi.get_func(ea)
-            if not fn:
+        append = rows.append
+        getn_func = ida_funcs.getn_func
+        get_func_name = ida_funcs.get_func_name
+        for i in range(ida_funcs.get_func_qty()):
+            fn = getn_func(i)
+            if fn is None:
                 continue
-            size_int = fn.end_ea - fn.start_ea
-            rows.append(
+            start = fn.start_ea
+            append(
                 {
                     "kind": "function",
-                    "addr": hex(fn.start_ea),
-                    "name": ida_funcs.get_func_name(fn.start_ea) or "<unnamed>",
-                    "size": hex(size_int),
-                    "size_int": size_int,
-                    "segment": _segment_name_for_ea(fn.start_ea),
-                    "has_type": bool(ida_nalt.get_tinfo(ida_typeinf.tinfo_t(), fn.start_ea)),
+                    "ea": start,
+                    "name": get_func_name(start) or "<unnamed>",
+                    "size_int": fn.end_ea - start,
                 }
             )
         return rows
 
     if kind == "globals":
-        rows = []
-        for ea, name in idautils.Names():
-            if idaapi.get_func(ea) or name is None:
-                continue
-            rows.append(
-                {
-                    "kind": "global",
-                    "addr": hex(ea),
-                    "name": name,
-                    "size": idc.get_item_size(ea),
-                    "segment": _segment_name_for_ea(ea),
-                }
-            )
-        return rows
+        # Function names are dropped later (after the cheap filters), see
+        # entity_query: get_func() for every name is the expensive part.
+        return [
+            {"kind": "global", "ea": ea, "name": name}
+            for ea, name in _all_names()
+            if name is not None
+        ]
 
     if kind == "imports":
-        rows = []
-        for imp in _collect_imports():
-            rows.append(
-                {
-                    "kind": "import",
-                    "addr": imp["addr"],
-                    "name": imp["imported_name"],
-                    "module": imp["module"],
-                }
-            )
-        return rows
+        return [
+            {
+                "kind": "import",
+                "ea": int(imp["addr"], 16),
+                "name": imp["imported_name"],
+                "module": imp["module"],
+            }
+            for imp in _collect_imports()
+        ]
 
     if kind == "strings":
-        rows = []
-        for ea, text in _get_strings_cache():
-            rows.append(
-                {
-                    "kind": "string",
-                    "addr": hex(ea),
-                    "text": text,
-                    "length": len(text),
-                    "segment": _segment_name_for_ea(ea),
-                }
-            )
-        return rows
+        return [
+            {"kind": "string", "ea": ea, "text": text, "length": len(text)}
+            for ea, text in _get_strings_cache()
+        ]
 
     if kind == "names":
-        rows = []
-        imports_by_ea = {int(imp["addr"], 16): imp for imp in _collect_imports()}
-        for ea, name in idautils.Names():
-            is_function = bool(idaapi.get_func(ea))
-            is_import = ea in imports_by_ea
-            rows.append(
-                {
-                    "kind": "name",
-                    "addr": hex(ea),
-                    "name": name,
-                    "segment": _segment_name_for_ea(ea),
-                    "is_function": is_function,
-                    "is_import": is_import,
-                }
-            )
-        return rows
+        return [{"kind": "name", "ea": ea, "name": name} for ea, name in _all_names()]
 
     return []
+
+
+class _EntityFields:
+    """Computes (and memoizes on the row) the expensive entity columns."""
+
+    def __init__(self, kind: str):
+        self.kind = kind
+        self._seg_names: dict[int, str | None] = {}
+        self._import_eas: set[int] | None = None
+
+    def segment(self, ea: int) -> str | None:
+        seg = idaapi.getseg(ea)
+        if not seg:
+            return None
+        start = seg.start_ea
+        if start not in self._seg_names:
+            try:
+                self._seg_names[start] = idaapi.get_segm_name(seg)
+            except Exception:
+                self._seg_names[start] = None
+        return self._seg_names[start]
+
+    def get(self, row: dict, key: str):
+        if key in row:
+            return row[key]
+        ea = row["ea"]
+        if key == "addr":
+            value = hex(ea)
+        elif key == "segment":
+            value = self.segment(ea)
+        elif key == "size":
+            if self.kind == "functions":
+                value = hex(row["size_int"])
+            else:
+                value = idc.get_item_size(ea)
+        elif key == "has_type":
+            value = bool(ida_nalt.get_tinfo(ida_typeinf.tinfo_t(), ea))
+        elif key == "is_function":
+            value = bool(idaapi.get_func(ea))
+        elif key == "is_import":
+            if self._import_eas is None:
+                self._import_eas = {int(imp["addr"], 16) for imp in _collect_imports()}
+            value = ea in self._import_eas
+        else:
+            return None  # not a column of this kind; leave the row alone
+        row[key] = value
+        return value
+
+    def fill(self, rows: list[dict], key: str) -> None:
+        get = self.get
+        for row in rows:
+            get(row, key)
+
+    def output(self, row: dict) -> dict:
+        get = self.get
+        return {col: get(row, col) for col in _ENTITY_COLUMNS[self.kind]}
 
 
 def _apply_projection(items: list[dict], fields: list[str] | None) -> list[dict]:
@@ -923,6 +1005,7 @@ def func_query(
 
 @tool
 @idasync
+@tool_timeout(120.0)
 def list_globals(
     queries: Annotated[
         list[ListQuery] | ListQuery,
@@ -931,10 +1014,21 @@ def list_globals(
 ) -> list[Page[Global]]:
     """List globals with optional filtering and offset/count pagination."""
     queries = normalize_dict_list(queries)
-    all_globals: list[Global] = []
-    for addr, name in idautils.Names():
-        if not idaapi.get_func(addr) and name is not None:
-            all_globals.append(Global(addr=hex(addr), name=name))
+    all_names = [{"ea": ea, "name": name} for ea, name in _all_names() if name is not None]
+    is_global: dict[int, bool] = {}
+
+    def globals_only(rows: list[dict]) -> list[dict]:
+        # get_func() per name is the expensive part; only run it on rows
+        # that survived the name filter (memoized across the batch).
+        out = []
+        for row in rows:
+            ea = row["ea"]
+            keep = is_global.get(ea)
+            if keep is None:
+                keep = is_global[ea] = not idaapi.get_func(ea)
+            if keep:
+                out.append(row)
+        return out
 
     results = []
     for query in queries:
@@ -946,14 +1040,17 @@ def list_globals(
         if filter_pattern in ("", "*"):
             filter_pattern = ""
 
-        filtered = pattern_filter(all_globals, filter_pattern, "name")
-        results.append(paginate(filtered, offset, count))
+        filtered = globals_only(pattern_filter(all_names, filter_pattern, "name"))
+        page = paginate(filtered, offset, count)
+        page["data"] = [Global(addr=hex(r["ea"]), name=r["name"]) for r in page["data"]]
+        results.append(page)
 
     return results
 
 
 @tool
 @idasync
+@tool_timeout(120.0)
 def entity_query(
     queries: Annotated[
         list[EntityQuery] | EntityQuery,
@@ -963,6 +1060,9 @@ def entity_query(
     """Query IDB entities with typed filters, projection, and pagination."""
     queries = normalize_dict_list(queries)
     results: list[dict] = []
+    # Shared across the batch: several queries of one kind collect once.
+    rows_by_kind: dict[str, list[dict]] = {}
+    fields_by_kind: dict[str, _EntityFields] = {}
 
     for query in queries:
         kind = str(query.get("kind", "functions") or "functions").lower()
@@ -978,7 +1078,10 @@ def entity_query(
             )
             continue
 
-        rows = _collect_entities(kind)
+        if kind not in rows_by_kind:
+            rows_by_kind[kind] = _collect_entities(kind)
+        rows = rows_by_kind[kind]
+        fields_for = fields_by_kind.setdefault(kind, _EntityFields(kind))
         primary_key = _primary_text_key(kind)
         filter_pattern = str(query.get("filter", "") or "")
         if filter_pattern:
@@ -987,24 +1090,16 @@ def entity_query(
         regex = str(query.get("regex", "") or "")
         if regex:
             try:
-                compiled = re.compile(regex)
-                rows = [row for row in rows if compiled.search(str(row.get(primary_key, "")))]
+                search = re.compile(regex).search
+                rows = [row for row in rows if search(str(row.get(primary_key, "")))]
             except re.error:
                 rows = []
-
-        segment_filter = str(query.get("segment", "") or "")
-        if segment_filter and kind in {"functions", "globals", "strings", "names"}:
-            rows = pattern_filter(rows, segment_filter, "segment")
-
-        module_filter = str(query.get("module", "") or "")
-        if module_filter and kind == "imports":
-            rows = pattern_filter(rows, module_filter, "module")
 
         min_addr = query.get("min_addr")
         if min_addr not in (None, ""):
             try:
                 min_ea = parse_address(min_addr)
-                rows = [row for row in rows if int(str(row["addr"]), 16) >= min_ea]
+                rows = [row for row in rows if row["ea"] >= min_ea]
             except Exception:
                 rows = []
 
@@ -1012,26 +1107,48 @@ def entity_query(
         if max_addr not in (None, ""):
             try:
                 max_ea = parse_address(max_addr)
-                rows = [row for row in rows if int(str(row["addr"]), 16) <= max_ea]
+                rows = [row for row in rows if row["ea"] <= max_ea]
             except Exception:
                 rows = []
+
+        if kind == "globals":
+            # Globals are names that aren't functions; checked only for rows
+            # that survived the cheap filters.
+            get_func = idaapi.get_func
+            rows = [row for row in rows if not get_func(row["ea"])]
+
+        segment_filter = str(query.get("segment", "") or "")
+        if segment_filter and kind in {"functions", "globals", "strings", "names"}:
+            fields_for.fill(rows, "segment")
+            rows = pattern_filter(rows, segment_filter, "segment")
+
+        module_filter = str(query.get("module", "") or "")
+        if module_filter and kind == "imports":
+            rows = pattern_filter(rows, module_filter, "module")
 
         sort_by = str(query.get("sort_by", "addr") or "addr")
         descending = bool(query.get("descending", False))
         if sort_by == "addr":
-            rows.sort(key=lambda row: int(str(row.get("addr", "0x0")), 16), reverse=descending)
+            rows = sorted(rows, key=lambda row: row["ea"], reverse=descending)
         elif sort_by in {"size", "length"}:
-            rows.sort(
+            if kind != "functions" and sort_by in _ENTITY_COLUMNS[kind]:
+                fields_for.fill(rows, sort_by)
+            rows = sorted(
+                rows,
                 key=lambda row: row.get("size_int", _coerce_sort_number(row.get(sort_by, 0))),
                 reverse=descending,
             )
         else:
-            rows.sort(key=lambda row: str(row.get(sort_by, "")).lower(), reverse=descending)
+            if sort_by in _ENTITY_COLUMNS[kind]:
+                fields_for.fill(rows, sort_by)
+            rows = sorted(
+                rows, key=lambda row: str(row.get(sort_by, "")).lower(), reverse=descending
+            )
 
         offset = int(query.get("offset", 0) or 0)
         count = int(query["count"]) if query.get("count") is not None else 100
         page = paginate(rows, offset, count)
-        data = [{k: v for k, v in item.items() if k != "size_int"} for item in page["data"]]
+        data = [fields_for.output(item) for item in page["data"]]
 
         fields_raw = query.get("fields")
         fields = None
@@ -1133,6 +1250,7 @@ def idb_save(
 
 @tool
 @idasync
+@tool_timeout(120.0)
 def find_regex(
     pattern: Annotated[str, "Regex pattern to search for in strings"],
     limit: Annotated[int, "Max matches (default: 30, max: 500)"] = 30,
