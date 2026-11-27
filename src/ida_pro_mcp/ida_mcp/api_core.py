@@ -754,6 +754,7 @@ def int_convert(
 
 @tool
 @idasync
+@tool_timeout(120.0)
 def list_funcs(
     queries: Annotated[
         list[ListQuery] | ListQuery,
@@ -762,7 +763,11 @@ def list_funcs(
 ) -> list[Page[Function]]:
     """List functions with optional filtering and offset/count pagination."""
     queries = normalize_dict_list(queries)
-    all_functions = [get_function(addr) for addr in idautils.Functions()]
+    # Filter on bare names first; build Function rows only for the page.
+    all_functions = [
+        {"name": n, "ea": ea}
+        for ea, n in _function_names()
+    ]
 
     results = []
     for query in queries:
@@ -775,13 +780,30 @@ def list_funcs(
             filter_pattern = ""
 
         filtered = pattern_filter(all_functions, filter_pattern, "name")
-        results.append(paginate(filtered, offset, count))
+        page = paginate(filtered, offset, count)
+        page["data"] = [get_function(item["ea"]) for item in page["data"]]
+        results.append(page)
 
     return results
 
 
+def _function_names() -> list[tuple[int, str]]:
+    """(start_ea, name) for every function, using the same naming as get_function."""
+    from . import compat
+
+    out = []
+    getn_func = ida_funcs.getn_func
+    func_name = compat.get_func_name
+    for i in range(ida_funcs.get_func_qty()):
+        fn = getn_func(i)
+        if fn is not None:
+            out.append((fn.start_ea, func_name(fn)))
+    return out
+
+
 @tool
 @idasync
+@tool_timeout(120.0)
 def func_query(
     queries: Annotated[
         list[FunctionQuery] | FunctionQuery,
@@ -791,36 +813,60 @@ def func_query(
     """Query functions with richer filtering than list_funcs."""
     queries = normalize_dict_list(queries)
 
+    # Lightweight rows first: name filters usually cut the set down a lot, and
+    # the expensive per-function work (type lookup, row dicts) is only done for
+    # rows that survive filtering. On huge databases (300k+ functions) building
+    # full rows for everything took ~30s under the tool watchdog's profile hook.
+    get_func_name = ida_funcs.get_func_name
+    getn_func = ida_funcs.getn_func
     all_functions: list[dict] = []
-    for addr in idautils.Functions():
-        fn = idaapi.get_func(addr)
-        if not fn:
+    append = all_functions.append
+    for i in range(ida_funcs.get_func_qty()):
+        fn = getn_func(i)
+        if fn is None:
             continue
-        size_int = fn.end_ea - fn.start_ea
-        fn_name = ida_funcs.get_func_name(fn.start_ea) or "<unnamed>"
-        has_type = ida_nalt.get_tinfo(ida_typeinf.tinfo_t(), fn.start_ea)
-        flags = int(fn.flags)
-        all_functions.append(
+        start = fn.start_ea
+        append(
             {
-                "addr": hex(fn.start_ea),
-                "name": fn_name,
-                "size": hex(size_int),
-                "size_int": size_int,
-                "has_type": has_type,
-                "noreturn": bool(flags & ida_funcs.FUNC_NORET),
-                "thunk": bool(flags & ida_funcs.FUNC_THUNK),
-                "lib": bool(flags & ida_funcs.FUNC_LIB),
+                "ea": start,
+                "name": get_func_name(start) or "<unnamed>",
+                "size_int": fn.end_ea - start,
+                "flags": fn.flags,
             }
         )
+
+    def has_type_at(ea: int) -> bool:
+        return bool(ida_nalt.get_tinfo(ida_typeinf.tinfo_t(), ea))
+
+    def to_row(item: dict) -> dict:
+        flags = int(item["flags"])
+        has_type = item.get("has_type")
+        if has_type is None:
+            has_type = has_type_at(item["ea"])
+        return {
+            "addr": hex(item["ea"]),
+            "name": item["name"],
+            "size": hex(item["size_int"]),
+            "has_type": has_type,
+            "noreturn": bool(flags & ida_funcs.FUNC_NORET),
+            "thunk": bool(flags & ida_funcs.FUNC_THUNK),
+            "lib": bool(flags & ida_funcs.FUNC_LIB),
+        }
+
+    flag_bits = {
+        "noreturn": ida_funcs.FUNC_NORET,
+        "thunk": ida_funcs.FUNC_THUNK,
+        "lib": ida_funcs.FUNC_LIB,
+    }
 
     def apply_name_regex(items: list[dict], expr: str) -> list[dict]:
         if not expr:
             return items
         try:
-            compiled = re.compile(expr)
+            search = re.compile(expr).search
         except re.error:
             return []
-        return [item for item in items if compiled.search(item["name"])]
+        return [item for item in items if search(item["name"])]
 
     results = []
     for query in queries:
@@ -848,24 +894,28 @@ def func_query(
         if max_size is not None:
             filtered = [f for f in filtered if f["size_int"] <= int(max_size)]
 
-        if "has_type" in query:
-            require_type = bool(query.get("has_type"))
-            filtered = [f for f in filtered if bool(f["has_type"]) is require_type]
-
-        for flag_key in ("noreturn", "thunk", "lib"):
+        for flag_key, bit in flag_bits.items():
             if flag_key in query:
                 want = bool(query.get(flag_key))
-                filtered = [f for f in filtered if f[flag_key] is want]
+                filtered = [f for f in filtered if bool(f["flags"] & bit) is want]
+
+        if "has_type" in query:
+            require_type = bool(query.get("has_type"))
+            for f in filtered:
+                if "has_type" not in f:
+                    f["has_type"] = has_type_at(f["ea"])
+            filtered = [f for f in filtered if f["has_type"] is require_type]
 
         if sort_by == "name":
-            filtered.sort(key=lambda f: f["name"].lower(), reverse=descending)
+            filtered = sorted(filtered, key=lambda f: f["name"].lower(), reverse=descending)
         elif sort_by == "size":
-            filtered.sort(key=lambda f: f["size_int"], reverse=descending)
-        else:
-            filtered.sort(key=lambda f: int(f["addr"], 16), reverse=descending)
+            filtered = sorted(filtered, key=lambda f: f["size_int"], reverse=descending)
+        elif descending:
+            filtered = filtered[::-1]
+        # getn_func order is already ascending by address.
 
         page = paginate(filtered, offset, count)
-        page["data"] = [{k: v for k, v in item.items() if k != "size_int"} for item in page["data"]]
+        page["data"] = [to_row(item) for item in page["data"]]
         results.append(page)
 
     return results

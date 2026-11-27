@@ -105,6 +105,29 @@ def test_utils_paginate_and_pattern_filter():
     assert [x["name"] for x in pattern_filter(data, "put", "name")] == ["puts"]
 
 
+@test()
+def test_pattern_filter_edge_cases():
+    """Case-insensitive glob/substring, regex metachars literal, None/objects safe."""
+    data = [{"name": "CamLod_Update"}, {"name": "a.b[1]"}, {"name": None}, {"name": "x?y"}]
+    names = lambda pat: [x["name"] for x in pattern_filter(data, pat, "name")]  # noqa: E731
+    assert names("*lod*") == ["CamLod_Update"]
+    assert names("LOD_") == ["CamLod_Update"]  # substring, case-insensitive
+    assert names("a.b[1]") == ["a.b[1]"]  # substring keeps metachars literal
+    assert names("x?y") == ["x?y"]  # glob ? matches one char
+    assert names("*_update") == ["CamLod_Update"]  # glob is anchored at both ends
+    assert names("cam*") == ["CamLod_Update"]
+    assert names("/^cam/") == ["CamLod_Update"]  # regex defaults to IGNORECASE
+    assert names("/[/") == []  # invalid regex: substring fallback, no match
+    assert pattern_filter(data, "", "name") is data
+
+    class Obj:
+        def __init__(self, name):
+            self.name = name
+
+    objs = [Obj("Visibility_Test"), Obj("other")]
+    assert [o.name for o in pattern_filter(objs, "*visib*", "name")] == ["Visibility_Test"]
+
+
 @test(binary="typed_fixture.elf")
 def test_utils_stack_frame_and_decompile_helpers():
     """Stack-frame and decompilation helpers expose typed_fixture details."""

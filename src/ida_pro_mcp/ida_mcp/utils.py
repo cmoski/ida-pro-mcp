@@ -968,6 +968,24 @@ def pattern_filter(data: list[T], pattern: str, key: str) -> list[T]:
     elif "*" in pattern or "?" in pattern:
         use_glob = True
 
+    # Everything becomes one compiled, case-insensitive matcher so each item
+    # costs a single C call. Tool bodies run under a per-call profile hook
+    # (the timeout watchdog), which made the old per-item helper chain
+    # (str/lower/fnmatch/normcase/...) blow the 30s deadline on databases
+    # with hundreds of thousands of functions.
+    if regex is not None:
+        test = regex.search
+    elif use_glob:
+        test = re.compile(fnmatch.translate(pattern), re.IGNORECASE).match
+    else:
+        test = re.compile(re.escape(pattern), re.IGNORECASE).search
+
+    if data and isinstance(data[0], dict):
+        try:
+            return [item for item in data if test(item[key] or "")]
+        except (KeyError, TypeError):
+            pass  # heterogeneous rows: fall back to the general path
+
     def get_value(item) -> str:
         try:
             v = item[key]
@@ -975,15 +993,7 @@ def pattern_filter(data: list[T], pattern: str, key: str) -> list[T]:
             v = getattr(item, key, "")
         return "" if v is None else str(v)
 
-    def matches(item) -> bool:
-        text = get_value(item)
-        if regex is not None:
-            return bool(regex.search(text))
-        if use_glob:
-            return fnmatch.fnmatch(text.lower(), pattern.lower())
-        return pattern.lower() in text.lower()
-
-    return [item for item in data if matches(item)]
+    return [item for item in data if test(get_value(item))]
 
 
 def refresh_decompiler_widget():
