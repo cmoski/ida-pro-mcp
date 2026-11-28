@@ -23,6 +23,7 @@ import ida_typeinf
 import idc
 
 from . import _objdump_search
+from . import listing_index
 from . import jobs
 from .mainthread import get_pump
 from .rpc import tool, MCP_SERVER
@@ -161,6 +162,8 @@ class SearchTextResult(TypedDict, total=False):
     # Set to "objdump" when the busy fast path served the request (raw
     # disassembly only — no IDA names/comments). Absent on the IDA path.
     engine: str
+    # IDA path: listing-index coverage, {"coverage": 0.0-1.0}.
+    index: dict[str, Any]
 
 
 # Cached strings list: [(ea, text), ...]
@@ -1285,61 +1288,6 @@ def find_regex(
     }
 
 
-_COMMENT_SCOLORS = (
-    ida_lines.SCOLOR_REGCMT,
-    ida_lines.SCOLOR_RPTCMT,
-    ida_lines.SCOLOR_AUTOCMT,
-    ida_lines.SCOLOR_COLLAPSED,
-)
-
-
-def _line_is_comment(tagged: str) -> bool:
-    """A rendered listing line is a comment if it carries any comment SCOLOR tag."""
-    if not tagged:
-        return False
-    for sc in _COMMENT_SCOLORS:
-        if ida_lines.COLOR_ON + sc in tagged:
-            return True
-    return False
-
-
-def _classify_hit_lines(
-    ea: int,
-    matcher,
-    want_disasm: bool,
-    want_comments: bool,
-    max_lines: int = 32,
-) -> list[SearchTextLine]:
-    """Render the listing for `ea` once, classify each line, return matching lines."""
-    out: list[SearchTextLine] = []
-    try:
-        result = ida_lines.generate_disassembly(ea, max_lines, False, False)
-    except Exception:
-        return out
-    # Bindings vary: (n, lineno, lines) or (lines, lineno).
-    lines = None
-    if isinstance(result, tuple):
-        for item in result:
-            if isinstance(item, (list, tuple)) and item and isinstance(item[0], str):
-                lines = list(item)
-                break
-    if lines is None:
-        return out
-
-    for tagged in lines:
-        text = ida_lines.tag_remove(tagged) or ""
-        if not text or not matcher(text):
-            continue
-        is_cmt = _line_is_comment(tagged)
-        kind = "comment" if is_cmt else "disasm"
-        if kind == "disasm" and not want_disasm:
-            continue
-        if kind == "comment" and not want_comments:
-            continue
-        out.append({"kind": kind, "text": text})
-    return out
-
-
 def _exec_segments() -> list[tuple[int, int]]:
     """Return [(start, end)] for executable segments in address order."""
     ranges: list[tuple[int, int]] = []
@@ -1520,10 +1468,14 @@ def search_text(
 ) -> SearchTextResult:
     """Search the rendered listing for `pattern` over [start, end).
 
-    Walks heads in Python and renders each line, so the tool deadline and UI
-    Cancel interrupt it reliably. Scope with `start`/`end` on large binaries.
-    If the time budget or deadline is hit, partial hits come back with
-    cursor.truncated / cursor.cancelled; resume from cursor.next.
+    Matches each item's disassembly line and its comments (regular,
+    repeatable, anterior/posterior, function comments); not xref/header
+    boilerplate. Backed by a listing index: each address range is rendered
+    once and then searched at regex speed, so repeat and whole-image searches
+    are fast; `index.coverage` reports how much is indexed. Unindexed ranges
+    are rendered on first touch. If the time budget or deadline is hit,
+    partial hits come back with cursor.truncated / cursor.cancelled; resume
+    from cursor.next.
 
     When IDA is busy, disasm-only code searches without `end` are served
     off-thread via objdump (engine="objdump"; raw disassembly, no IDA names).
@@ -1605,65 +1557,39 @@ def _search_text_ida(
     if end_ea <= start_ea:
         return {"n": 0, "hits": [], "cursor": {"done": True}}
 
-    hits: list[SearchTextHit] = []
-    next_cursor: int | None = None
-    cancelled = False
-    # Chunk the address space into fixed-size windows and call Heads() per
-    # chunk. This bounds each Heads()/next_head() C call to one CHUNK_BYTES
-    # scan — without it, a single next_head over a huge undefined gap can
-    # run for tens of seconds without yielding to Python, so neither the
-    # tool deadline nor the cancel flag can interrupt it.
-    #
-    # Between chunks we check (a) our own monotonic deadline directly
-    # (independent of sync.py's Timer, which can be starved by GIL contention
-    # on big binaries), and (b) the global cancel flag for UI-driven cancels.
-    # Either path returns a partial result with cursor.cancelled=True.
-    CHUNK_BYTES = 65536
+    # Whole-window regex over the listing index (rendered once, kept
+    # compressed; see listing_index.py). Windows not indexed yet are rendered
+    # on first touch. Each candidate is re-rendered and re-matched live, so
+    # hits are never stale. The deadline is checked between windows.
+    if regex:
+        window_rx = re.compile(pattern, (0 if case_sensitive else re.IGNORECASE) | re.MULTILINE)
+    else:
+        window_rx = re.compile(re.escape(pattern), 0 if case_sensitive else re.IGNORECASE)
+
     deadline = get_tool_deadline()
     if time_budget_sec > 0:
         budget_deadline = time.monotonic() + time_budget_sec
         deadline = budget_deadline if deadline is None else min(deadline, budget_deadline)
 
+    ranges = []
     for seg_start, seg_end in segments:
-        if cancelled or len(hits) >= limit:
-            break
         if seg_end <= start_ea:
             continue
         if seg_start >= end_ea:
             break
-        walk_start = max(seg_start, start_ea)
-        walk_end = min(seg_end, end_ea)
-        chunk_ea = walk_start
-        while chunk_ea < walk_end:
-            if cancelled or len(hits) >= limit:
-                break
-            if (deadline is not None and time.monotonic() >= deadline) \
-                    or ida_kernwin.user_cancelled():
-                cancelled = True
-                next_cursor = chunk_ea
-                break
-            chunk_end = min(chunk_ea + CHUNK_BYTES, walk_end)
-            for head_ea in idautils.Heads(chunk_ea, chunk_end):
-                lines = _classify_hit_lines(head_ea, matcher, want_disasm, want_comments)
-                if not lines:
-                    continue
-                entry: SearchTextHit = {"addr": hex(head_ea), "matches": lines}
-                func = idaapi.get_func(head_ea)
-                if func is not None:
-                    fname = ida_funcs.get_func_name(func.start_ea)
-                    if fname:
-                        entry["function"] = fname
-                seg = idaapi.getseg(head_ea)
-                if seg is not None:
-                    sname = ida_segment.get_segm_name(seg)
-                    if sname:
-                        entry["segment"] = sname
-                hits.append(entry)
-                if len(hits) >= limit:
-                    size = max(1, idaapi.get_item_size(head_ea))
-                    next_cursor = head_ea + size
-                    break
-            chunk_ea = chunk_end
+        ranges.append((max(seg_start, start_ea), min(seg_end, end_ea)))
+
+    index = listing_index.get_index()
+    hits, next_cursor, cancelled = index.search(
+        window_rx,
+        matcher,
+        ranges,
+        limit,
+        want_disasm,
+        want_comments,
+        deadline,
+        ida_kernwin.user_cancelled,
+    )
 
     cursor: dict[str, Any]
     if cancelled:
@@ -1678,4 +1604,7 @@ def _search_text_ida(
     else:
         cursor = {"done": True}
 
-    return {"n": len(hits), "hits": hits, "cursor": cursor}
+    result: SearchTextResult = {"n": len(hits), "hits": hits, "cursor": cursor}
+    status = index.status()
+    result["index"] = {"coverage": status["coverage"]}
+    return result

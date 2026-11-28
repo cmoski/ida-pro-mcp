@@ -404,6 +404,7 @@ http://127.0.0.1:13337/mcp?ext=dbg
 ## Pattern Matching & Search
 
 - `find_regex(queries)`: Search strings with case-insensitive regex (paginated).
+- `search_text(pattern, limit=30, start="", end="", regex=False, case_sensitive=False, include="all", code_only=True)`: Search the listing text (disassembly lines and comments). Backed by a listing index: each range is rendered once, then searched at regex speed, so whole-image searches take seconds after the first. Headless workers build the index in the background after analysis (`IDA_MCP_LISTING_INDEX=0` turns that off); `index.coverage` in the result shows progress. Edits update it, and every hit is re-checked live.
 - `find_bytes(patterns, limit=1000, offset=0)`: Find byte pattern(s) in binary (e.g., "48 8B ?? ??"). Max limit: 10000.
 - `find_insns(sequences, limit=1000, offset=0)`: Find instruction sequence(s) in code. Max limit: 10000.
 - `find(type, targets, limit=1000, offset=0)`: Advanced search (immediate values, strings, data/code references). Max limit: 10000.

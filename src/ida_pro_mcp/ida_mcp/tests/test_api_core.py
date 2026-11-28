@@ -946,3 +946,117 @@ def test_entity_query_lazy_columns_match_direct_lookups():
     glob = entity_query({"kind": "globals", "count": 20})[0]
     for row in glob["data"]:
         assert idaapi.get_func(int(row["addr"], 16)) is None, row
+
+
+# ---------------------------------------------------------------------------
+# search_text listing index: results stay correct after edits
+# ---------------------------------------------------------------------------
+
+
+def _first_code_head():
+    import ida_funcs
+    import idautils
+
+    for i in range(ida_funcs.get_func_qty()):
+        fn = ida_funcs.getn_func(i)
+        heads = list(idautils.Heads(fn.start_ea, fn.end_ea))
+        if len(heads) >= 2:
+            return heads[1]
+    return None
+
+
+@test()
+def test_search_text_index_sees_comment_edits():
+    """Comments added/removed after indexing are found/forgotten at once."""
+    import ida_bytes
+    import ida_lines
+
+    ea = _first_code_head()
+    if ea is None:
+        skip_test("no function with two heads")
+    token = "zqIdxCmtToken"
+    search_text("___warm_the_index___", time_budget_sec=0)  # build the index
+    old_cmt = ida_bytes.get_cmt(ea, False)
+    try:
+        ida_bytes.set_cmt(ea, f"note {token}", False)
+        hits = search_text(token)["hits"]
+        assert [h["addr"] for h in hits] == [hex(ea)], hits
+        assert hits[0]["matches"][0]["kind"] == "comment"
+        assert search_text(token, include="disasm")["n"] == 0
+        assert search_text(token, include="comments")["n"] == 1
+
+        ida_lines.add_extra_cmt(ea, True, f"anterior {token}x")
+        hits = search_text(f"{token}x")["hits"]
+        assert [h["addr"] for h in hits] == [hex(ea)], hits
+        assert hits[0]["matches"][0]["kind"] == "comment"
+    finally:
+        ida_bytes.set_cmt(ea, old_cmt or "", False)
+        ida_lines.del_extra_cmt(ea, ida_lines.E_PREV)
+    assert search_text(token)["n"] == 0
+
+
+@test()
+def test_search_text_index_sees_renames_at_call_sites():
+    """Renaming a callee updates the indexed text of its callers' windows."""
+    import ida_funcs
+    import ida_name
+    import idautils
+    import ida_xref
+
+    target = None
+    for callee_ea in idautils.Functions():
+        callee = ida_funcs.get_func(callee_ea)
+        if callee is None or callee.flags & ida_funcs.FUNC_THUNK:
+            continue
+        sites = [
+            x.frm
+            for x in idautils.XrefsTo(callee_ea)
+            if x.type in (ida_xref.fl_CN, ida_xref.fl_CF)
+        ]
+        if sites:
+            target = (callee_ea, sites)
+            break
+    if target is None:
+        skip_test("no direct calls")
+    callee_ea, sites = target
+    old_name = ida_name.get_name(callee_ea)
+    new_name = "zqIdxRenamedFunc"
+    search_text("___warm_the_index___", time_budget_sec=0)
+    try:
+        assert ida_name.set_name(callee_ea, new_name, ida_name.SN_NOWARN)
+        found = {h["addr"] for h in search_text(new_name, limit=500)["hits"]}
+        assert {hex(s) for s in sites} <= found, (sites, found)
+    finally:
+        ida_name.set_name(callee_ea, old_name, ida_name.SN_NOWARN)
+    assert search_text(new_name)["n"] == 0
+
+
+@test()
+def test_search_text_reports_index_coverage():
+    result = search_text("___coverage_probe___", time_budget_sec=0)
+    assert 0.0 < result["index"]["coverage"] <= 1.0
+
+
+@test()
+def test_listing_index_background_build_completes():
+    """build_step (the headless background builder) indexes every window."""
+    from ..listing_index import ListingIndex
+
+    index = ListingIndex()
+    try:
+        for _ in range(100000):
+            if index.build_step(0.05):
+                break
+        else:
+            raise AssertionError("build_step never completed")
+        status = index.status()
+        assert status["coverage"] == 1.0 and status["indexed"] == status["windows"] > 0
+        # Indexed text agrees with a live render.
+        from ..listing_index import WINDOW, render_head
+        w = next(iter(index.windows))
+        text, eas, _kinds = index.windows[w].unpack()
+        first_ea = eas[0]
+        assert text.split("\n")[0] == render_head(first_ea)[0][1]
+        assert all(w <= ea < w + WINDOW for ea in eas)
+    finally:
+        index.reset()

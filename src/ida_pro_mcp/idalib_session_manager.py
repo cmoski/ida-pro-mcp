@@ -184,6 +184,12 @@ class IDASessionManager:
         # The strings cache is process-global, so drop it on every DB change or
         # the next binary would serve the previous one's strings.
         invalidate_strings_cache()
+        # Same for the search_text listing index (absent in IDA-less tests).
+        try:
+            from .ida_mcp import listing_index
+        except ImportError:
+            return
+        listing_index.reset_index()
 
 
 _session_manager: Optional[IDASessionManager] = None

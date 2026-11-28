@@ -13,6 +13,7 @@ Main pieces:
 - `src/ida_pro_mcp/idalib_paths.py`: path resolution, alias registry, PE sniffing, database lock probing (no IDA imports)
 - `src/ida_pro_mcp/autosave.py`: idle auto-save policy for workers (no IDA imports)
 - `src/ida_pro_mcp/ida_mcp/auto_steps.py`: stepped auto-analysis (`step_analysis`, `wait_analysis`). Never call bare `ida_auto.auto_wait()` in tools: in idalib it holds the GIL for the whole run and ignores `set_cancelled()`, freezing the worker and overrunning tool deadlines
+- `src/ida_pro_mcp/ida_mcp/listing_index.py`: compressed, edit-invalidated index of the rendered listing behind `search_text`; built in background slices on headless workers
 - `src/ida_pro_mcp/ida_mcp/mainthread.py`: headless main-thread pump; also runs background analysis in slices between tool calls
 - `src/ida_pro_mcp/ida_mcp/`: IDA/plugin-side APIs
 

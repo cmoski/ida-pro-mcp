@@ -20,6 +20,7 @@ from ida_pro_mcp.ida_mcp.api_core import (
     invalidate_strings_cache,
     server_warmup,
 )
+from ida_pro_mcp.ida_mcp import listing_index
 from ida_pro_mcp.ida_mcp.auto_steps import step_analysis
 from ida_pro_mcp.ida_mcp.discovery import register_instance, unregister_instance
 from ida_pro_mcp.ida_mcp.http import IdaMcpHttpRequestHandler
@@ -116,6 +117,8 @@ _ANALYSIS_CHECKPOINT_SEC = 900.0
 # Length of one background-analysis slice. A queued tool call waits at most
 # about this long (plus the duration of a single analysis step).
 _ANALYSIS_SLICE_SEC = 0.1
+_INDEX_SLICE_SEC = 0.1
+_LISTING_INDEX_ENV = "IDA_MCP_LISTING_INDEX"
 
 # IDB events that mean the database content changed. Any of them marks the
 # database dirty for the idle auto-saver.
@@ -324,6 +327,43 @@ def _finish_background_analysis(error: str | None = None) -> None:
     if error is None and _AUTOSAVE.enabled and _AUTOSAVE.dirty:
         if _AUTOSAVE.run_save(_save_database_now):
             logger.info("Saved database after auto-analysis")
+    if error is None:
+        _start_background_index()
+
+
+def _listing_index_enabled() -> bool:
+    value = os.environ.get(_LISTING_INDEX_ENV, "1").strip().lower()
+    return value not in ("0", "false", "no", "off")
+
+
+def _index_slice() -> bool:
+    """One background slice of listing-index building (for search_text)."""
+    index = listing_index.get_index()
+    done = index.build_step(_INDEX_SLICE_SEC)
+    if done:
+        status = index.status()
+        logger.info(
+            "Listing index built: %d windows, %.1f MB, %.0fs rendering",
+            status["windows"],
+            status["mb"],
+            index.render_seconds,
+        )
+    return done
+
+
+def _start_background_index() -> None:
+    """Build the search_text listing index between tool calls. Main thread."""
+    if not _listing_index_enabled():
+        return
+    if not _PUMP.active:
+        _PENDING_INDEX[0] = True
+        return
+    if _PUMP.has_background():
+        return  # analysis still running; it starts the index when it finishes
+    _PUMP.set_background(_index_slice, label="listing_index")
+
+
+_PENDING_INDEX = [False]
 
 
 def _start_background_analysis(session) -> bool:
@@ -517,6 +557,8 @@ def _idb_open_body(
                 build_caches=build_caches and not _ANALYSIS.running,
                 init_hexrays=init_hexrays,
             )
+        if not already_open and not _ANALYSIS.running:
+            _start_background_index()
         _LIFECYCLE.set_idle_ttl(float(idle_ttl_sec), time.monotonic() - load_started_at)
         _AUTOSAVE.configure(enabled=autosave, idle_sec=autosave_idle_sec)
         if _REGISTERED_PORT is None and _BOUND_HOST and _BOUND_PORT:
@@ -742,6 +784,9 @@ def main():
         if _PENDING_BACKGROUND[0]:
             _PENDING_BACKGROUND[0] = False
             _PUMP.set_background(_analysis_slice, label="auto_analysis")
+        elif _PENDING_INDEX[0]:
+            _PENDING_INDEX[0] = False
+            _start_background_index()
         MCP_SERVER.serve(
             host=args.host,
             port=args.port,
